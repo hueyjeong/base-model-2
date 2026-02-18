@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Corpus data (large files)
+corpus/*.jsonl
+
+# Model checkpoints & weights
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+
+# Logs & temp
+*.log
+_tmp_*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

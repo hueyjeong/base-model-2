@@ -1,0 +1,1 @@
+https://huggingface.co/team-lucid/t5-v1_1-large-ko
