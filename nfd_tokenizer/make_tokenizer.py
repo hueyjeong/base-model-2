@@ -49,7 +49,7 @@ def build_vocab_and_merges():
     tid = 0
 
     # 1. special tokens
-    for tok in ["[UNK]", "[BOS]", "[EOS]", "[PAD]", "[SEP]"]:
+    for tok in ["[UNK]", "[BOS]", "[EOS]", "[PAD]", "[SEP]", "[MASK]"]:
         vocab[tok] = tid
         tid += 1
 
@@ -110,6 +110,7 @@ tokenizer.decoder = decoders.ByteLevel()
 tokenizer.add_special_tokens([
     AddedToken("<|BOHJ|>", special=True),
     AddedToken("<|EOHJ|>", special=True),
+    AddedToken("[MASK]", special=True),
 ])
 
 # 테스트
@@ -138,4 +139,4 @@ for test in test_sentences:
 output_path = os.path.join(os.path.dirname(__file__), "custom_gec_tokenizer_manual.json")
 tokenizer.save(output_path)
 print(f"토크나이저 생성됨: {output_path}")
-print(f"총 vocab: {len(vocab)} (special 6 + bytes 256 + 멀티바이트 토큰)")
+print(f"총 vocab: {len(vocab)} (special 7 + bytes 256 + 멀티바이트 토큰)")

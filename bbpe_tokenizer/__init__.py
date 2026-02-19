@@ -1,1 +1,1 @@
-# BBPE + MeCab tokenizer package
+# Plain BBPE tokenizer package (without MeCab)

@@ -43,6 +43,7 @@ class GECTokenizer:
         self.pad_id = self.tokenizer.token_to_id("[PAD]")
         self.sep_id = self.tokenizer.token_to_id("[SEP]")
         self.unk_id = self.tokenizer.token_to_id("[UNK]")
+        self.mask_id = self.tokenizer.token_to_id("[MASK]")
         self.vocab_size = self.tokenizer.get_vocab_size()
 
     def encode(self, text: str, add_special: bool = True) -> List[int]:

@@ -1,7 +1,7 @@
-"""Plain BBPE 토크나이저 래퍼 — BaseTokenizer 인터페이스 구현
+"""MeCab BBPE 토크나이저 래퍼 — BaseTokenizer 인터페이스 구현
 
 SentencePiece BBPE 모델을 로드하여 공통 인터페이스를 제공한다.
-MeCab 사전 분절 없이 SentencePiece 자체 토큰화만 사용한다.
+학습 시 MeCab 사전 분절을 사용했다면, 추론 시에도 동일하게 적용한다.
 """
 import os
 import sys
@@ -14,23 +14,47 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from tokenizer_base import BaseTokenizer
 
 
-class BBPETokenizer(BaseTokenizer):
-    """SentencePiece BBPE 토크나이저 래퍼 (MeCab 미사용)
+class MeCabBBPETokenizer(BaseTokenizer):
+    """MeCab + SentencePiece BBPE 토크나이저 래퍼
 
-    SentencePiece의 자체 토큰화만 사용하며,
-    외부 형태소 분석기에 의존하지 않는다.
+    학습 시 MeCab 사전 분절을 사용한 경우,
+    encode 시에도 동일하게 MeCab 분절을 적용하여
+    학습-추론 간 토큰화 일관성을 유지한다.
     """
 
-    def __init__(self, model_path: str):
+    def __init__(self, model_path: str, use_mecab: bool = True):
         """
         Args:
             model_path: SentencePiece .model 파일 경로
+            use_mecab: MeCab 사전 분절 사용 여부 (학습 시 사용했다면 True)
         """
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"모델 파일을 찾을 수 없습니다: {model_path}")
 
         self._sp = spm.SentencePieceProcessor()
         self._sp.Load(model_path)
+
+        # MeCab 설정
+        self._use_mecab = use_mecab
+        self._mecab = None
+        if use_mecab:
+            import MeCab
+            # 1순위: mecab-ko-dic (한국어), 2순위: unidic-lite (일본어)
+            tagger_created = False
+            for dic_module in ["mecab_ko_dic", "unidic_lite"]:
+                try:
+                    mod = __import__(dic_module)
+                    dicdir = mod.DICDIR
+                    self._mecab = MeCab.Tagger(f"-O wakati -r /dev/null -d {dicdir}")
+                    tagger_created = True
+                    break
+                except (ImportError, AttributeError, RuntimeError):
+                    continue
+            if not tagger_created:
+                try:
+                    self._mecab = MeCab.Tagger("-O wakati")
+                except RuntimeError:
+                    self._mecab = MeCab.Tagger("-O wakati -r /dev/null")
 
         # Special token IDs (학습 시 설정한 값과 일치해야 함)
         self._pad_id = self._sp.pad_id()   # 0
@@ -58,8 +82,17 @@ class BBPETokenizer(BaseTokenizer):
     def unk_id(self) -> int:
         return self._unk_id
 
+    def _mecab_segment(self, text: str) -> str:
+        """MeCab wakati 분절: 형태소 단위로 공백 구분"""
+        if self._mecab is None:
+            return text
+        result = self._mecab.parse(text)
+        return result.strip() if result else text
+
     def encode(self, text: str, add_special: bool = True) -> List[int]:
         """텍스트 → 토큰 ID 리스트
+
+        파이프라인: [MeCab 분절 →] SentencePiece 인코딩 → [BOS/EOS 추가]
 
         Args:
             text: 입력 텍스트
@@ -67,6 +100,8 @@ class BBPETokenizer(BaseTokenizer):
         Returns:
             토큰 ID 리스트
         """
+        if self._use_mecab:
+            text = self._mecab_segment(text)
         ids = self._sp.encode(text, out_type=int)
         if add_special:
             ids = [self._bos_id] + ids + [self._eos_id]
@@ -87,7 +122,9 @@ class BBPETokenizer(BaseTokenizer):
         return self._sp.decode(ids)
 
     def encode_batch(self, texts: List[str], add_special: bool = True) -> List[List[int]]:
-        """배치 인코딩 (SentencePiece 네이티브 배치)"""
+        """배치 인코딩 (MeCab 분절 포함)"""
+        if self._use_mecab:
+            texts = [self._mecab_segment(t) for t in texts]
         all_ids = self._sp.encode(texts, out_type=int)
         if add_special:
             all_ids = [[self._bos_id] + ids + [self._eos_id] for ids in all_ids]
@@ -105,12 +142,12 @@ class BBPETokenizer(BaseTokenizer):
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Plain BBPE 토크나이저 테스트")
+    parser = argparse.ArgumentParser(description="MeCab BBPE 토크나이저 테스트")
     parser.add_argument("--model", "-m", required=True, help="SentencePiece .model 파일 경로")
     parser.add_argument("--test", action="store_true", help="테스트 실행")
     args = parser.parse_args()
 
-    tokenizer = BBPETokenizer(args.model)
+    tokenizer = MeCabBBPETokenizer(args.model)
     print(f"Vocab size: {tokenizer.vocab_size}")
     print(f"PAD={tokenizer.pad_id}, BOS={tokenizer.bos_id}, "
           f"EOS={tokenizer.eos_id}, UNK={tokenizer.unk_id}")
