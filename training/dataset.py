@@ -117,7 +117,9 @@ class StreamingPackedDataset(IterableDataset):
             yield self._make_sample(src_buf, tgt_buf)
 
     def _make_sample(self, src_ids, tgt_ids):
-        """버퍼 → 텐서 dict"""
+        """버퍼 → 텐서 dict (pack_size 초과 시 truncate)"""
+        src_ids = src_ids[:self.pack_size]
+        tgt_ids = tgt_ids[:self.pack_size]
         return {
             "src_ids": torch.tensor(src_ids, dtype=torch.long),
             "tgt_ids": torch.tensor(tgt_ids, dtype=torch.long),

@@ -10,6 +10,7 @@ Usage:
         --max_steps 100000
 """
 import argparse
+import gc
 import json
 import os
 import sys
@@ -134,10 +135,15 @@ def train(args):
 
     # DataLoader: IterableDataset이므로 shuffle 불필요
     def collate_packed(batch):
-        return {
-            "src_ids": torch.stack([b["src_ids"] for b in batch]),
-            "tgt_ids": torch.stack([b["tgt_ids"] for b in batch]),
-        }
+        """패킹된 샘플들을 배치로 묶기 (길이가 다를 수 있으므로 패딩)"""
+        from torch.nn.utils.rnn import pad_sequence
+        src_list = [b["src_ids"] for b in batch]
+        tgt_list = [b["tgt_ids"] for b in batch]
+        src_ids = pad_sequence(src_list, batch_first=True, padding_value=0)
+        tgt_ids = pad_sequence(tgt_list, batch_first=True, padding_value=0)
+        # 패딩 위치 마스크 (True=유효, False=패딩)
+        src_mask = src_ids != 0
+        return {"src_ids": src_ids, "tgt_ids": tgt_ids, "src_mask": src_mask}
 
     loader = DataLoader(
         dataset, batch_size=args.batch_size,
@@ -201,7 +207,8 @@ def train(args):
 
             src_ids = batch["src_ids"].to(device)  # (B, src_len)
             tgt_ids = batch["tgt_ids"].to(device)  # (B, tgt_len)
-            src_mask = torch.ones_like(src_ids, dtype=torch.bool)
+            src_mask = batch["src_mask"].to(device)  # (B, src_len)
+            del batch  # CPU 텐서 참조 제거
 
             # Teacher forcing: 디코더 입력은 tgt_ids[:-1], 타겟은 tgt_ids[1:]
             tgt_input = tgt_ids[:, :-1]
@@ -231,6 +238,9 @@ def train(args):
             log_loss += loss.item() * args.grad_accum_steps
             log_tokens += n_tokens
 
+            # 메모리 해제: 계산 그래프 참조 제거
+            del logits, loss, src_ids, tgt_ids, src_mask, tgt_input, tgt_target
+
         # Optimizer step
         lr = get_lr(global_step, args.warmup_steps, args.lr, args.max_steps)
         for pg in optimizer.param_groups:
@@ -245,7 +255,9 @@ def train(args):
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
 
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
+        gc.collect()
+        torch.cuda.empty_cache()
         global_step += 1
 
         # 로그
