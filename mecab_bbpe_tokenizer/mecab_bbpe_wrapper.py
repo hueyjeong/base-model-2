@@ -1,13 +1,13 @@
-"""MeCab BBPE 토크나이저 래퍼 — BaseTokenizer 인터페이스 구현
+"""MeCab + BBPE 토크나이저 래퍼 — BaseTokenizer 인터페이스 구현
 
-SentencePiece BBPE 모델을 로드하여 공통 인터페이스를 제공한다.
+HuggingFace tokenizers JSON을 로드하여 공통 인터페이스를 제공한다.
 학습 시 MeCab 사전 분절을 사용했다면, 추론 시에도 동일하게 적용한다.
 """
 import os
 import sys
 from typing import List
 
-import sentencepiece as spm
+from tokenizers import Tokenizer
 
 # 프로젝트 루트를 path에 추가
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -15,31 +15,29 @@ from tokenizer_base import BaseTokenizer
 
 
 class MeCabBBPETokenizer(BaseTokenizer):
-    """MeCab + SentencePiece BBPE 토크나이저 래퍼
+    """MeCab + ByteLevel BPE 토크나이저 래퍼
 
     학습 시 MeCab 사전 분절을 사용한 경우,
     encode 시에도 동일하게 MeCab 분절을 적용하여
     학습-추론 간 토큰화 일관성을 유지한다.
     """
 
-    def __init__(self, model_path: str, use_mecab: bool = True):
+    def __init__(self, json_path: str, use_mecab: bool = True):
         """
         Args:
-            model_path: SentencePiece .model 파일 경로
+            json_path: HuggingFace tokenizers JSON 파일 경로
             use_mecab: MeCab 사전 분절 사용 여부 (학습 시 사용했다면 True)
         """
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"모델 파일을 찾을 수 없습니다: {model_path}")
+        if not os.path.exists(json_path):
+            raise FileNotFoundError(f"토크나이저 파일을 찾을 수 없습니다: {json_path}")
 
-        self._sp = spm.SentencePieceProcessor()
-        self._sp.Load(model_path)
+        self._tok = Tokenizer.from_file(json_path)
 
         # MeCab 설정
         self._use_mecab = use_mecab
         self._mecab = None
         if use_mecab:
             import MeCab
-            # 1순위: mecab-ko-dic (한국어), 2순위: unidic-lite (일본어)
             tagger_created = False
             for dic_module in ["mecab_ko_dic", "unidic_lite"]:
                 try:
@@ -56,15 +54,18 @@ class MeCabBBPETokenizer(BaseTokenizer):
                 except RuntimeError:
                     self._mecab = MeCab.Tagger("-O wakati -r /dev/null")
 
-        # Special token IDs (학습 시 설정한 값과 일치해야 함)
-        self._pad_id = self._sp.pad_id()   # 0
-        self._unk_id = self._sp.unk_id()   # 1
-        self._bos_id = self._sp.bos_id()   # 2
-        self._eos_id = self._sp.eos_id()   # 3
+        # Special token IDs
+        self._pad_id = self._tok.token_to_id("[PAD]")
+        self._unk_id = self._tok.token_to_id("[UNK]")
+        self._bos_id = self._tok.token_to_id("[BOS]")
+        self._eos_id = self._tok.token_to_id("[EOS]")
+        self._sep_id = self._tok.token_to_id("[SEP]")
+        self._cls_id = self._tok.token_to_id("[CLS]")
+        self._mask_id = self._tok.token_to_id("[MASK]")
 
     @property
     def vocab_size(self) -> int:
-        return self._sp.get_piece_size()
+        return self._tok.get_vocab_size()
 
     @property
     def pad_id(self) -> int:
@@ -82,6 +83,18 @@ class MeCabBBPETokenizer(BaseTokenizer):
     def unk_id(self) -> int:
         return self._unk_id
 
+    @property
+    def sep_id(self) -> int:
+        return self._sep_id
+
+    @property
+    def cls_id(self) -> int:
+        return self._cls_id
+
+    @property
+    def mask_id(self) -> int:
+        return self._mask_id
+
     def _mecab_segment(self, text: str) -> str:
         """MeCab wakati 분절: 형태소 단위로 공백 구분"""
         if self._mecab is None:
@@ -92,7 +105,7 @@ class MeCabBBPETokenizer(BaseTokenizer):
     def encode(self, text: str, add_special: bool = True) -> List[int]:
         """텍스트 → 토큰 ID 리스트
 
-        파이프라인: [MeCab 분절 →] SentencePiece 인코딩 → [BOS/EOS 추가]
+        파이프라인: [MeCab 분절 →] BPE 인코딩 → [BOS/EOS 추가]
 
         Args:
             text: 입력 텍스트
@@ -102,7 +115,8 @@ class MeCabBBPETokenizer(BaseTokenizer):
         """
         if self._use_mecab:
             text = self._mecab_segment(text)
-        ids = self._sp.encode(text, out_type=int)
+        encoded = self._tok.encode(text)
+        ids = encoded.ids
         if add_special:
             ids = [self._bos_id] + ids + [self._eos_id]
         return ids
@@ -119,31 +133,32 @@ class MeCabBBPETokenizer(BaseTokenizer):
         if skip_special:
             special = {self._pad_id, self._bos_id, self._eos_id, self._unk_id}
             ids = [i for i in ids if i not in special]
-        return self._sp.decode(ids)
+        return self._tok.decode(ids, skip_special_tokens=False)
 
     def encode_batch(self, texts: List[str], add_special: bool = True) -> List[List[int]]:
         """배치 인코딩 (MeCab 분절 포함)"""
         if self._use_mecab:
             texts = [self._mecab_segment(t) for t in texts]
-        all_ids = self._sp.encode(texts, out_type=int)
+        encoded_list = self._tok.encode_batch(texts)
+        all_ids = [enc.ids for enc in encoded_list]
         if add_special:
             all_ids = [[self._bos_id] + ids + [self._eos_id] for ids in all_ids]
         return all_ids
 
     def id_to_piece(self, id: int) -> str:
         """토큰 ID → 토큰 문자열"""
-        return self._sp.id_to_piece(id)
+        return self._tok.id_to_token(id)
 
     def piece_to_id(self, piece: str) -> int:
         """토큰 문자열 → 토큰 ID"""
-        return self._sp.piece_to_id(piece)
+        return self._tok.token_to_id(piece)
 
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="MeCab BBPE 토크나이저 테스트")
-    parser.add_argument("--model", "-m", required=True, help="SentencePiece .model 파일 경로")
+    parser.add_argument("--model", "-m", required=True, help="토크나이저 JSON 파일 경로")
     parser.add_argument("--test", action="store_true", help="테스트 실행")
     args = parser.parse_args()
 

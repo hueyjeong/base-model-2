@@ -49,7 +49,12 @@ def build_vocab_and_merges():
     tid = 0
 
     # 1. special tokens
-    for tok in ["[UNK]", "[BOS]", "[EOS]", "[PAD]", "[SEP]", "[MASK]"]:
+    special_tokens = [
+        "[PAD]", "[UNK]", "[BOS]", "[EOS]", "[SEP]", "[CLS]", "[MASK]",
+    ]
+    # 여분 특수 토큰 (미래 사용 예약)
+    special_tokens += [f"[UNUSED{i}]" for i in range(10)]
+    for tok in special_tokens:
         vocab[tok] = tid
         tid += 1
 
@@ -108,9 +113,8 @@ tokenizer.decoder = decoders.ByteLevel()
 
 # special tokens를 단일 토큰으로 등록
 tokenizer.add_special_tokens([
-    AddedToken("<|BOHJ|>", special=True),
-    AddedToken("<|EOHJ|>", special=True),
-    AddedToken("[MASK]", special=True),
+    AddedToken("[BOHJ]", special=True),
+    AddedToken("[EOHJ]", special=True),
 ])
 
 # 테스트
@@ -121,7 +125,7 @@ test_sentences = [
     "Hello, world!",
     "こんにちは世界",
     "カタカナテスト",
-    "<|BOHJ|>국+21<|EOHJ|>と<|BOHJ|>국+23<|EOHJ|>",
+    "[BOHJ]국+21[EOHJ]と[BOHJ]국+23[EOHJ]",
 ]
 for test in test_sentences:
     decomposed = nfd_decompose(test)

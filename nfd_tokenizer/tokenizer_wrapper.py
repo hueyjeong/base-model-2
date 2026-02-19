@@ -42,6 +42,7 @@ class GECTokenizer:
         self.eos_id = self.tokenizer.token_to_id("[EOS]")
         self.pad_id = self.tokenizer.token_to_id("[PAD]")
         self.sep_id = self.tokenizer.token_to_id("[SEP]")
+        self.cls_id = self.tokenizer.token_to_id("[CLS]")
         self.unk_id = self.tokenizer.token_to_id("[UNK]")
         self.mask_id = self.tokenizer.token_to_id("[MASK]")
         self.vocab_size = self.tokenizer.get_vocab_size()

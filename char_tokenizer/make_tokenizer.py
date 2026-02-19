@@ -100,7 +100,12 @@ def build_vocab_and_merges():
     tid = 0
 
     # 1. Special tokens
-    for tok in ["[PAD]", "[UNK]", "[BOS]", "[EOS]", "[SEP]", "[MASK]"]:
+    special_tokens = [
+        "[PAD]", "[UNK]", "[BOS]", "[EOS]", "[SEP]", "[CLS]", "[MASK]",
+    ]
+    # 여분 특수 토큰 (미래 사용 예약)
+    special_tokens += [f"[UNUSED{i}]" for i in range(10)]
+    for tok in special_tokens:
         vocab[tok] = tid
         tid += 1
 
@@ -202,6 +207,7 @@ def main():
         AddedToken("[BOS]", special=True),
         AddedToken("[EOS]", special=True),
         AddedToken("[SEP]", special=True),
+        AddedToken("[CLS]", special=True),
         AddedToken("[MASK]", special=True),
     ])
 

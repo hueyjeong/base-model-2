@@ -43,6 +43,24 @@ class BaseTokenizer(ABC):
         """미등록 토큰 ID"""
         ...
 
+    @property
+    @abstractmethod
+    def sep_id(self) -> int:
+        """구분 토큰 ID"""
+        ...
+
+    @property
+    @abstractmethod
+    def cls_id(self) -> int:
+        """분류 토큰 ID (BERT-style)"""
+        ...
+
+    @property
+    @abstractmethod
+    def mask_id(self) -> int:
+        """마스크 토큰 ID (MLM)"""
+        ...
+
     # --- 필수 메서드 ---
 
     @abstractmethod

@@ -1,16 +1,16 @@
 """
 한자 전처리/후처리 모듈
 
-전처리: 한자 → <|BOHJ|>NFD음가+번호<|EOHJ|>
-후처리: <|BOHJ|>NFD음가+번호<|EOHJ|> → 한자
+전처리: 한자 → [BOHJ]NFD음가+번호[EOHJ]
+후처리: [BOHJ]NFD음가+번호[EOHJ] → 한자
 """
 import re
 import unicodedata
 from collections import defaultdict
 from hanja.table import hanja_table
 
-BOHJ = "<|BOHJ|>"
-EOHJ = "<|EOHJ|>"
+BOHJ = "[BOHJ]"
+EOHJ = "[EOHJ]"
 
 _POSTPROCESS_RE = re.compile(
     re.escape(BOHJ) + r"(.+?)\+(\d+)" + re.escape(EOHJ)
@@ -51,7 +51,7 @@ _forward_map, _reverse_map = build_tables()
 
 
 def preprocess(text):
-    """텍스트 내 한자를 <|BOHJ|>NFD음가+번호<|EOHJ|>로 치환"""
+    """텍스트 내 한자를 [BOHJ]NFD음가+번호[EOHJ]로 치환"""
     result = []
     for ch in text:
         if ch in _forward_map:
@@ -63,7 +63,7 @@ def preprocess(text):
 
 
 def postprocess(text):
-    """<|BOHJ|>NFD음가+번호<|EOHJ|> 패턴을 한자로 복원"""
+    """[BOHJ]NFD음가+번호[EOHJ] 패턴을 한자로 복원"""
     def _replace(m):
         reading = m.group(1)
         # NFC로 합쳐졌을 수 있으므로 NFD로 변환해서 조회

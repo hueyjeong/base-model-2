@@ -65,6 +65,9 @@ class KeyboardTokenizer(BaseTokenizer):
         self._unk_id = self._tokenizer.token_to_id("[UNK]")
         self._bos_id = self._tokenizer.token_to_id("[BOS]")
         self._eos_id = self._tokenizer.token_to_id("[EOS]")
+        self._sep_id = self._tokenizer.token_to_id("[SEP]")
+        self._cls_id = self._tokenizer.token_to_id("[CLS]")
+        self._mask_id = self._tokenizer.token_to_id("[MASK]")
 
     @property
     def vocab_size(self) -> int:
@@ -85,6 +88,18 @@ class KeyboardTokenizer(BaseTokenizer):
     @property
     def unk_id(self) -> int:
         return self._unk_id
+
+    @property
+    def sep_id(self) -> int:
+        return self._sep_id
+
+    @property
+    def cls_id(self) -> int:
+        return self._cls_id
+
+    @property
+    def mask_id(self) -> int:
+        return self._mask_id
 
     def encode(self, text: str, add_special: bool = True) -> List[int]:
         """텍스트 → 키보드 시퀀스 → 토큰 ID 리스트"""

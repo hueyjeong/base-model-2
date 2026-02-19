@@ -1,13 +1,12 @@
-"""Plain BBPE 토크나이저 래퍼 — BaseTokenizer 인터페이스 구현
+"""BBPE 토크나이저 래퍼 — BaseTokenizer 인터페이스 구현
 
-SentencePiece BBPE 모델을 로드하여 공통 인터페이스를 제공한다.
-MeCab 사전 분절 없이 SentencePiece 자체 토큰화만 사용한다.
+HuggingFace tokenizers JSON을 로드하여 공통 인터페이스를 제공한다.
 """
 import os
 import sys
 from typing import List
 
-import sentencepiece as spm
+from tokenizers import Tokenizer
 
 # 프로젝트 루트를 path에 추가
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -15,32 +14,34 @@ from tokenizer_base import BaseTokenizer
 
 
 class BBPETokenizer(BaseTokenizer):
-    """SentencePiece BBPE 토크나이저 래퍼 (MeCab 미사용)
+    """ByteLevel BPE 토크나이저 래퍼
 
-    SentencePiece의 자체 토큰화만 사용하며,
-    외부 형태소 분석기에 의존하지 않는다.
+    HuggingFace tokenizers JSON을 로드하여 사용한다.
+    다른 토크나이저(nfd, keyboard, char)와 동일한 형식.
     """
 
-    def __init__(self, model_path: str):
+    def __init__(self, json_path: str):
         """
         Args:
-            model_path: SentencePiece .model 파일 경로
+            json_path: HuggingFace tokenizers JSON 파일 경로
         """
-        if not os.path.exists(model_path):
-            raise FileNotFoundError(f"모델 파일을 찾을 수 없습니다: {model_path}")
+        if not os.path.exists(json_path):
+            raise FileNotFoundError(f"토크나이저 파일을 찾을 수 없습니다: {json_path}")
 
-        self._sp = spm.SentencePieceProcessor()
-        self._sp.Load(model_path)
+        self._tok = Tokenizer.from_file(json_path)
 
-        # Special token IDs (학습 시 설정한 값과 일치해야 함)
-        self._pad_id = self._sp.pad_id()   # 0
-        self._unk_id = self._sp.unk_id()   # 1
-        self._bos_id = self._sp.bos_id()   # 2
-        self._eos_id = self._sp.eos_id()   # 3
+        # Special token IDs
+        self._pad_id = self._tok.token_to_id("[PAD]")
+        self._unk_id = self._tok.token_to_id("[UNK]")
+        self._bos_id = self._tok.token_to_id("[BOS]")
+        self._eos_id = self._tok.token_to_id("[EOS]")
+        self._sep_id = self._tok.token_to_id("[SEP]")
+        self._cls_id = self._tok.token_to_id("[CLS]")
+        self._mask_id = self._tok.token_to_id("[MASK]")
 
     @property
     def vocab_size(self) -> int:
-        return self._sp.get_piece_size()
+        return self._tok.get_vocab_size()
 
     @property
     def pad_id(self) -> int:
@@ -58,6 +59,18 @@ class BBPETokenizer(BaseTokenizer):
     def unk_id(self) -> int:
         return self._unk_id
 
+    @property
+    def sep_id(self) -> int:
+        return self._sep_id
+
+    @property
+    def cls_id(self) -> int:
+        return self._cls_id
+
+    @property
+    def mask_id(self) -> int:
+        return self._mask_id
+
     def encode(self, text: str, add_special: bool = True) -> List[int]:
         """텍스트 → 토큰 ID 리스트
 
@@ -67,7 +80,8 @@ class BBPETokenizer(BaseTokenizer):
         Returns:
             토큰 ID 리스트
         """
-        ids = self._sp.encode(text, out_type=int)
+        encoded = self._tok.encode(text)
+        ids = encoded.ids
         if add_special:
             ids = [self._bos_id] + ids + [self._eos_id]
         return ids
@@ -84,29 +98,30 @@ class BBPETokenizer(BaseTokenizer):
         if skip_special:
             special = {self._pad_id, self._bos_id, self._eos_id, self._unk_id}
             ids = [i for i in ids if i not in special]
-        return self._sp.decode(ids)
+        return self._tok.decode(ids, skip_special_tokens=False)
 
     def encode_batch(self, texts: List[str], add_special: bool = True) -> List[List[int]]:
-        """배치 인코딩 (SentencePiece 네이티브 배치)"""
-        all_ids = self._sp.encode(texts, out_type=int)
+        """배치 인코딩"""
+        encoded_list = self._tok.encode_batch(texts)
+        all_ids = [enc.ids for enc in encoded_list]
         if add_special:
             all_ids = [[self._bos_id] + ids + [self._eos_id] for ids in all_ids]
         return all_ids
 
     def id_to_piece(self, id: int) -> str:
         """토큰 ID → 토큰 문자열"""
-        return self._sp.id_to_piece(id)
+        return self._tok.id_to_token(id)
 
     def piece_to_id(self, piece: str) -> int:
         """토큰 문자열 → 토큰 ID"""
-        return self._sp.piece_to_id(piece)
+        return self._tok.token_to_id(piece)
 
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Plain BBPE 토크나이저 테스트")
-    parser.add_argument("--model", "-m", required=True, help="SentencePiece .model 파일 경로")
+    parser = argparse.ArgumentParser(description="BBPE 토크나이저 테스트")
+    parser.add_argument("--model", "-m", required=True, help="토크나이저 JSON 파일 경로")
     parser.add_argument("--test", action="store_true", help="테스트 실행")
     args = parser.parse_args()
 
