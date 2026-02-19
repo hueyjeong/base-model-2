@@ -68,6 +68,7 @@ class BitMambaSeq2Seq(nn.Module):
             dt_rank=config.dt_rank,
             d_ff=config.d_ff,
             n_heads=config.n_heads,
+            n_kv_heads=config.n_kv_heads,
             dropout=config.dropout,
             rms_norm_eps=config.rms_norm_eps,
         )

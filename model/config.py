@@ -47,6 +47,7 @@ class BitMambaSeq2SeqConfig:
 
     # Cross-Attention 파라미터
     n_heads: int = 12
+    n_kv_heads: int | None = None   # GQA KV 헤드 수 (None=MHA, 1=MQA)
 
     # 토크나이저/시퀀스
     vocab_size: int = 64000
@@ -78,5 +79,8 @@ class BitMambaSeq2SeqConfig:
         assert self.d_model > 0, "d_model must be positive"
         assert self.d_model % self.n_heads == 0, \
             f"d_model({self.d_model}) must be divisible by n_heads({self.n_heads})"
+        if self.n_kv_heads is not None:
+            assert self.n_heads % self.n_kv_heads == 0, \
+                f"n_heads({self.n_heads}) must be divisible by n_kv_heads({self.n_kv_heads})"
         assert self.d_inner > 0, "d_inner must be positive"
         assert self.d_state > 0, "d_state must be positive"

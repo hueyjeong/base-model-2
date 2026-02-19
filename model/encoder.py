@@ -5,6 +5,7 @@
 """
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from model.mamba_block import MambaBlock
 from model.bitlinear import BitLinear
@@ -113,6 +114,7 @@ class Encoder(nn.Module):
         rms_norm_eps: float = 1e-6,
     ):
         super().__init__()
+        self.gradient_checkpointing = False
         self.layers = nn.ModuleList([
             EncoderLayer(
                 d_model=d_model,
@@ -135,5 +137,8 @@ class Encoder(nn.Module):
             (batch, seq_len, d_model)  — 인코더 최종 출력
         """
         for layer in self.layers:
-            x = layer(x)
+            if self.gradient_checkpointing and self.training:
+                x = checkpoint(layer, x, use_reentrant=False)
+            else:
+                x = layer(x)
         return x

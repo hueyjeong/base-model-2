@@ -7,6 +7,7 @@
 """
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from model.mamba_block import MambaBlock
 from model.cross_attention import CrossAttention
@@ -25,6 +26,7 @@ class DecoderLayer(nn.Module):
         dt_rank: int,
         d_ff: int,
         n_heads: int,
+        n_kv_heads: int | None = None,
         dropout: float = 0.1,
         rms_norm_eps: float = 1e-6,
     ):
@@ -43,6 +45,7 @@ class DecoderLayer(nn.Module):
         self.cross_attn = CrossAttention(
             d_model=d_model,
             n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
             dropout=dropout,
         )
         self.norm2 = RMSNorm(d_model, eps=rms_norm_eps)
@@ -102,10 +105,12 @@ class Decoder(nn.Module):
         dt_rank: int,
         d_ff: int,
         n_heads: int,
+        n_kv_heads: int | None = None,
         dropout: float = 0.1,
         rms_norm_eps: float = 1e-6,
     ):
         super().__init__()
+        self.gradient_checkpointing = False
         self.layers = nn.ModuleList([
             DecoderLayer(
                 d_model=d_model,
@@ -115,6 +120,7 @@ class Decoder(nn.Module):
                 dt_rank=dt_rank,
                 d_ff=d_ff,
                 n_heads=n_heads,
+                n_kv_heads=n_kv_heads,
                 dropout=dropout,
                 rms_norm_eps=rms_norm_eps,
             )
@@ -137,5 +143,11 @@ class Decoder(nn.Module):
             (batch, tgt_len, d_model)  — 디코더 최종 출력
         """
         for layer in self.layers:
-            x = layer(x, encoder_out, encoder_mask)
+            if self.gradient_checkpointing and self.training:
+                x = checkpoint(
+                    layer, x, encoder_out, encoder_mask,
+                    use_reentrant=False,
+                )
+            else:
+                x = layer(x, encoder_out, encoder_mask)
         return x
