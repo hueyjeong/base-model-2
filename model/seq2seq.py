@@ -1,6 +1,7 @@
 """BitMamba Seq2Seq — 전체 Encoder-Decoder 모델
 
-FP16 Embedding → Encoder(Mamba + BitNet) → Decoder(Mamba + CrossAttn + BitNet) → LM Head
+FP16 Embedding → Encoder(Mamba + BitNet) → Decoder(Mamba concat + BitNet) → LM Head
+Cross-Attention 없이 encoder 출력을 decoder 입력에 concat하여 Mamba state로 전달.
 """
 import torch
 import torch.nn as nn
@@ -17,7 +18,7 @@ class BitMambaSeq2Seq(nn.Module):
         - FP16 임베딩 (경량)
         - Mamba SSM 기반 시퀀스 모델링
         - BitNet 1.58b ternary FFN
-        - Cross-attention (디코더 → 인코더)
+        - Cross-Attention 없음 (Mamba concat 방식)
         - 임베딩 weight tying (옵션)
     """
 
@@ -58,7 +59,7 @@ class BitMambaSeq2Seq(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
         )
 
-        # --- 디코더 ---
+        # --- 디코더 (Cross-Attention 없음, Mamba concat 방식) ---
         self.decoder = Decoder(
             n_layers=config.n_decoder_layers,
             d_model=config.d_model,
@@ -67,8 +68,6 @@ class BitMambaSeq2Seq(nn.Module):
             d_conv=config.d_conv,
             dt_rank=config.dt_rank,
             d_ff=config.d_ff,
-            n_heads=config.n_heads,
-            n_kv_heads=config.n_kv_heads,
             dropout=config.dropout,
             rms_norm_eps=config.rms_norm_eps,
         )
@@ -130,20 +129,32 @@ class BitMambaSeq2Seq(nn.Module):
     ) -> torch.Tensor:
         """디코더 forward → logits
 
+        Encoder 출력을 target 임베딩 앞에 concat하여 Mamba로 처리.
+        Cross-Attention 없이 Mamba의 recurrent state로 encoder 정보 전달.
+
         Args:
             tgt_ids: (B, tgt_len) — 타겟 토큰 ID
             encoder_out: (B, src_len, d_model)
-            encoder_mask: (B, src_len)
+            encoder_mask: (B, src_len) — 미사용 (호환성 유지)
 
         Returns:
             logits: (B, tgt_len, vocab_size)
         """
-        # 임베딩 (FP16 → FP32 변환)
-        x = self.decoder_embedding(tgt_ids).float() * self.embed_scale
-        x = self.embed_dropout(x)
+        src_len = encoder_out.size(1)
 
-        # 디코더 스택
-        x = self.decoder(x, encoder_out, encoder_mask)
+        # 타겟 임베딩 (FP16 → FP32 변환)
+        tgt_emb = self.decoder_embedding(tgt_ids).float() * self.embed_scale
+        tgt_emb = self.embed_dropout(tgt_emb)
+
+        # Encoder 출력 + Target 임베딩 concat
+        # [encoder_out (B, src_len, d)] ; [tgt_emb (B, tgt_len, d)]
+        x = torch.cat([encoder_out, tgt_emb], dim=1)  # (B, src_len + tgt_len, d)
+
+        # 디코더 스택 (Mamba가 encoder 정보를 state로 축적)
+        x = self.decoder(x)
+
+        # Target 부분만 슬라이스
+        x = x[:, src_len:, :]  # (B, tgt_len, d_model)
 
         # 최종 정규화 + LM Head
         x = self.final_norm(x)

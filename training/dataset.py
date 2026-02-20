@@ -94,43 +94,56 @@ class StreamingPackedDataset(IterableDataset):
                     yield text, lang
 
     def _pack_sequences(self, noised_pairs):
-        """(noised_ids, target_ids) 스트림을 pack_size까지 이어붙이기
+        """(noised_ids, target_ids, n_chars) 스트림을 pack_size까지 이어붙이기
 
         noised_ids, target_ids 모두 이미 [BOS]...[EOS] 포함 상태.
         패킹은 단순 연결: [BOS]s1[EOS][BOS]s2[EOS]...
         """
         src_buf = []
         tgt_buf = []
+        char_buf = 0
 
-        for noised_ids, target_ids in noised_pairs:
+        for noised_ids, target_ids, n_chars in noised_pairs:
             src_buf.extend(noised_ids)
             tgt_buf.extend(target_ids)
+            char_buf += n_chars
 
             # pack_size 이상이면 yield
             if len(src_buf) >= self.pack_size or len(tgt_buf) >= self.pack_size:
-                yield self._make_sample(src_buf, tgt_buf)
+                yield self._make_sample(src_buf, tgt_buf, char_buf)
                 src_buf = []
                 tgt_buf = []
+                char_buf = 0
 
         # 잔여 버퍼 (마지막 불완전 팩)
         if src_buf:
-            yield self._make_sample(src_buf, tgt_buf)
+            yield self._make_sample(src_buf, tgt_buf, char_buf)
 
-    def _make_sample(self, src_ids, tgt_ids):
+    def _make_sample(self, src_ids, tgt_ids, n_chars=0):
         """버퍼 → 텐서 dict (pack_size 초과 시 truncate)"""
         src_ids = src_ids[:self.pack_size]
         tgt_ids = tgt_ids[:self.pack_size]
         return {
             "src_ids": torch.tensor(src_ids, dtype=torch.long),
             "tgt_ids": torch.tensor(tgt_ids, dtype=torch.long),
+            "n_chars": n_chars,
         }
 
     def __iter__(self):
-        """스트리밍 → 노이즈 적용 → 패킹 → yield"""
+        """스트리밍 → 노이즈 적용 → 패킹 → yield
+
+        num_workers > 0일 때 각 worker가 다른 줄을 처리하도록 분할.
+        """
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info else 0
+        num_workers = worker_info.num_workers if worker_info else 1
+
         def noised_stream():
-            for text, lang in self._iter_lines():
+            for i, (text, lang) in enumerate(self._iter_lines()):
+                if i % num_workers != worker_id:
+                    continue
                 noised_ids, target_ids = self.noiser(text, lang)
-                yield noised_ids, target_ids
+                yield noised_ids, target_ids, len(text)
 
         yield from self._pack_sequences(noised_stream())
 
