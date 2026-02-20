@@ -79,32 +79,32 @@ def load_tokenizer(name: str, path: str | None = None):
 
 SMALL_CONFIGS = {
     "8M": dict(
-        d_model=256, d_inner=512, d_ff=448,
+        d_model=288, d_inner=576, d_ff=544,
         n_encoder_layers=3, n_decoder_layers=5,
-        n_heads=8, n_kv_heads=4, dt_rank=16,
+        n_heads=8, n_kv_heads=4, dt_rank=18,
         d_state=16, d_conv=4,
     ),
     "16M": dict(
-        d_model=320, d_inner=640, d_ff=640,
-        n_encoder_layers=4, n_decoder_layers=6,
-        n_heads=8, n_kv_heads=4, dt_rank=20,
+        d_model=352, d_inner=704, d_ff=640,
+        n_encoder_layers=4, n_decoder_layers=7,
+        n_heads=8, n_kv_heads=4, dt_rank=22,
         d_state=16, d_conv=4,
     ),
     "32M": dict(
         d_model=448, d_inner=896, d_ff=768,
-        n_encoder_layers=4, n_decoder_layers=7,
+        n_encoder_layers=5, n_decoder_layers=9,
         n_heads=8, n_kv_heads=4, dt_rank=28,
         d_state=16, d_conv=4,
     ),
     "64M": dict(
-        d_model=512, d_inner=1024, d_ff=896,
+        d_model=576, d_inner=1152, d_ff=1088,
         n_encoder_layers=6, n_decoder_layers=10,
-        n_heads=8, n_kv_heads=4, dt_rank=32,
+        n_heads=8, n_kv_heads=4, dt_rank=36,
         d_state=16, d_conv=4,
     ),
     "128M": dict(
         d_model=768, d_inner=1536, d_ff=1280,
-        n_encoder_layers=6, n_decoder_layers=10,
+        n_encoder_layers=7, n_decoder_layers=12,
         n_heads=12, n_kv_heads=4, dt_rank=48,
         d_state=16, d_conv=4,
     ),
@@ -121,7 +121,7 @@ except ImportError:
     FUSED_CE_AVAILABLE = False
 
 def validate(model, val_loader, criterion, config, device, use_amp, n_steps,
-             fused_ce_loss=None):
+             fused_ce_loss=None, amp_dtype=torch.float16):
     """검증 루프: n_steps 배치에 대해 평균 loss 및 BPC 계산"""
     model.eval()
     total_loss = 0.0
@@ -147,7 +147,7 @@ def validate(model, val_loader, criterion, config, device, use_amp, n_steps,
             if fused_ce_loss is not None:
                 # Fused CE: logits 텐서 미생성
                 if use_amp:
-                    with torch.amp.autocast("cuda"):
+                    with torch.amp.autocast("cuda", dtype=amp_dtype):
                         encoder_out = model.encode(src_ids, src_mask)
                         hidden = model.decode(tgt_input, encoder_out,
                                               src_mask, return_hidden=True)
@@ -168,7 +168,7 @@ def validate(model, val_loader, criterion, config, device, use_amp, n_steps,
             else:
                 # 기존 방식
                 if use_amp:
-                    with torch.amp.autocast("cuda"):
+                    with torch.amp.autocast("cuda", dtype=amp_dtype):
                         logits = model(src_ids, tgt_input, src_mask)
                         loss = criterion(
                             logits.view(-1, config.vocab_size),
@@ -330,9 +330,19 @@ def train(args):
     # Loss: cross-entropy (PAD 무시)
     criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_id)
 
-    # AMP scaler
-    use_amp = args.amp and torch.cuda.is_available()
-    scaler = torch.amp.GradScaler("cuda") if use_amp else None
+    # AMP 설정 (BF16 우선, FP16 fallback)
+    use_amp = (args.bf16 or args.amp) and torch.cuda.is_available()
+    if args.bf16 and torch.cuda.is_available():
+        amp_dtype = torch.bfloat16
+        scaler = None  # BF16은 GradScaler 불필요 (FP32 동일 dynamic range)
+        print(f"⚡ BF16 Mixed Precision 활성화 (GradScaler 없음)")
+    elif args.amp and torch.cuda.is_available():
+        amp_dtype = torch.float16
+        scaler = torch.amp.GradScaler("cuda")
+        print(f"⚡ FP16 Mixed Precision 활성화 (GradScaler 사용)")
+    else:
+        amp_dtype = None
+        scaler = None
 
     # ── 체크포인트 재시작 ──
     start_step = 0
@@ -355,6 +365,11 @@ def train(args):
     print(f"  effective batch = {args.batch_size} × {args.grad_accum_steps} = {args.batch_size * args.grad_accum_steps} packs")
     print(f"  종료 기준: {stop_mode}")
     print("=" * 60)
+
+    # torch.compile (커널 fusion으로 속도 향상)
+    if args.compile:
+        print("🔧 torch.compile 적용 중... (첫 step 느림, 이후 빠름)")
+        model = torch.compile(model)
 
     model.train()
     optimizer.zero_grad()
@@ -396,7 +411,7 @@ def train(args):
             if fused_ce_loss is not None:
                 # ── Fused Cross-Entropy (logits 미생성) ──
                 if use_amp:
-                    with torch.amp.autocast("cuda"):
+                    with torch.amp.autocast("cuda", dtype=amp_dtype):
                         encoder_out = model.encode(src_ids, src_mask)
                         hidden = model.decode(tgt_input, encoder_out,
                                               src_mask, return_hidden=True)
@@ -406,7 +421,10 @@ def train(args):
                             tgt_target.reshape(-1),
                         )
                         loss = loss / args.grad_accum_steps
-                    scaler.scale(loss).backward()
+                    if scaler:
+                        scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
                 else:
                     encoder_out = model.encode(src_ids, src_mask)
                     hidden = model.decode(tgt_input, encoder_out,
@@ -421,14 +439,17 @@ def train(args):
             else:
                 # ── 기존 방식 ──
                 if use_amp:
-                    with torch.amp.autocast("cuda"):
+                    with torch.amp.autocast("cuda", dtype=amp_dtype):
                         logits = model(src_ids, tgt_input, src_mask)
                         loss = criterion(
                             logits.view(-1, config.vocab_size),
                             tgt_target.reshape(-1),
                         )
                         loss = loss / args.grad_accum_steps
-                    scaler.scale(loss).backward()
+                    if scaler:
+                        scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
                 else:
                     logits = model(src_ids, tgt_input, src_mask)
                     loss = criterion(
@@ -454,7 +475,7 @@ def train(args):
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
-        if use_amp:
+        if scaler:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
@@ -491,6 +512,7 @@ def train(args):
             val_loss, val_bpc = validate(
                 model, val_loader, criterion, config, device,
                 use_amp, args.val_steps, fused_ce_loss=fused_ce_loss,
+                amp_dtype=amp_dtype,
             )
             print(f"  📊 val step {global_step:>7d} | val_loss {val_loss:.4f} | val_bpc {val_bpc:.3f}")
 
@@ -561,9 +583,13 @@ def main():
     parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping")
     parser.add_argument("--fused_ce", action="store_true",
                         help="Fused Cross-Entropy (liger-kernel). logits 메모리 0으로 절약")
-    parser.add_argument("--amp", action="store_true", help="Mixed precision (AMP)")
+    parser.add_argument("--amp", action="store_true", help="FP16 Mixed precision (AMP)")
+    parser.add_argument("--bf16", action="store_true",
+                        help="BF16 Mixed precision (FP32 동일 범위, scaler 불필요, 더 안정적)")
     parser.add_argument("--grad_ckpt", action="store_true",
                         help="Gradient checkpointing (활성화 시 활성화 메모리 3~4배 절약)")
+    parser.add_argument("--compile", action="store_true",
+                        help="torch.compile 적용 (커널 fusion, 첫 step 느리나 이후 1.3~2x 빠름)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_workers", type=int, default=4,
                         help="DataLoader worker 수 (0=메인 프로세스만)")

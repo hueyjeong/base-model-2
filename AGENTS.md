@@ -31,8 +31,13 @@ base-model-2/
 │   ├── encoder.py             # Mamba-based encoder
 │   ├── decoder.py             # Mamba-based decoder
 │   ├── mamba_block.py         # Mamba SSM block
-│   ├── bitlinear.py           # BitLinear (1-bit weight) layer
-│   └── cross_attention.py     # Cross-attention between encoder/decoder
+│   ├── bitlinear.py           # BitLinear (1.58b weight, 8-bit activation) layer
+│   └── cross_attention.py     # (Deprecated) Cross-attention between encoder/decoder
+│
+├── training/                  # Pre-training scripts
+│   ├── pretrain.py            # Main pre-training script (supports AMP, Fused CE, JIT)
+│   ├── dataset.py             # Streaming packed dataset logic
+│   └── noising.py             # BART-style noise generation
 │
 ├── nfd_tokenizer/             # NFD-decomposition + ByteLevel BPE tokenizer
 │   ├── make_tokenizer.py      # Builds tokenizer vocabulary & merges
@@ -122,8 +127,8 @@ Tokenizer-specific tokens:
 The model is a **BitNet-Mamba Seq2Seq** (encoder-decoder):
 
 - **Encoder**: Stacked Mamba blocks (SSM-based, no attention)
-- **Decoder**: Stacked Mamba blocks + cross-attention to encoder outputs
-- **BitLinear**: 1-bit quantized linear layers (weights are ternary: {-1, 0, +1})
+- **Decoder**: Stacked Mamba blocks (encoder outputs concatenated ahead of target embeddings, relying purely on Mamba's recurrent state; no cross-attention)
+- **BitLinear**: 1.58-bit ternary quantized linear layers (weights are ternary: {-1, 0, +1}, activations are 8-bit)
 - **Embedding**: Optionally shared between encoder/decoder, and optionally tied with the LM head
 
 Default config (`BitMambaSeq2SeqConfig`):
@@ -131,7 +136,7 @@ Default config (`BitMambaSeq2SeqConfig`):
 - `n_encoder_layers=6`, `n_decoder_layers=10`
 - `n_heads=12`, `d_ff=1280`
 - `vocab_size=64000`, `max_seq_len=512`
-- Target: ~128M parameters (excluding embeddings)
+- Target: Ranging from ~8M up to ~128M parameters (excluding embeddings, managed via `SMALL_CONFIGS` in `pretrain.py`)
 
 ---
 
@@ -173,6 +178,15 @@ Run `python verify_model.py` from the project root to:
 3. Run a forward pass with random inputs
 4. Run a backward pass and check for NaN/Inf gradients
 5. Test config JSON serialization roundtrip
+
+### Pre-training
+The model uses `training/pretrain.py` for training the Seq2Seq BitMamba architecture across a custom corpus.
+- **Metrics**: Uses `Bits Per Character (BPC)` for metric stability, measuring loss against `--max_chars` to compare disparate tokenizer performances fairly.
+- **Optimization Strategy**: 
+  - Requires PyTorch `bfloat16` (`--bf16`) for mixed-precision to avoid BitLinear scaler overflow.
+  - Leverages `liger-kernel` for Fused Cross-Entropy (`--fused_ce`) to completely avoid materializing `logits` matrices in VRAM.
+  - Supports `torch.compile` (`--compile`) for JIT kernel fusions and speedups.
+  - Provides Gradient Checkpointing (`--grad_ckpt`) and chunked cross-entropy fallback (`--chunk_ce`).
 
 ### Testing
 - Most scripts include inline `if __name__ == "__main__"` test blocks
