@@ -126,8 +126,9 @@ class BitMambaSeq2Seq(nn.Module):
         tgt_ids: torch.Tensor,
         encoder_out: torch.Tensor,
         encoder_mask: torch.Tensor | None = None,
+        return_hidden: bool = False,
     ) -> torch.Tensor:
-        """디코더 forward → logits
+        """디코더 forward → logits (또는 hidden states)
 
         Encoder 출력을 target 임베딩 앞에 concat하여 Mamba로 처리.
         Cross-Attention 없이 Mamba의 recurrent state로 encoder 정보 전달.
@@ -136,9 +137,12 @@ class BitMambaSeq2Seq(nn.Module):
             tgt_ids: (B, tgt_len) — 타겟 토큰 ID
             encoder_out: (B, src_len, d_model)
             encoder_mask: (B, src_len) — 미사용 (호환성 유지)
+            return_hidden: True면 lm_head 적용 전 hidden states 반환
+                           (chunked cross-entropy용)
 
         Returns:
-            logits: (B, tgt_len, vocab_size)
+            return_hidden=False: logits (B, tgt_len, vocab_size)
+            return_hidden=True:  hidden (B, tgt_len, d_model)
         """
         src_len = encoder_out.size(1)
 
@@ -156,8 +160,12 @@ class BitMambaSeq2Seq(nn.Module):
         # Target 부분만 슬라이스
         x = x[:, src_len:, :]  # (B, tgt_len, d_model)
 
-        # 최종 정규화 + LM Head
+        # 최종 정규화
         x = self.final_norm(x)
+
+        # Chunked CE용: hidden states 반환
+        if return_hidden:
+            return x
 
         # LM Head: weight tying 시 임베딩이 FP16이므로 FP32로 변환 후 matmul
         if self.config.tie_lm_head:

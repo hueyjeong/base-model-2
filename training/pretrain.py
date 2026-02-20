@@ -19,6 +19,7 @@ import time
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -110,7 +111,17 @@ SMALL_CONFIGS = {
 }
 
 
-def validate(model, val_loader, criterion, config, device, use_amp, n_steps):
+# ── Fused Cross-Entropy (liger-kernel) ──────────────────────────────
+try:
+    from liger_kernel.transformers.fused_linear_cross_entropy import (
+        LigerFusedLinearCrossEntropyLoss,
+    )
+    FUSED_CE_AVAILABLE = True
+except ImportError:
+    FUSED_CE_AVAILABLE = False
+
+def validate(model, val_loader, criterion, config, device, use_amp, n_steps,
+             fused_ce_loss=None):
     """검증 루프: n_steps 배치에 대해 평균 loss 및 BPC 계산"""
     model.eval()
     total_loss = 0.0
@@ -133,23 +144,46 @@ def validate(model, val_loader, criterion, config, device, use_amp, n_steps):
             tgt_input = tgt_ids[:, :-1]
             tgt_target = tgt_ids[:, 1:]
 
-            if use_amp:
-                with torch.amp.autocast("cuda"):
+            if fused_ce_loss is not None:
+                # Fused CE: logits 텐서 미생성
+                if use_amp:
+                    with torch.amp.autocast("cuda"):
+                        encoder_out = model.encode(src_ids, src_mask)
+                        hidden = model.decode(tgt_input, encoder_out,
+                                              src_mask, return_hidden=True)
+                        loss = fused_ce_loss(
+                            model.lm_head.weight,
+                            hidden.view(-1, hidden.size(-1)),
+                            tgt_target.reshape(-1),
+                        )
+                else:
+                    encoder_out = model.encode(src_ids, src_mask)
+                    hidden = model.decode(tgt_input, encoder_out,
+                                          src_mask, return_hidden=True)
+                    loss = fused_ce_loss(
+                        model.lm_head.weight,
+                        hidden.view(-1, hidden.size(-1)),
+                        tgt_target.reshape(-1),
+                    )
+            else:
+                # 기존 방식
+                if use_amp:
+                    with torch.amp.autocast("cuda"):
+                        logits = model(src_ids, tgt_input, src_mask)
+                        loss = criterion(
+                            logits.view(-1, config.vocab_size),
+                            tgt_target.reshape(-1),
+                        )
+                else:
                     logits = model(src_ids, tgt_input, src_mask)
                     loss = criterion(
                         logits.view(-1, config.vocab_size),
                         tgt_target.reshape(-1),
                     )
-            else:
-                logits = model(src_ids, tgt_input, src_mask)
-                loss = criterion(
-                    logits.view(-1, config.vocab_size),
-                    tgt_target.reshape(-1),
-                )
 
-            n_tokens = (tgt_target != criterion.ignore_index).sum().item()
-            total_loss += loss.item() * n_tokens
-            total_tokens += n_tokens
+            n_tok = (tgt_target != config.pad_id).sum().item()
+            total_loss += loss.item() * n_tok
+            total_tokens += n_tok
             total_chars += n_chars
 
     model.train()
@@ -247,6 +281,19 @@ def train(args):
         )
         print(f"검증 데이터: {args.val_corpus}")
 
+    # Fused Cross-Entropy 설정
+    fused_ce_loss = None
+    if args.fused_ce:
+        if not FUSED_CE_AVAILABLE:
+            print("⚠️  liger-kernel 미설치. pip install liger-kernel 후 재시도")
+            print("   기존 CE 방식으로 대체합니다.")
+        else:
+            fused_ce_loss = LigerFusedLinearCrossEntropyLoss(
+                ignore_index=config.pad_id,
+                reduction="mean",
+            )
+            print(f"💫 Fused Cross-Entropy 활성화 (logits 메모리 0)")
+
     # DataLoader: IterableDataset이므로 shuffle 불필요
     def collate_packed(batch):
         """패킹된 샘플들을 배치로 묶기 (길이가 다를 수 있으므로 패딩)"""
@@ -313,7 +360,7 @@ def train(args):
     optimizer.zero_grad()
 
     global_step = start_step
-    total_chars = 0
+    total_chars = args.start_chars
     accum_loss = 0.0
     accum_tokens = 0
     log_loss = 0.0
@@ -346,23 +393,50 @@ def train(args):
             tgt_input = tgt_ids[:, :-1]
             tgt_target = tgt_ids[:, 1:]
 
-            if use_amp:
-                with torch.amp.autocast("cuda"):
+            if fused_ce_loss is not None:
+                # ── Fused Cross-Entropy (logits 미생성) ──
+                if use_amp:
+                    with torch.amp.autocast("cuda"):
+                        encoder_out = model.encode(src_ids, src_mask)
+                        hidden = model.decode(tgt_input, encoder_out,
+                                              src_mask, return_hidden=True)
+                        loss = fused_ce_loss(
+                            model.lm_head.weight,
+                            hidden.view(-1, hidden.size(-1)),
+                            tgt_target.reshape(-1),
+                        )
+                        loss = loss / args.grad_accum_steps
+                    scaler.scale(loss).backward()
+                else:
+                    encoder_out = model.encode(src_ids, src_mask)
+                    hidden = model.decode(tgt_input, encoder_out,
+                                          src_mask, return_hidden=True)
+                    loss = fused_ce_loss(
+                        model.lm_head.weight,
+                        hidden.view(-1, hidden.size(-1)),
+                        tgt_target.reshape(-1),
+                    )
+                    loss = loss / args.grad_accum_steps
+                    loss.backward()
+            else:
+                # ── 기존 방식 ──
+                if use_amp:
+                    with torch.amp.autocast("cuda"):
+                        logits = model(src_ids, tgt_input, src_mask)
+                        loss = criterion(
+                            logits.view(-1, config.vocab_size),
+                            tgt_target.reshape(-1),
+                        )
+                        loss = loss / args.grad_accum_steps
+                    scaler.scale(loss).backward()
+                else:
                     logits = model(src_ids, tgt_input, src_mask)
                     loss = criterion(
                         logits.view(-1, config.vocab_size),
                         tgt_target.reshape(-1),
                     )
                     loss = loss / args.grad_accum_steps
-                scaler.scale(loss).backward()
-            else:
-                logits = model(src_ids, tgt_input, src_mask)
-                loss = criterion(
-                    logits.view(-1, config.vocab_size),
-                    tgt_target.reshape(-1),
-                )
-                loss = loss / args.grad_accum_steps
-                loss.backward()
+                    loss.backward()
 
             n_tokens = tgt_target.numel()
             accum_loss += loss.item() * args.grad_accum_steps
@@ -373,7 +447,7 @@ def train(args):
             total_chars += batch_chars
 
             # 메모리 해제: 계산 그래프 참조 제거
-            del logits, loss, src_ids, tgt_ids, src_mask, tgt_input, tgt_target
+            del loss, src_ids, tgt_ids, src_mask, tgt_input, tgt_target
 
         # Optimizer step
         lr = get_lr(global_step, args.warmup_steps, args.lr, args.max_steps)
@@ -416,7 +490,7 @@ def train(args):
         if val_loader is not None and args.val_every and global_step % args.val_every == 0:
             val_loss, val_bpc = validate(
                 model, val_loader, criterion, config, device,
-                use_amp, args.val_steps,
+                use_amp, args.val_steps, fused_ce_loss=fused_ce_loss,
             )
             print(f"  📊 val step {global_step:>7d} | val_loss {val_loss:.4f} | val_bpc {val_bpc:.3f}")
 
@@ -475,6 +549,8 @@ def main():
     parser.add_argument("--max_steps", type=int, default=100000, help="최대 학습 스텝")
     parser.add_argument("--max_chars", type=int, default=None,
                         help="총 문자 예산 (예: 500_000_000). 설정 시 이 문자 수 도달하면 종료")
+    parser.add_argument("--start_chars", type=int, default=0,
+                        help="이미 학습한 문자 수 (resume 시 사용)")
     parser.add_argument("--grad_accum_steps", type=int, default=32,
                         help="Gradient accumulation 스텝 (effective batch size)")
     parser.add_argument("--pack_size", type=int, default=2048,
@@ -483,6 +559,8 @@ def main():
                         help="DataLoader 배치 크기 (pack 단위)")
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping")
+    parser.add_argument("--fused_ce", action="store_true",
+                        help="Fused Cross-Entropy (liger-kernel). logits 메모리 0으로 절약")
     parser.add_argument("--amp", action="store_true", help="Mixed precision (AMP)")
     parser.add_argument("--grad_ckpt", action="store_true",
                         help="Gradient checkpointing (활성화 시 활성화 메모리 3~4배 절약)")
