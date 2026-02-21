@@ -108,7 +108,7 @@ class BitMambaSeq2Seq(nn.Module):
 
         Args:
             src_ids: (B, src_len) — 소스 토큰 ID
-            src_mask: (B, src_len) — 소스 패딩 마스크 (옵션)
+            src_mask: (B, src_len) — 소스 패딩 마스크 (True=유효, False=패딩)
 
         Returns:
             encoder_out: (B, src_len, d_model)
@@ -116,6 +116,10 @@ class BitMambaSeq2Seq(nn.Module):
         # 임베딩 (FP16 → FP32 변환)
         x = self.encoder_embedding(src_ids).float() * self.embed_scale
         x = self.embed_dropout(x)
+
+        # 패딩 위치를 0으로 마스킹 → Mamba SSM state에 패딩 정보 유입 방지
+        if src_mask is not None:
+            x = x * src_mask.unsqueeze(-1).float()  # (B, src_len, 1)
 
         # 인코더 스택
         encoder_out = self.encoder(x)
@@ -136,7 +140,7 @@ class BitMambaSeq2Seq(nn.Module):
         Args:
             tgt_ids: (B, tgt_len) — 타겟 토큰 ID
             encoder_out: (B, src_len, d_model)
-            encoder_mask: (B, src_len) — 미사용 (호환성 유지)
+            encoder_mask: (B, src_len) — 패딩 마스크 (True=유효, False=패딩)
             return_hidden: True면 lm_head 적용 전 hidden states 반환
                            (chunked cross-entropy용)
 
@@ -149,6 +153,10 @@ class BitMambaSeq2Seq(nn.Module):
         # 타겟 임베딩 (FP16 → FP32 변환)
         tgt_emb = self.decoder_embedding(tgt_ids).float() * self.embed_scale
         tgt_emb = self.embed_dropout(tgt_emb)
+
+        # 패딩 위치의 encoder_out을 0으로 마스킹 → 디코더 Mamba state 오염 방지
+        if encoder_mask is not None:
+            encoder_out = encoder_out * encoder_mask.unsqueeze(-1).float()
 
         # Encoder 출력 + Target 임베딩 concat
         # [encoder_out (B, src_len, d)] ; [tgt_emb (B, tgt_len, d)]
