@@ -252,6 +252,11 @@ def train(args):
     print(f"  임베딩 제외 파라미터: {format_params(counts['total_excl_embedding'])}")
     print(f"  전체 파라미터: {format_params(counts['total'])}")
 
+    # INT8 텐서코어 BitLinear 교체
+    if args.int8:
+        from model.triton_bitlinear import replace_bitlinear_with_triton
+        model = replace_bitlinear_with_triton(model)
+
     # Gradient Checkpointing
     if args.grad_ckpt:
         model.encoder.gradient_checkpointing = True
@@ -368,8 +373,11 @@ def train(args):
 
     # torch.compile (커널 fusion으로 속도 향상)
     if args.compile:
-        print("🔧 torch.compile 적용 중... (첫 step 느림, 이후 빠름)")
-        model = torch.compile(model)
+        if args.int8:
+            print("⚠️  --int8과 --compile은 동시 사용 불가 (custom autograd). --compile 건너뜀")
+        else:
+            print("🔧 torch.compile 적용 중... (첫 step 느림, 이후 빠름)")
+            model = torch.compile(model)
 
     model.train()
     optimizer.zero_grad()
@@ -590,6 +598,8 @@ def main():
                         help="Gradient checkpointing (활성화 시 활성화 메모리 3~4배 절약)")
     parser.add_argument("--compile", action="store_true",
                         help="torch.compile 적용 (커널 fusion, 첫 step 느리나 이후 1.3~2x 빠름)")
+    parser.add_argument("--int8", action="store_true",
+                        help="INT8 tensor core BitLinear (Triton 퓨전 양자화 + INT8 matmul)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_workers", type=int, default=4,
                         help="DataLoader worker 수 (0=메인 프로세스만)")
