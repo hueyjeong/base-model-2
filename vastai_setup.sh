@@ -7,9 +7,9 @@ export DEBIAN_FRONTEND=noninteractive
 export PYTHONUNBUFFERED=1
 export PIP_NO_CACHE_DIR=1
 
-# CUDA 12.1 경로 설정 (Vast.ai 기본 이미지 등에 설치되어 있을 경우)
-export PATH=/usr/local/cuda-12.1/bin${PATH:+:${PATH}}
-export LD_LIBRARY_PATH=/usr/local/cuda-12.1/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
+# CUDA 13.0 경로 설정 (Vast.ai 기본 이미지 등에 설치되어 있을 경우)
+export PATH=/usr/local/cuda-13.0/bin${PATH:+:${PATH}}
+export LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
 
 # 한국어 미캡(Mecab) 및 시스템 패키지 설치
 echo "1. 시스템 패키지 설치 시작..."
@@ -58,16 +58,16 @@ if [ -d "/workspace/base-model-2" ]; then
     python3.12 -m venv .venv
     source .venv/bin/activate
     
-    # 2. PyTorch (CUDA 12.1)
+    # 2. PyTorch (CUDA 13.0)
     echo "Installing PyTorch..."
-    pip install torch --index-url https://download.pytorch.org/whl/cu121
+    pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu130
 
     # 3. 핵심 의존성
     echo "Installing Core Dependencies..."
     pip install wheel tokenizers transformers sentencepiece einops ninja packaging
 
-    # 4. Mamba CUDA 커널 (CUDA 12.x용) 구축 (의존성 분리 방지)
-    echo "Installing causal-conv1d and mamba-ssm..."
+    # 4. Mamba CUDA 커널 구축 (의존성 분리 방지)
+    echo "Installing causal-conv1d and mamba-ssm from source..."
     TORCH_CUDA_ARCH_LIST="12.0" pip install causal-conv1d --no-build-isolation
     TORCH_CUDA_ARCH_LIST="12.0" pip install mamba_ssm --force-reinstall --no-build-isolation
 

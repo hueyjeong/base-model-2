@@ -1,15 +1,14 @@
-# 사용 하려는 PyTorch 버전 및 CUDA 12.1에 맵핑되는 도커 이미지.
-# 우분투 버전을 기본으로 설정하되, python 3.12를 활용.
-FROM nvidia/cuda:12.1.1-devel-ubuntu22.04
+# 빌드 이미지를 CUDA 13.0.0 (Ubuntu 22.04 기반)으로 상향
+FROM nvidia/cuda:13.0.0-devel-ubuntu22.04
 
 # 컨테이너 내 상호작용 프롬프트 무시
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV PIP_NO_CACHE_DIR=1
 
-# CUDA 12.1 경로 설정
-ENV PATH=/usr/local/cuda-12.1/bin${PATH:+:${PATH}}
-ENV LD_LIBRARY_PATH=/usr/local/cuda-12.1/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
+# CUDA 13.0 경로 설정
+ENV PATH=/usr/local/cuda-13.0/bin${PATH:+:${PATH}}
+ENV LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
 
 # 시스템 종속성 설치용 저장소 추가 및 기본 패키지 설치
 RUN apt-get update && apt-get install -y \
@@ -32,6 +31,7 @@ RUN apt-get install -y \
     libmecab-dev \
     mecab-ipadic-utf8 \
     rclone \
+    openssh-server \
     && rm -rf /var/lib/apt/lists/*
 
 # python 및 pip를 최신 버전으로 심볼릭 링크
@@ -52,11 +52,11 @@ COPY requirements.txt .
 # RUN 명령어마다 VEnv를 활성화해야하므로 bash를 사용해서 일괄 실행.
 RUN /bin/bash -c "python3.12 -m venv .venv && \
     source .venv/bin/activate && \
-    echo 'Installing PyTorch...' && \
-    pip install torch --index-url https://download.pytorch.org/whl/cu121 && \
+    echo 'Installing PyTorch (CUDA 13.0 Nightly/Pre)...' && \
+    pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu130 && \
     echo 'Installing Core Dependencies...' && \
     pip install wheel tokenizers transformers sentencepiece einops ninja packaging && \
-    echo 'Installing Mamba CUDA Kernels...' && \
+    echo 'Installing Mamba CUDA Kernels (From source for GLIBCXX compatibility)...' && \
     TORCH_CUDA_ARCH_LIST=\"12.0\" pip install causal-conv1d --no-build-isolation && \
     TORCH_CUDA_ARCH_LIST=\"12.0\" pip install mamba_ssm --force-reinstall --no-build-isolation && \
     echo 'Installing Mecab...' && \
@@ -67,8 +67,16 @@ RUN /bin/bash -c "python3.12 -m venv .venv && \
 # 의존성 설치가 끝난 후 전체 코드 복사 (소스코드 변경 시 빌드 캐시가 깨지지 않도록)
 COPY . .
 
+# 특정 corpus 데이터 포함
+COPY corpus/sample_10g.jsonl corpus/sample_1g.jsonl corpus/val_50k.jsonl ./corpus/
+
+# Entrypoint 준비
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
 # Venv 자동화를 위한 환경변수 PATH 수정
 ENV PATH="/workspace/base-model-2/.venv/bin:$PATH"
 
 # Vast.ai 등에서 접속 후 작업을 시작할 수 있도록 bash를 기본 커맨드로 지정
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["/bin/bash"]

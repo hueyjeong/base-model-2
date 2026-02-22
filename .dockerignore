@@ -42,8 +42,11 @@ ENV/
 .idea/
 
 # Data and Checkpoints
-corpus/
 *.jsonl
+corpus/*
+!corpus/sample_10g.jsonl
+!corpus/sample_1g.jsonl
+!corpus/val_50k.jsonl
 *.pt
 *.safetensors
 *.ckpt
