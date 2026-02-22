@@ -111,7 +111,9 @@ class MambaBlock(nn.Module):
 
         # Δ: dt_rank → d_inner, softplus 활성화
         dt = self.dt_proj(dt)  # (B, L, d_inner)
-        dt = F.softplus(dt)
+        # Compute softplus in FP32 then clamp to prevent BF16 exponential explosions
+        dt_f32 = dt.float()
+        dt = F.softplus(dt_f32).clamp(min=1e-5).to(dt.dtype)
 
         # 4. Selective scan (CUDA 가능 시 자동 사용)
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state) FP32
@@ -156,9 +158,10 @@ class MambaBlock(nn.Module):
         """
         batch, seq_len, d_inner = x.shape
 
-        # 이산화
-        dA = torch.einsum("bld,dn->bldn", dt, A)
-        dA = torch.exp(dA)
+        # 이산화 (Compute in FP32 to prevent exp() underflow to exactly 0.0 or Inf)
+        orig_dtype = dt.dtype
+        dA = torch.einsum("bld,dn->bldn", dt.float(), A.float())
+        dA = torch.exp(dA).to(orig_dtype)
         dB = torch.einsum("bld,bln->bldn", dt, B)
 
         x_expanded = x.unsqueeze(-1)

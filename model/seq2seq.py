@@ -83,6 +83,12 @@ class BitMambaSeq2Seq(nn.Module):
             # 임베딩이 FP16이므로 lm_head도 해당 weight 사용
             self.lm_head.weight = self.decoder_embedding.weight
 
+        # --- Copy Gate (Trial B) ---
+        if getattr(config, "use_copy_gate", False):
+            self.copy_gate = nn.Linear(config.d_model, 1)
+            # 게이트 초기값을 보수적으로 설정 (생성 분포 p_gen 쪽으로 쏠리도록 유도)
+            nn.init.constant_(self.copy_gate.bias, 2.0)
+
         self._init_weights()
 
     def _init_weights(self):
@@ -117,9 +123,10 @@ class BitMambaSeq2Seq(nn.Module):
         x = self.encoder_embedding(src_ids).float() * self.embed_scale
         x = self.embed_dropout(x)
 
-        # 패딩 위치를 0으로 마스킹 → Mamba SSM state에 패딩 정보 유입 방지
+        # 패딩 위치를 완전히 0으로 만들면 역전파 시 MambaBlock에서 NaN 유발 가능성 존재
+        # 극소값 1e-5를 남겨두어 gradient flow를 안전하게 유지
         if src_mask is not None:
-            x = x * src_mask.unsqueeze(-1).float()  # (B, src_len, 1)
+            x = x * (src_mask.unsqueeze(-1).float() + 1e-5)  # (B, src_len, 1)
 
         # 인코더 스택
         encoder_out = self.encoder(x)
@@ -131,6 +138,8 @@ class BitMambaSeq2Seq(nn.Module):
         encoder_out: torch.Tensor,
         encoder_mask: torch.Tensor | None = None,
         return_hidden: bool = False,
+        src_ids: torch.Tensor | None = None,
+        source_bias: float = 0.0,
     ) -> torch.Tensor:
         """디코더 forward → logits (또는 hidden states)
 
@@ -154,9 +163,9 @@ class BitMambaSeq2Seq(nn.Module):
         tgt_emb = self.decoder_embedding(tgt_ids).float() * self.embed_scale
         tgt_emb = self.embed_dropout(tgt_emb)
 
-        # 패딩 위치의 encoder_out을 0으로 마스킹 → 디코더 Mamba state 오염 방지
+        # 패딩 위치의 encoder_out 마스킹 시 극소값 잔존으로 완전한 0.0 회피
         if encoder_mask is not None:
-            encoder_out = encoder_out * encoder_mask.unsqueeze(-1).float()
+            encoder_out = encoder_out * (encoder_mask.unsqueeze(-1).float() + 1e-5)
 
         # Encoder 출력 + Target 임베딩 concat
         # [encoder_out (B, src_len, d)] ; [tgt_emb (B, tgt_len, d)]
@@ -183,6 +192,40 @@ class BitMambaSeq2Seq(nn.Module):
         else:
             logits = self.lm_head(x)
 
+        # --- Trial B: Copy Gate ---
+        use_copy_gate = getattr(self.config, "use_copy_gate", False)
+        if use_copy_gate and src_ids is not None and hasattr(self, "copy_gate"):
+            # Gate 값 산출 (Logit Space 보정용)
+            raw_gate = torch.sigmoid(self.copy_gate(x))  # (B, tgt_len, 1)
+            # Gate Collapse 방지: 생성 모델이 최소 50%의 gradient를 받도록 강제
+            gate = 0.5 + 0.5 * raw_gate
+            
+            # p_copy: src_ids 내의 unigram 분포 산출 (one-hot counting)
+            B, V = logits.size(0), logits.size(-1)
+            one_hot = torch.zeros(B, V, dtype=logits.dtype, device=logits.device)
+            one_hot.scatter_add_(1, src_ids, torch.ones_like(src_ids, dtype=logits.dtype))
+            one_hot[:, self.config.pad_id] = 0.0
+            
+            # 확률화
+            p_copy_sum = one_hot.sum(dim=-1, keepdim=True).clamp(min=1e-5)
+            p_copy = (one_hot / p_copy_sum).unsqueeze(1)  # (B, 1, V)
+            
+            # Logit Space 변환 (BF16 수치 안정성을 위해 1e-5로 하한선 상향)
+            copy_logits = torch.log(p_copy.clamp(min=1e-5))
+            
+            # Logit 레벨에서 Gate 혼합 (그래디언트 보존)
+            logits = gate * logits + (1.0 - gate) * copy_logits
+
+        # --- Trial A: Source-Aware Logit Bias ---
+        if source_bias > 0.0 and src_ids is not None:
+            B, V = logits.size(0), logits.size(-1)
+            src_mask_vocab = torch.zeros(B, V, dtype=logits.dtype, device=logits.device)
+            src_mask_vocab.scatter_(1, src_ids, 1.0)
+            src_mask_vocab[:, self.config.pad_id] = 0.0
+            
+            # 원문에 등장한 토큰들(mask=1.0)에게 source_bias 가산
+            logits = logits + src_mask_vocab.unsqueeze(1) * source_bias
+
         return logits
 
     def forward(
@@ -190,6 +233,7 @@ class BitMambaSeq2Seq(nn.Module):
         src_ids: torch.Tensor,
         tgt_ids: torch.Tensor,
         src_mask: torch.Tensor | None = None,
+        source_bias: float = 0.0,
     ) -> torch.Tensor:
         """전체 Encoder-Decoder forward
 
@@ -197,6 +241,7 @@ class BitMambaSeq2Seq(nn.Module):
             src_ids: (B, src_len)
             tgt_ids: (B, tgt_len)
             src_mask: (B, src_len) — True=유효, False=패딩
+            source_bias: Trial A Source-Aware Logit Bias 강도
 
         Returns:
             logits: (B, tgt_len, vocab_size)
@@ -205,7 +250,13 @@ class BitMambaSeq2Seq(nn.Module):
             src_mask = self._make_src_mask(src_ids)
 
         encoder_out = self.encode(src_ids, src_mask)
-        logits = self.decode(tgt_ids, encoder_out, src_mask)
+        logits = self.decode(
+            tgt_ids=tgt_ids,
+            encoder_out=encoder_out,
+            encoder_mask=src_mask,
+            src_ids=src_ids,
+            source_bias=source_bias,
+        )
 
         return logits
 
@@ -237,6 +288,10 @@ class BitMambaSeq2Seq(nn.Module):
             counts["lm_head"] = 0  # 임베딩과 공유
         else:
             counts["lm_head"] = sum(p.numel() for p in self.lm_head.parameters())
+
+        # Copy Gate (Trial B)
+        if getattr(self.config, "use_copy_gate", False) and hasattr(self, "copy_gate"):
+            counts["copy_gate"] = sum(p.numel() for p in self.copy_gate.parameters())
 
         # Final norm
         counts["final_norm"] = sum(p.numel() for p in self.final_norm.parameters())

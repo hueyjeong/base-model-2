@@ -27,7 +27,7 @@ def quantize_weights_158(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     Returns:
         (quantized_weights, scale_factor)
     """
-    gamma = w.abs().mean() + 1e-8
+    gamma = w.abs().mean().clamp(min=1e-5)
     w_scaled = w / gamma
     w_clipped = w_scaled.clamp(-1.0, 1.0)
     w_quant = _ste_round(w_clipped)
@@ -46,7 +46,7 @@ def quantize_activations_8bit(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
     """
     Q_b = 127.0
     # per-token: 마지막 차원 기준
-    eta = x.abs().amax(dim=-1, keepdim=True) + 1e-8
+    eta = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5)
     x_scaled = x * Q_b / eta
     x_quant = _ste_round(x_scaled.clamp(-128.0, 127.0))
     return x_quant, eta / Q_b

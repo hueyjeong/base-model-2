@@ -62,6 +62,9 @@ class BitMambaSeq2SeqConfig:
     tie_lm_head: bool = True
     pad_id: int = 0
 
+    # 원문 참조 (Trial B 기본 활성화)
+    use_copy_gate: bool = True
+
     def save(self, path: str) -> None:
         """설정을 JSON 파일로 저장"""
         with open(path, "w", encoding="utf-8") as f:

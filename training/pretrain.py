@@ -21,6 +21,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -28,6 +30,11 @@ from model.config import BitMambaSeq2SeqConfig
 from model.seq2seq import BitMambaSeq2Seq
 from training.noising import DenoisingNoiser, NoiseConfig
 from training.dataset import StreamingPackedDataset
+try:
+    from training.upload_gdrive import upload_and_cleanup
+except ImportError:
+    # 모듈이 없을 경우를 대비 (테스트 환경 등)
+    def upload_and_cleanup(*args, **kwargs): pass
 
 # ── 토크나이저 프리셋 ──────────────────────────────────────────────────
 
@@ -121,7 +128,7 @@ except ImportError:
     FUSED_CE_AVAILABLE = False
 
 def validate(model, val_loader, criterion, config, device, use_amp, n_steps,
-             fused_ce_loss=None, amp_dtype=torch.float16):
+             fused_ce_loss=None, amp_dtype=torch.float16, source_bias=0.0):
     """검증 루프: n_steps 배치에 대해 평균 loss 및 BPC 계산"""
     model.eval()
     total_loss = 0.0
@@ -150,32 +157,32 @@ def validate(model, val_loader, criterion, config, device, use_amp, n_steps,
                     with torch.amp.autocast("cuda", dtype=amp_dtype):
                         encoder_out = model.encode(src_ids, src_mask)
                         hidden = model.decode(tgt_input, encoder_out,
-                                              src_mask, return_hidden=True)
+                                              src_mask, return_hidden=True, src_ids=src_ids, source_bias=source_bias)
                         loss = fused_ce_loss(
-                            model.lm_head.weight,
-                            hidden.view(-1, hidden.size(-1)),
+                            model.lm_head.weight.float(),
+                            hidden.view(-1, hidden.size(-1)).float(),
                             tgt_target.reshape(-1),
                         )
                 else:
                     encoder_out = model.encode(src_ids, src_mask)
                     hidden = model.decode(tgt_input, encoder_out,
-                                          src_mask, return_hidden=True)
+                                          src_mask, return_hidden=True, src_ids=src_ids, source_bias=source_bias)
                     loss = fused_ce_loss(
-                        model.lm_head.weight,
-                        hidden.view(-1, hidden.size(-1)),
+                        model.lm_head.weight.float(),
+                        hidden.view(-1, hidden.size(-1)).float(),
                         tgt_target.reshape(-1),
                     )
             else:
                 # 기존 방식
                 if use_amp:
                     with torch.amp.autocast("cuda", dtype=amp_dtype):
-                        logits = model(src_ids, tgt_input, src_mask)
+                        logits = model(src_ids, tgt_input, src_mask, source_bias=source_bias)
                         loss = criterion(
                             logits.view(-1, config.vocab_size),
                             tgt_target.reshape(-1),
                         )
                 else:
-                    logits = model(src_ids, tgt_input, src_mask)
+                    logits = model(src_ids, tgt_input, src_mask, source_bias=source_bias)
                     loss = criterion(
                         logits.view(-1, config.vocab_size),
                         tgt_target.reshape(-1),
@@ -223,8 +230,23 @@ def get_lr(step: int, warmup: int, max_lr: float, max_steps: int) -> float:
 
 
 def train(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    # DDP 초기화
+    is_distributed = int(os.environ.get("WORLD_SIZE", 1)) > 1
+    if is_distributed:
+        dist.init_process_group(backend="nccl")
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        global_rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+    else:
+        local_rank = 0
+        global_rank = 0
+        world_size = 1
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if global_rank == 0:
+        print(f"Device: {device} | World Size: {world_size}")
 
     # ── 토크나이저 ──
     tokenizer = load_tokenizer(args.tokenizer)
@@ -238,6 +260,7 @@ def train(args):
 
     model_kwargs = dict(SMALL_CONFIGS[args.size])
     model_kwargs["vocab_size"] = tokenizer.vocab_size
+    model_kwargs["use_copy_gate"] = args.use_copy_gate
     config = BitMambaSeq2SeqConfig(**model_kwargs)
     model = BitMambaSeq2Seq(config).to(device)
     # 임베딩만 FP32로 (FP16 임베딩 gradient NaN 방지, 나머지는 native dtype 유지)
@@ -246,11 +269,12 @@ def train(args):
         model.decoder_embedding.float()
 
     counts = model.count_parameters()
-    print(f"\n모델: {args.size}")
-    print(f"  d_model={config.d_model}, enc={config.n_encoder_layers}, "
-          f"dec={config.n_decoder_layers}")
-    print(f"  임베딩 제외 파라미터: {format_params(counts['total_excl_embedding'])}")
-    print(f"  전체 파라미터: {format_params(counts['total'])}")
+    if global_rank == 0:
+        print(f"\n모델: {args.size}")
+        print(f"  d_model={config.d_model}, enc={config.n_encoder_layers}, "
+              f"dec={config.n_decoder_layers}")
+        print(f"  임베딩 제외 파라미터: {format_params(counts['total_excl_embedding'])}")
+        print(f"  전체 파라미터: {format_params(counts['total'])}")
 
     # INT8 텐서코어 BitLinear 교체
     if args.int8:
@@ -265,15 +289,18 @@ def train(args):
 
     # ── 데이터셋 (스트리밍 + 패킹) ──
     noiser = DenoisingNoiser(
-        tokenizer, NoiseConfig(), seed=args.seed, use_korean_errors=True,
+        tokenizer, NoiseConfig(), seed=args.seed + global_rank, use_korean_errors=True,
     )
     dataset = StreamingPackedDataset(
         args.corpus, tokenizer, noiser,
         pack_size=args.pack_size,
         text_key=args.text_key, lang_key=args.lang_key,
         seed=args.seed,
+        rank=global_rank,
+        world_size=world_size,
     )
-    print(f"\n데이터셋: 스트리밍 (pack_size={args.pack_size})")
+    if global_rank == 0:
+        print(f"\n데이터셋: 스트리밍 (pack_size={args.pack_size})")
 
     # ── 검증 데이터셋 ──
     val_loader = None
@@ -283,8 +310,11 @@ def train(args):
             pack_size=args.pack_size,
             text_key=args.text_key, lang_key=args.lang_key,
             seed=args.seed + 1,  # 학습과 다른 시드
+            rank=global_rank,
+            world_size=world_size,
         )
-        print(f"검증 데이터: {args.val_corpus}")
+        if global_rank == 0:
+            print(f"검증 데이터: {args.val_corpus}")
 
     # Fused Cross-Entropy 설정
     fused_ce_loss = None
@@ -297,7 +327,8 @@ def train(args):
                 ignore_index=config.pad_id,
                 reduction="mean",
             )
-            print(f"💫 Fused Cross-Entropy 활성화 (logits 메모리 0)")
+            if global_rank == 0:
+                print(f"💫 Fused Cross-Entropy 활성화 (logits 메모리 0)")
 
     # DataLoader: IterableDataset이므로 shuffle 불필요
     def collate_packed(batch):
@@ -340,36 +371,48 @@ def train(args):
     if args.bf16 and torch.cuda.is_available():
         amp_dtype = torch.bfloat16
         scaler = None  # BF16은 GradScaler 불필요 (FP32 동일 dynamic range)
-        print(f"⚡ BF16 Mixed Precision 활성화 (GradScaler 없음)")
+        if global_rank == 0:
+            print(f"⚡ BF16 Mixed Precision 활성화 (GradScaler 없음)")
     elif args.amp and torch.cuda.is_available():
         amp_dtype = torch.float16
         scaler = torch.amp.GradScaler("cuda")
-        print(f"⚡ FP16 Mixed Precision 활성화 (GradScaler 사용)")
+        if global_rank == 0:
+            print(f"⚡ FP16 Mixed Precision 활성화 (GradScaler 사용)")
     else:
         amp_dtype = None
         scaler = None
 
-    # ── 체크포인트 재시작 ──
+    # DDP Wrapping 모델
+    if is_distributed:
+        model = DDP(model, device_ids=[local_rank])
+        raw_model = model.module
+    else:
+        raw_model = model
+
     start_step = 0
     if args.resume and os.path.exists(args.resume):
-        print(f"\n체크포인트 로드: {args.resume}")
+        if global_rank == 0:
+            print(f"\n체크포인트 로드: {args.resume}")
+        # DDP 환경에서는 map_location에 device를 지정하여 바로 해당 GPU 램에 로드하는 것이 효율적입니다.
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model"])
+        raw_model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_step = ckpt.get("step", 0)
         if scaler and "scaler" in ckpt:
             scaler.load_state_dict(ckpt["scaler"])
-        print(f"  스텝 {start_step}부터 재시작")
+        if global_rank == 0:
+            print(f"  스텝 {start_step}부터 재시작")
 
     # ── 학습 루프 ──
     max_chars = args.max_chars
     stop_mode = "chars" if max_chars else "steps"
-    print(f"\n학습 시작 (max_steps={args.max_steps}, "
-          f"max_chars={format_chars(max_chars) if max_chars else 'unlimited'}, "
-          f"grad_accum={args.grad_accum_steps})")
-    print(f"  effective batch = {args.batch_size} × {args.grad_accum_steps} = {args.batch_size * args.grad_accum_steps} packs")
-    print(f"  종료 기준: {stop_mode}")
-    print("=" * 60)
+    if global_rank == 0:
+        print(f"\n학습 시작 (max_steps={args.max_steps}, "
+              f"max_chars={format_chars(max_chars) if max_chars else 'unlimited'}, "
+              f"grad_accum={args.grad_accum_steps})")
+        print(f"  effective batch = {args.batch_size} × {args.grad_accum_steps} × {world_size} = {args.batch_size * args.grad_accum_steps * world_size} packs")
+        print(f"  종료 기준: {stop_mode}")
+        print("=" * 60)
 
     # torch.compile (커널 fusion으로 속도 향상)
     if args.compile:
@@ -404,7 +447,8 @@ def train(args):
                 epoch += 1
                 data_iter = iter(loader)
                 batch = next(data_iter)
-                print(f"  ── epoch {epoch} 시작 (step {global_step}) ──")
+                if global_rank == 0:
+                    print(f"  ── epoch {epoch} 시작 (step {global_step}) ──", flush=True)
 
             src_ids = batch["src_ids"].to(device)  # (B, src_len)
             tgt_ids = batch["tgt_ids"].to(device)  # (B, tgt_len)
@@ -420,12 +464,12 @@ def train(args):
                 # ── Fused Cross-Entropy (logits 미생성) ──
                 if use_amp:
                     with torch.amp.autocast("cuda", dtype=amp_dtype):
-                        encoder_out = model.encode(src_ids, src_mask)
-                        hidden = model.decode(tgt_input, encoder_out,
-                                              src_mask, return_hidden=True)
+                        encoder_out = raw_model.encode(src_ids, src_mask)
+                        hidden = raw_model.decode(tgt_input, encoder_out,
+                                              src_mask, return_hidden=True, src_ids=src_ids, source_bias=args.source_bias)
                         loss = fused_ce_loss(
-                            model.lm_head.weight,
-                            hidden.view(-1, hidden.size(-1)),
+                            raw_model.lm_head.weight.float(),
+                            hidden.view(-1, hidden.size(-1)).float(),
                             tgt_target.reshape(-1),
                         )
                         loss = loss / args.grad_accum_steps
@@ -434,12 +478,12 @@ def train(args):
                     else:
                         loss.backward()
                 else:
-                    encoder_out = model.encode(src_ids, src_mask)
-                    hidden = model.decode(tgt_input, encoder_out,
-                                          src_mask, return_hidden=True)
+                    encoder_out = raw_model.encode(src_ids, src_mask)
+                    hidden = raw_model.decode(tgt_input, encoder_out,
+                                          src_mask, return_hidden=True, src_ids=src_ids, source_bias=args.source_bias)
                     loss = fused_ce_loss(
-                        model.lm_head.weight,
-                        hidden.view(-1, hidden.size(-1)),
+                        raw_model.lm_head.weight.float(),
+                        hidden.view(-1, hidden.size(-1)).float(),
                         tgt_target.reshape(-1),
                     )
                     loss = loss / args.grad_accum_steps
@@ -448,7 +492,7 @@ def train(args):
                 # ── 기존 방식 ──
                 if use_amp:
                     with torch.amp.autocast("cuda", dtype=amp_dtype):
-                        logits = model(src_ids, tgt_input, src_mask)
+                        logits = model(src_ids, tgt_input, src_mask, source_bias=args.source_bias)
                         loss = criterion(
                             logits.view(-1, config.vocab_size),
                             tgt_target.reshape(-1),
@@ -459,7 +503,7 @@ def train(args):
                     else:
                         loss.backward()
                 else:
-                    logits = model(src_ids, tgt_input, src_mask)
+                    logits = model(src_ids, tgt_input, src_mask, source_bias=args.source_bias)
                     loss = criterion(
                         logits.view(-1, config.vocab_size),
                         tgt_target.reshape(-1),
@@ -468,12 +512,25 @@ def train(args):
                     loss.backward()
 
             n_tokens = tgt_target.numel()
-            accum_loss += loss.item() * args.grad_accum_steps
-            accum_tokens += n_tokens
-            log_loss += loss.item() * args.grad_accum_steps
-            log_tokens += n_tokens
-            log_chars += batch_chars
-            total_chars += batch_chars
+
+            # 분산 환경일 경우 손실과 통계를 동기화(reduce)하여 로깅 정확성 보장
+            if is_distributed:
+                loss_info = torch.tensor([loss.item(), n_tokens, batch_chars], device=device)
+                dist.all_reduce(loss_info, op=dist.ReduceOp.SUM)
+                sync_loss = loss_info[0].item() / world_size
+                sync_tokens = int(loss_info[1].item())
+                sync_chars = int(loss_info[2].item())
+            else:
+                sync_loss = loss.item()
+                sync_tokens = n_tokens
+                sync_chars = batch_chars
+
+            accum_loss += sync_loss * args.grad_accum_steps
+            accum_tokens += sync_tokens
+            log_loss += sync_loss * args.grad_accum_steps
+            log_tokens += sync_tokens
+            log_chars += sync_chars
+            total_chars += sync_chars
 
             # 메모리 해제: 계산 그래프 참조 제거
             del loss, src_ids, tgt_ids, src_mask, tgt_input, tgt_target
@@ -496,7 +553,7 @@ def train(args):
         global_step += 1
 
         # 로그
-        if global_step % args.log_every == 0:
+        if global_step % args.log_every == 0 and global_rank == 0:
             elapsed = time.time() - t_start
             avg_loss = log_loss / max(args.log_every, 1)
             tok_per_sec = log_tokens / max(elapsed, 1e-6)
@@ -504,7 +561,7 @@ def train(args):
             print(f"  step {global_step:>7d} | loss {avg_loss:.4f} | bpc {bpc:.3f} | "
                   f"chars {format_chars(total_chars)} | "
                   f"lr {lr:.2e} | {tok_per_sec:.0f} tok/s | "
-                  f"{elapsed:.1f}s")
+                  f"{elapsed:.1f}s", flush=True)
             log_loss = 0.0
             log_tokens = 0
             log_chars = 0
@@ -512,25 +569,31 @@ def train(args):
 
         # max_chars 체크
         if max_chars and total_chars >= max_chars:
-            print(f"\n  ✅ 문자 예산 도달: {format_chars(total_chars)} >= {format_chars(max_chars)}")
+            if global_rank == 0:
+                print(f"\n  ✅ 문자 예산 도달: {format_chars(total_chars)} >= {format_chars(max_chars)}")
             training_done = True
 
         # 검증
         if val_loader is not None and args.val_every and global_step % args.val_every == 0:
-            val_loss, val_bpc = validate(
-                model, val_loader, criterion, config, device,
-                use_amp, args.val_steps, fused_ce_loss=fused_ce_loss,
-                amp_dtype=amp_dtype,
-            )
-            print(f"  📊 val step {global_step:>7d} | val_loss {val_loss:.4f} | val_bpc {val_bpc:.3f}")
+            # TODO: 다중 GPU 환경에서 검증셋을 분산/수집하는 방법이 있지만, 우선 메인 프로세스에서만 검증
+            if global_rank == 0:
+                val_loss, val_bpc = validate(
+                    raw_model, val_loader, criterion, config, device,
+                    use_amp, args.val_steps, fused_ce_loss=fused_ce_loss,
+                    amp_dtype=amp_dtype, source_bias=args.source_bias,
+                )
+                print(f"  📊 val step {global_step:>7d} | val_loss {val_loss:.4f} | val_bpc {val_bpc:.3f}", flush=True)
+            # 다른 프로세스 동기화 
+            if is_distributed:
+                dist.barrier()
 
         # 체크포인트 저장
-        if args.save_dir and global_step % args.save_every == 0:
+        if args.save_dir and global_step % args.save_every == 0 and global_rank == 0:
             os.makedirs(args.save_dir, exist_ok=True)
             ckpt_path = os.path.join(args.save_dir, f"step_{global_step}.pt")
             ckpt = {
                 "step": global_step,
-                "model": model.state_dict(),
+                "model": raw_model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "config": model_kwargs,
                 "args": vars(args),
@@ -539,19 +602,30 @@ def train(args):
                 ckpt["scaler"] = scaler.state_dict()
             torch.save(ckpt, ckpt_path)
             print(f"  💾 체크포인트 저장: {ckpt_path}")
+            
+            # Google Drive 자동 업로드 및 최신 체크포인트 보존
+            if args.gdrive_remote:
+                upload_and_cleanup(ckpt_path, args.log_file, args.gdrive_remote, keep_latest_n=1)
 
     # 최종 저장
-    if args.save_dir:
+    if args.save_dir and global_rank == 0:
         os.makedirs(args.save_dir, exist_ok=True)
         final_path = os.path.join(args.save_dir, "final.pt")
         torch.save({
             "step": global_step,
-            "model": model.state_dict(),
+            "model": raw_model.state_dict(),
             "config": model_kwargs,
         }, final_path)
         print(f"\n최종 모델 저장: {final_path}")
-
-    print(f"\n학습 완료! (총 {global_step} 스텝)")
+        print(f"\n학습 완료! (총 {global_step} 스텝)")
+        
+        # 마지막 모델과 로그 업로드 수행
+        if args.gdrive_remote:
+            upload_and_cleanup(final_path, args.log_file, args.gdrive_remote, keep_latest_n=1)
+        
+    if is_distributed:
+        dist.destroy_process_group()
+        
     return 0
 
 
@@ -583,7 +657,7 @@ def main():
                         help="이미 학습한 문자 수 (resume 시 사용)")
     parser.add_argument("--grad_accum_steps", type=int, default=32,
                         help="Gradient accumulation 스텝 (effective batch size)")
-    parser.add_argument("--pack_size", type=int, default=2048,
+    parser.add_argument("--pack_size", type=int, default=4096,
                         help="패킹 목표 토큰 수")
     parser.add_argument("--batch_size", type=int, default=1,
                         help="DataLoader 배치 크기 (pack 단위)")
@@ -604,20 +678,29 @@ def main():
     parser.add_argument("--num_workers", type=int, default=4,
                         help="DataLoader worker 수 (0=메인 프로세스만)")
 
+    # 원문 참조력 실험 (Trial A & B 기본 적용)
+    parser.add_argument("--source_bias", type=float, default=0.5,
+                        help="Trial A: 원문 등장 토큰 Logit 가산 강도 (기본: 0.5)")
+    parser.add_argument("--no_copy_gate", action="store_false", dest="use_copy_gate",
+                        help="Trial B: Copy Gate 비활성화")
+
     # 저장
     parser.add_argument("--save_dir", default=None, help="체크포인트 저장 디렉토리")
-    parser.add_argument("--save_every", type=int, default=5000, help="저장 주기 (스텝)")
+    parser.add_argument("--save_every", type=int, default=1000, help="저장 주기 (스텝)")
     parser.add_argument("--log_every", type=int, default=50, help="로그 주기 (스텝)")
     parser.add_argument("--resume", default=None, help="재시작 체크포인트 경로")
+    
+    # Google Drive 업로드 동기화
+    parser.add_argument("--gdrive_remote", default=None, help="체크포인트 업로드용 rclone 대상 폴더 (예: 'gdrive:my_checkpoints/')")
+    parser.add_argument("--log_file", default=None, help="동기화할 로그 파일명 (예: 'training_run_v1.log')")
 
     # 검증
     parser.add_argument("--val_corpus", default=None, help="검증 코퍼스 파일 경로")
-    parser.add_argument("--val_every", type=int, default=100, help="검증 주기 (스텝)")
+    parser.add_argument("--val_every", type=int, default=200, help="검증 주기 (스텝)")
     parser.add_argument("--val_steps", type=int, default=20, help="검증 시 평가할 배치 수")
 
     args = parser.parse_args()
     return train(args)
-
 
 if __name__ == "__main__":
     sys.exit(main())

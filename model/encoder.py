@@ -20,8 +20,11 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        return x * rms * self.weight
+        orig_dtype = x.dtype
+        # Calculate in FP32 to prevent BF16 underflow on <PAD> 0-vectors
+        x_f32 = x.float()
+        rms = torch.rsqrt(x_f32.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return (x_f32 * rms).to(orig_dtype) * self.weight
 
 
 class BitNetFFN(nn.Module):

@@ -51,6 +51,8 @@ class StreamingPackedDataset(IterableDataset):
         min_length: int = 10,
         shuffle_files: bool = True,
         seed: int = 42,
+        rank: int = 0,
+        world_size: int = 1,
     ):
         self.file_paths = [file_paths] if isinstance(file_paths, str) else list(file_paths)
         self.tokenizer = tokenizer
@@ -61,6 +63,8 @@ class StreamingPackedDataset(IterableDataset):
         self.min_length = min_length
         self.shuffle_files = shuffle_files
         self.rng = random.Random(seed)
+        self.rank = rank
+        self.world_size = world_size
 
     def _iter_lines(self):
         """파일에서 (text, lang) 한 줄씩 스트리밍"""
@@ -120,9 +124,17 @@ class StreamingPackedDataset(IterableDataset):
             yield self._make_sample(src_buf, tgt_buf, char_buf)
 
     def _make_sample(self, src_ids, tgt_ids, n_chars=0):
-        """버퍼 → 텐서 dict (pack_size 초과 시 truncate)"""
+        """버퍼 → 텐서 dict (pack_size 초과 시 truncate, 부족 시 tokenizer.pad_id 로 pad)"""
         src_ids = src_ids[:self.pack_size]
         tgt_ids = tgt_ids[:self.pack_size]
+        
+        # Pad if shorter than pack_size
+        pad_id = self.tokenizer.pad_id
+        if len(src_ids) < self.pack_size:
+            src_ids.extend([pad_id] * (self.pack_size - len(src_ids)))
+        if len(tgt_ids) < self.pack_size:
+            tgt_ids.extend([pad_id] * (self.pack_size - len(tgt_ids)))
+            
         return {
             "src_ids": torch.tensor(src_ids, dtype=torch.long),
             "tgt_ids": torch.tensor(tgt_ids, dtype=torch.long),
@@ -131,16 +143,22 @@ class StreamingPackedDataset(IterableDataset):
 
     def __iter__(self):
         """스트리밍 → 노이즈 적용 → 패킹 → yield
-
-        num_workers > 0일 때 각 worker가 다른 줄을 처리하도록 분할.
+        
+        DDP(world_size > 1)일 경우 전체 GPU가 데이터를 나눠서 처리하고,
+        num_workers > 0일 때 각 worker가 또 다시 할당된 줄을 처리하도록 분할.
         """
         worker_info = torch.utils.data.get_worker_info()
         worker_id = worker_info.id if worker_info else 0
         num_workers = worker_info.num_workers if worker_info else 1
 
+        # 전체 분할 수 (GPUs * DataLoader Workers)
+        total_workers = self.world_size * num_workers
+        # 현재 프로세스+워커의 고유 ID
+        global_worker_id = (self.rank * num_workers) + worker_id
+
         def noised_stream():
             for i, (text, lang) in enumerate(self._iter_lines()):
-                if i % num_workers != worker_id:
+                if i % total_workers != global_worker_id:
                     continue
                 noised_ids, target_ids = self.noiser(text, lang)
                 yield noised_ids, target_ids, len(text)
@@ -186,8 +204,8 @@ if __name__ == "__main__":
         tgt_len = sample["tgt_ids"].shape[0]
 
         # BOS/EOS 경계 수 = 패킹된 문장 수
-        bos_count = (sample["src_ids"] == tok.bos_id).sum().item()
-        eos_count = (sample["src_ids"] == tok.eos_id).sum().item()
+        bos_count = int((sample["src_ids"] == tok.bos_id).sum().item())
+        eos_count = int((sample["src_ids"] == tok.eos_id).sum().item())
 
         # 디코딩 미리보기
         preview = tok.decode(sample["tgt_ids"][:60].tolist(), skip_special=False)
