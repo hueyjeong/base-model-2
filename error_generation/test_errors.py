@@ -45,6 +45,10 @@ def test_individual_modules():
         ("double_expression",    "잊히다."),
         ("foreign_style",        "곧 도착합니다."),
         ("misc_errors",          "사흘 뒤에 만나자."),
+        ("chat_style_errors",    "안녕하세요. 감사합니다."),
+        ("jamo_separation",      "안녕"),
+        ("punctuation_errors",   "안녕!"),
+        ("honorific_errors",     "제가 했습니다."),
     ]
 
     print("=== 개별 모듈 테스트 ===")
@@ -153,7 +157,7 @@ def test_error_types_list():
         print(f"  - {t}")
     print(f"  총 {len(types)}개 유형")
     print()
-    return len(types) == 12
+    return len(types) == 16
 
 
 def main():

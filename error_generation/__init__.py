@@ -30,6 +30,10 @@ from error_generation.saisiot_errors import apply_saisiot_error
 from error_generation.double_expression import apply_double_expression
 from error_generation.foreign_style import apply_foreign_style
 from error_generation.misc_errors import apply_misc_error
+from error_generation.chat_style_errors import apply_chat_style
+from error_generation.jamo_separation import apply_jamo_separation
+from error_generation.punctuation_errors import apply_punctuation_error
+from error_generation.honorific_errors import apply_honorific_error
 
 from error_generation import common_misspellings
 from error_generation import spacing_errors
@@ -43,6 +47,10 @@ from error_generation import saisiot_errors
 from error_generation import double_expression
 from error_generation import foreign_style
 from error_generation import misc_errors
+from error_generation import chat_style_errors
+from error_generation import jamo_separation
+from error_generation import punctuation_errors
+from error_generation import honorific_errors
 
 
 # 오류 생성 함수 목록과 가중치
@@ -62,6 +70,10 @@ ERROR_GENERATORS: list[tuple[str, ErrorFn, float]] = [
     ("double_expression",    apply_double_expression,  1.0),
     ("foreign_style",        apply_foreign_style,      0.5),
     ("misc_errors",          apply_misc_error,         1.0),
+    ("chat_style_errors",    apply_chat_style,         1.5),
+    ("jamo_separation",      apply_jamo_separation,    1.0),
+    ("punctuation_errors",   apply_punctuation_error,  1.0),
+    ("honorific_errors",     apply_honorific_error,    1.0),
 ]
 
 # 모든 모듈 목록 (패턴 수 집계용)
@@ -70,6 +82,8 @@ ALL_MODULES = [
     consonant_errors, conjugation_errors, suffix_errors,
     particle_errors, word_substitution, saisiot_errors,
     double_expression, foreign_style, misc_errors,
+    chat_style_errors, jamo_separation, punctuation_errors,
+    honorific_errors,
 ]
 
 
