@@ -122,6 +122,8 @@ class BitMambaSeq2Seq(nn.Module):
         # 임베딩 (FP16 → FP32 변환)
         x = self.encoder_embedding(src_ids).float() * self.embed_scale
         x = self.embed_dropout(x)
+        if self.encoder.gradient_checkpointing:
+            x.requires_grad_(True)
 
         # 패딩 위치를 완전히 0으로 만들면 역전파 시 MambaBlock에서 NaN 유발 가능성 존재
         # 극소값 1e-5를 남겨두어 gradient flow를 안전하게 유지
@@ -162,6 +164,8 @@ class BitMambaSeq2Seq(nn.Module):
         # 타겟 임베딩 (FP16 → FP32 변환)
         tgt_emb = self.decoder_embedding(tgt_ids).float() * self.embed_scale
         tgt_emb = self.embed_dropout(tgt_emb)
+        if self.decoder.gradient_checkpointing:
+            tgt_emb.requires_grad_(True)
 
         # 패딩 위치의 encoder_out 마스킹 시 극소값 잔존으로 완전한 0.0 회피
         if encoder_mask is not None:
