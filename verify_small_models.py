@@ -34,13 +34,13 @@ SMALL_CONFIGS = {
     "16M": dict(
         d_model=320, d_inner=640, d_ff=640,
         n_encoder_layers=4, n_decoder_layers=6,
-        n_heads=8, dt_rank=20,
+        n_heads=8, dt_rank=24,
         d_state=16, d_conv=4,
     ),
     "32M": dict(
         d_model=448, d_inner=896, d_ff=768,
         n_encoder_layers=4, n_decoder_layers=7,
-        n_heads=8, dt_rank=28,
+        n_heads=8, dt_rank=32,
         d_state=16, d_conv=4,
     ),
     "64M": dict(

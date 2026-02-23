@@ -88,25 +88,25 @@ SMALL_CONFIGS = {
     "8M": dict(
         d_model=288, d_inner=576, d_ff=544,
         n_encoder_layers=3, n_decoder_layers=5,
-        n_heads=8, n_kv_heads=4, dt_rank=18,
+        n_heads=8, n_kv_heads=4, dt_rank=24,
         d_state=16, d_conv=4,
     ),
     "16M": dict(
         d_model=352, d_inner=704, d_ff=640,
         n_encoder_layers=4, n_decoder_layers=7,
-        n_heads=8, n_kv_heads=4, dt_rank=22,
+        n_heads=8, n_kv_heads=4, dt_rank=24,
         d_state=16, d_conv=4,
     ),
     "32M": dict(
         d_model=448, d_inner=896, d_ff=768,
         n_encoder_layers=5, n_decoder_layers=9,
-        n_heads=8, n_kv_heads=4, dt_rank=28,
+        n_heads=8, n_kv_heads=4, dt_rank=32,
         d_state=16, d_conv=4,
     ),
     "64M": dict(
         d_model=576, d_inner=1152, d_ff=1088,
         n_encoder_layers=6, n_decoder_layers=10,
-        n_heads=8, n_kv_heads=4, dt_rank=36,
+        n_heads=8, n_kv_heads=4, dt_rank=40,
         d_state=16, d_conv=4,
     ),
     "128M": dict(
@@ -301,8 +301,18 @@ def train(args):
 
     # INT8 텐서코어 BitLinear 교체
     if args.int8:
-        from model.triton_bitlinear import replace_bitlinear_with_triton
-        model = replace_bitlinear_with_triton(model)
+        if args.int8_backend == "cuda":
+            try:
+                from model.cuda_bitlinear import replace_bitlinear_with_cuda
+                model = replace_bitlinear_with_cuda(model)
+            except Exception as e:
+                print(f"⚠️ CUDA BitLinear 로드 실패: {e}")
+                print("   triton backend로 fallback 합니다.")
+                from model.triton_bitlinear import replace_bitlinear_with_triton
+                model = replace_bitlinear_with_triton(model)
+        else:
+            from model.triton_bitlinear import replace_bitlinear_with_triton
+            model = replace_bitlinear_with_triton(model)
 
     # Gradient Checkpointing
     if args.grad_ckpt:
@@ -426,6 +436,26 @@ def train(args):
         if global_rank == 0:
             print(f"  스텝 {start_step}부터 재시작")
 
+    # CUDA Graph (실험): 고정 shape + 단일 GPU + 비스케일러 경로에서만 활성화
+    use_cuda_graph = (
+        args.cuda_graph
+        and torch.cuda.is_available()
+        and (not is_distributed)
+        and (not args.grad_ckpt)
+        and (not args.compile)
+        and (not args.fused_ce)
+        and (scaler is None)
+    )
+    if args.cuda_graph and not use_cuda_graph and global_rank == 0:
+        print("⚠️  CUDA Graph 조건 미충족(단일GPU/grad_ckpt off/compile off/fused_ce off/FP16 scaler off). 비활성화합니다.")
+    if use_cuda_graph:
+        try:
+            torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
+            if global_rank == 0:
+                print("ℹ️  CUDA Graph 모드: AccumulateGrad stream mismatch 경고 비활성화")
+        except Exception:
+            pass
+
     # ── 학습 루프 ──
     max_chars = args.max_chars
     stop_mode = "chars" if max_chars else "steps"
@@ -461,17 +491,97 @@ def train(args):
     epoch = 1
     training_done = False
 
+    def _next_batch():
+        nonlocal data_iter, epoch, global_step
+        try:
+            return next(data_iter)
+        except StopIteration:
+            epoch += 1
+            data_iter = iter(loader)
+            b = next(data_iter)
+            if global_rank == 0:
+                print(f"  ── epoch {epoch} 시작 (step {global_step}) ──", flush=True)
+            return b
+
+    graph_runner = None
+    if use_cuda_graph:
+        warm = _next_batch()
+        warm_src = warm["src_ids"].to(device)
+        warm_tgt = warm["tgt_ids"].to(device)
+        warm_mask = warm["src_mask"].to(device)
+        del warm
+
+        static_src = torch.empty_like(warm_src)
+        static_tgt = torch.empty_like(warm_tgt)
+        static_mask = torch.empty_like(warm_mask)
+        static_loss = torch.zeros((), device=device)
+
+        static_src.copy_(warm_src)
+        static_tgt.copy_(warm_tgt)
+        static_mask.copy_(warm_mask)
+
+        tgt_input_static = static_tgt[:, :-1]
+        tgt_target_static = static_tgt[:, 1:]
+
+        # 캡처 전 eager 워밍업 (JIT/커널 초기화 및 lazy path 소거)
+        optimizer.zero_grad(set_to_none=True)
+        if use_amp:
+            with torch.amp.autocast("cuda", dtype=amp_dtype):
+                warm_logits = model(static_src, tgt_input_static, static_mask, source_bias=args.source_bias)
+                warm_loss = criterion(
+                    warm_logits.view(-1, config.vocab_size),
+                    tgt_target_static.reshape(-1),
+                )
+                warm_loss = warm_loss / args.grad_accum_steps
+        else:
+            warm_logits = model(static_src, tgt_input_static, static_mask, source_bias=args.source_bias)
+            warm_loss = criterion(
+                warm_logits.view(-1, config.vocab_size),
+                tgt_target_static.reshape(-1),
+            )
+            warm_loss = warm_loss / args.grad_accum_steps
+        warm_loss.backward()
+        optimizer.zero_grad(set_to_none=True)
+        del warm_logits, warm_loss
+        torch.cuda.synchronize()
+
+        optimizer.zero_grad(set_to_none=True)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            if use_amp:
+                with torch.amp.autocast("cuda", dtype=amp_dtype):
+                    logits = model(static_src, tgt_input_static, static_mask, source_bias=args.source_bias)
+                    loss = criterion(
+                        logits.view(-1, config.vocab_size),
+                        tgt_target_static.reshape(-1),
+                    )
+                    loss = loss / args.grad_accum_steps
+            else:
+                logits = model(static_src, tgt_input_static, static_mask, source_bias=args.source_bias)
+                loss = criterion(
+                    logits.view(-1, config.vocab_size),
+                    tgt_target_static.reshape(-1),
+                )
+                loss = loss / args.grad_accum_steps
+            loss.backward()
+            static_loss.copy_(loss.detach())
+
+        if global_rank == 0:
+            print("🚀 CUDA Graph 캡처 완료 (기본 경로: non-fused CE)")
+
+        graph_runner = {
+            "graph": g,
+            "static_src": static_src,
+            "static_tgt": static_tgt,
+            "static_mask": static_mask,
+            "static_loss": static_loss,
+            "shape": (tuple(warm_src.shape), tuple(warm_tgt.shape), tuple(warm_mask.shape)),
+        }
+
     while global_step < args.max_steps and not training_done:
         # gradient accumulation 루프
         for accum_i in range(args.grad_accum_steps):
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                epoch += 1
-                data_iter = iter(loader)
-                batch = next(data_iter)
-                if global_rank == 0:
-                    print(f"  ── epoch {epoch} 시작 (step {global_step}) ──", flush=True)
+            batch = _next_batch()
 
             src_ids = batch["src_ids"].to(device)  # (B, src_len)
             tgt_ids = batch["tgt_ids"].to(device)  # (B, tgt_len)
@@ -483,7 +593,21 @@ def train(args):
             tgt_input = tgt_ids[:, :-1]
             tgt_target = tgt_ids[:, 1:]
 
-            if fused_ce_loss is not None:
+            used_graph = False
+            if graph_runner is not None:
+                cur_shape = (tuple(src_ids.shape), tuple(tgt_ids.shape), tuple(src_mask.shape))
+                if cur_shape == graph_runner["shape"]:
+                    graph_runner["static_src"].copy_(src_ids)
+                    graph_runner["static_tgt"].copy_(tgt_ids)
+                    graph_runner["static_mask"].copy_(src_mask)
+                    graph_runner["graph"].replay()
+                    loss_val = graph_runner["static_loss"].item()
+                    used_graph = True
+                else:
+                    if global_rank == 0:
+                        print("⚠️  CUDA Graph shape 불일치 감지. 해당 스텝은 eager 경로로 실행")
+
+            if (not used_graph) and fused_ce_loss is not None:
                 # ── Fused Cross-Entropy (logits 미생성) ──
                 if use_amp:
                     with torch.amp.autocast("cuda", dtype=amp_dtype):
@@ -534,6 +658,9 @@ def train(args):
                     loss = loss / args.grad_accum_steps
                     loss.backward()
 
+            if not used_graph:
+                loss_val = loss.item()
+
             n_tokens = tgt_target.numel()
 
             # 분산 환경일 경우 손실과 통계를 동기화(reduce)하여 로깅 정확성 보장
@@ -544,7 +671,7 @@ def train(args):
                 sync_tokens = int(loss_info[1].item())
                 sync_chars = int(loss_info[2].item())
             else:
-                sync_loss = loss.item()
+                sync_loss = loss_val
                 sync_tokens = n_tokens
                 sync_chars = batch_chars
 
@@ -556,7 +683,10 @@ def train(args):
             total_chars += sync_chars
 
             # 메모리 해제: 계산 그래프 참조 제거
-            del loss, src_ids, tgt_ids, src_mask, tgt_input, tgt_target
+            if used_graph:
+                del src_ids, tgt_ids, src_mask, tgt_input, tgt_target
+            else:
+                del loss, src_ids, tgt_ids, src_mask, tgt_input, tgt_target
 
         # Optimizer step
         lr = get_lr(global_step, args.warmup_steps, args.lr, args.max_steps)
@@ -696,8 +826,12 @@ def main():
                         help="Gradient checkpointing (활성화 시 활성화 메모리 3~4배 절약)")
     parser.add_argument("--compile", action="store_true",
                         help="torch.compile 적용 (커널 fusion, 첫 step 느리나 이후 1.3~2x 빠름)")
+    parser.add_argument("--cuda_graph", action="store_true",
+                        help="(실험) CUDA Graph 캡처 사용: 단일GPU 고정-shape eager 경로")
     parser.add_argument("--int8", action="store_true",
-                        help="INT8 tensor core BitLinear (Triton 퓨전 양자화 + INT8 matmul)")
+                        help="INT8 tensor core BitLinear로 교체")
+    parser.add_argument("--int8_backend", default="triton", choices=["triton", "cuda"],
+                        help="INT8 BitLinear backend 선택")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_workers", type=int, default=4,
                         help="DataLoader worker 수 (0=메인 프로세스만)")

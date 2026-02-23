@@ -55,6 +55,35 @@ torchrun --nproc_per_node=2 training/pretrain.py \
     --bf16 \
     --fused_ce
 ```
+
+### INT8 CUDA 백엔드 사용
+
+`BitLinear`를 C++/CUDA 경로로 교체하려면 아래 옵션을 추가하세요.
+
+```bash
+torchrun --nproc_per_node=2 training/pretrain.py \
+   --size 8M \
+   --corpus corpus/sample_10g.jsonl \
+   --batch_size 4 \
+   --grad_accum_steps 8 \
+   --bf16 \
+   --fused_ce \
+   --int8 \
+   --int8_backend cuda
+
+# 권장 환경변수 (non-graph 가속)
+export BITLINEAR_CUDA_BACKWARD=fp32_tf32
+export BITLINEAR_CUDA_GRADW_LT=1
+export BITLINEAR_CUDA_FUSED_ACT=1
+export BITLINEAR_CUDA_FUSED_WEIGHT=1
+
+# CUDA Graph는 실험용으로만 사용 권장
+# (일부 배치/시퀀스 조합에서 오히려 감속 가능)
+# --cuda_graph
+```
+
+상세 사용법과 트러블슈팅은 `docs/int8_cuda_backend.md`를 참고하세요.
+
 ---
 
 ## 4. Google Drive 자동 업로드 설정 (선택 사항)

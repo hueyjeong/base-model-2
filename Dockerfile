@@ -112,16 +112,16 @@ RUN echo 'Installing Requirement...' && \
     pip install -r requirements.txt
 
 RUN echo 'Installing PyTorch...' && \
-    pip install torch --index-url https://download.pytorch.org/whl/cu128 --force-reinstall
+    pip install torch --index-url https://download.pytorch.org/whl/cu128
 
 RUN echo 'Installing Core Dependencies...' && \
     pip install wheel tokenizers transformers sentencepiece einops ninja packaging
 
 RUN echo 'Installing Mamba CUDA Kernels (causal-conv1d)...' && \
-    TORCH_CUDA_ARCH_LIST="12.0" pip install causal-conv1d --force-reinstall --no-build-isolation
+    pip install causal-conv1d
 
 RUN echo 'Installing Mamba CUDA Kernels (mamba_ssm)...' && \
-    TORCH_CUDA_ARCH_LIST="12.0" pip install mamba_ssm --force-reinstall --no-build-isolation
+    pip install mamba_ssm
 
 RUN echo 'Installing Mecab...' && \
     pip install mecab-python3 mecab-ko-dic
