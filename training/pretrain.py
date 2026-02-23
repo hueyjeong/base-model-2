@@ -128,12 +128,16 @@ except ImportError:
     FUSED_CE_AVAILABLE = False
 
 def validate(model, val_loader, criterion, config, device, use_amp, n_steps,
-             fused_ce_loss=None, amp_dtype=torch.float16, source_bias=0.0):
-    """검증 루프: n_steps 배치에 대해 평균 loss 및 BPC 계산"""
+             fused_ce_loss=None, amp_dtype=torch.float16, source_bias=0.0,
+             tokenizer=None):
+    """검증 루프: n_steps 배치에 대해 평균 loss 및 BPC, CER 계산"""
     model.eval()
+    import editdistance
     total_loss = 0.0
     total_tokens = 0
     total_chars = 0
+    total_edit_distance = 0
+    total_target_chars_for_cer = 0
     val_iter = iter(val_loader)
 
     with torch.no_grad():
@@ -172,6 +176,10 @@ def validate(model, val_loader, criterion, config, device, use_amp, n_steps,
                         hidden.view(-1, hidden.size(-1)).float(),
                         tgt_target.reshape(-1),
                     )
+                if tokenizer is not None:
+                    # logits for argmax (without requiring gradients, and chunked inference if very large, but usually fine)
+                    logits = F.linear(hidden.view(-1, hidden.size(-1)).float(), model.lm_head.weight.float())
+                    preds = logits.argmax(dim=-1).view(tgt_target.shape)
             else:
                 # 기존 방식
                 if use_amp:
@@ -187,6 +195,20 @@ def validate(model, val_loader, criterion, config, device, use_amp, n_steps,
                         logits.view(-1, config.vocab_size),
                         tgt_target.reshape(-1),
                     )
+                if tokenizer is not None:
+                    preds = logits.argmax(dim=-1).view(tgt_target.shape)
+
+            if tokenizer is not None:
+                for b in range(tgt_target.shape[0]):
+                    valid_mask = tgt_target[b] != config.pad_id
+                    target_ids_b = tgt_target[b][valid_mask].tolist()
+                    pred_ids_b = preds[b][valid_mask].tolist()
+                    
+                    target_text = tokenizer.decode(target_ids_b).replace("<s>", "").replace("</s>", "")
+                    pred_text = tokenizer.decode(pred_ids_b).replace("<s>", "").replace("</s>", "")
+                    
+                    total_edit_distance += editdistance.eval(target_text, pred_text)
+                    total_target_chars_for_cer += len(target_text)
 
             n_tok = (tgt_target != config.pad_id).sum().item()
             total_loss += loss.item() * n_tok
@@ -195,10 +217,11 @@ def validate(model, val_loader, criterion, config, device, use_amp, n_steps,
 
     model.train()
     if total_tokens == 0:
-        return float('nan'), float('nan')
+        return float('nan'), float('nan'), float('nan')
     avg_loss = total_loss / total_tokens
     bpc = (avg_loss * total_tokens) / (max(total_chars, 1) * math.log(2))
-    return avg_loss, bpc
+    cer = (total_edit_distance / max(total_target_chars_for_cer, 1)) if tokenizer is not None else float('nan')
+    return avg_loss, bpc, cer
 
 
 def format_params(n: int) -> str:
@@ -577,12 +600,13 @@ def train(args):
         if val_loader is not None and args.val_every and global_step % args.val_every == 0:
             # TODO: 다중 GPU 환경에서 검증셋을 분산/수집하는 방법이 있지만, 우선 메인 프로세스에서만 검증
             if global_rank == 0:
-                val_loss, val_bpc = validate(
+                val_loss, val_bpc, val_cer = validate(
                     raw_model, val_loader, criterion, config, device,
                     use_amp, args.val_steps, fused_ce_loss=fused_ce_loss,
                     amp_dtype=amp_dtype, source_bias=args.source_bias,
+                    tokenizer=tokenizer,
                 )
-                print(f"  📊 val step {global_step:>7d} | val_loss {val_loss:.4f} | val_bpc {val_bpc:.3f}", flush=True)
+                print(f"  📊 val step {global_step:>7d} | val_loss {val_loss:.4f} | val_bpc {val_bpc:.3f} | val_cer {val_cer:.4f}", flush=True)
             # 다른 프로세스 동기화 
             if is_distributed:
                 dist.barrier()

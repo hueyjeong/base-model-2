@@ -44,9 +44,7 @@ ENV/
 # Data and Checkpoints
 *.jsonl
 corpus/*
-!corpus/sample_10g.jsonl
-!corpus/sample_1g.jsonl
-!corpus/val_50k.jsonl
+!corpus/*.tar.gz.enc.*
 *.pt
 *.safetensors
 *.ckpt

@@ -15,6 +15,7 @@ env/
 
 # Corpus data (large files)
 corpus/*.jsonl
+corpus/corpus.tar.gz.enc*
 
 # Model checkpoints & weights
 *.pt
