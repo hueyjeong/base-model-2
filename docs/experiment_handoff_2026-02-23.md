@@ -184,3 +184,122 @@ python -m training.pretrain \
 - CUDA Graph는 실험 플래그로만 유지,
 - 실전 기본값은 `bf16_tc + gradw_lt + fused_quant`가 가장 합리적.
 - batch 4 이상 확장 및 고활용(200%/400%)은 더 큰 GPU에서 micro-batch 확장 중심으로 재평가 권장.
+
+---
+
+## 8) 96GB 머신 추가 결과 (2026-02-23, 같은 코드베이스)
+
+### 8-1. 배치 확장 가능 범위 (quick feasibility)
+
+- GPU: `NVIDIA RTX PRO 6000 Blackwell Workstation Edition (97887 MiB)`
+- 64M: batch `1/2/4/8` 가능, `16` OOM
+- 128M: batch `1/2/4` 가능, `8/16` OOM
+
+### 8-2. non-graph 기준 배치별 실측 요약 (max_steps=50)
+
+#### 64M
+- batch=1: `fused_quant`가 baseline 대비 `+3.97%`
+- batch=2: `fused_quant`/`all_opt` 모두 `+4.3%`
+- batch=4: `all_opt`가 `+10.41%`
+- batch=8: `fused_quant`가 `+12.58%`
+
+#### 128M
+- batch=1: `fused_quant`가 `+3.18%`
+- batch=2: `fused_quant`가 `+7.72%`
+- batch=4: `fused_quant`가 `+11.97%`
+
+해석:
+- `gradw_lt` 단독 이득은 작거나 불안정했고,
+- 이번 머신에서는 **fused quant(activation+weight)**가 가장 일관된 이득을 제공.
+
+### 8-3. micro-batch vs grad_accum (128M)
+
+- `bs1_ga1`: `27400.1 tok/s`
+- `bs1_ga2`: `27052.1 tok/s`
+- `bs2_ga1`: `28058.9 tok/s` ← 최고
+- `bs2_ga2`: `27919.1 tok/s`
+
+해석:
+- 같은 effective batch를 맞춰도 `batch_size=2`가 가장 유리.
+- `batch_size>2`는 가능하더라도 처리량/효율이 떨어지는 구간이 많음.
+
+### 8-4. pack_size sweep (fused quant + bf16_tc, batch=2)
+
+#### 128M (max_steps=60)
+- `pack=4096`: `28187.5 tok/s`, `29756 MiB`
+- `pack=6144`: `26820.0 tok/s`, `43678 MiB`
+- `pack=8192`: `25988.7 tok/s`, `57428 MiB`
+- `pack=10240`: `25450.3 tok/s`, `71340 MiB`
+
+#### 64M (max_steps=60)
+- `pack=4096`: `43314.6 tok/s`, `19270 MiB`
+- `pack=6144`: `41421.2 tok/s`, `28198 MiB`
+- `pack=8192`: `40676.8 tok/s`, `36938 MiB`
+- `pack=10240`: `39569.5 tok/s`, `45970 MiB`
+
+해석:
+- 64M/128M 모두 **`pack_size=4096`가 처리량 최고 + 메모리 최소**.
+
+### 8-5. lr / warmup 탐색 (128M, batch=2, pack=4096, non-graph)
+
+#### 1차 스윕 (max_steps=200)
+- 후보 중 상위: `lr=1.6e-4`, `warmup=50 or 100`
+
+#### 2차 재검증 (max_steps=400)
+- `lr=1.6e-4, wu=50`: `tail_bpc=3.426`, `27642 tok/s`
+- `lr=1.6e-4, wu=100`: `tail_bpc=3.355`, `27819 tok/s` ← best
+- `lr=1.3e-4, wu=50`: `tail_bpc=3.395`, `27732 tok/s`
+
+해석:
+- 현재 데이터/세팅에서는 **`lr=1.6e-4`, `warmup_steps=100`**이 가장 안정적.
+
+### 8-6. 옵션 on/off 분해 (128M, lr=1.6e-4, wu=50, max_steps=120)
+
+- baseline (`fused=0, ckpt=0`): `27672 tok/s`, `peak 29756 MiB`
+- `grad_ckpt=1`: 약 `-27% tok/s`, 메모리 약 `-24 GB`
+- `fused_ce=1`: 속도 소폭 감소(약 `-0.9%`), 메모리 변화 미미
+
+해석:
+- **메모리 여유가 있으면 `grad_ckpt`는 끄는 게 유리**.
+- `fused_ce`는 이번 세팅에서 필수 옵션이 아님(성능 이득 미확인).
+
+### 8-7. 96GB 머신 운영 권장 프리셋
+
+권장 우선순위 (128M 기준):
+1) `--int8 --int8_backend cuda`
+2) `--batch_size 2 --grad_accum_steps 1`
+3) `--pack_size 4096`
+4) `--lr 1.6e-4 --warmup_steps 100`
+5) 기본적으로 `--grad_ckpt` OFF, `--fused_ce` OFF
+6) `--cuda_graph`는 실험 플래그로만 유지
+
+권장 환경변수:
+```bash
+export BITLINEAR_CUDA_BACKWARD=bf16_tc
+export BITLINEAR_CUDA_GRADW_LT=0
+export BITLINEAR_CUDA_FUSED_ACT=1
+export BITLINEAR_CUDA_FUSED_WEIGHT=1
+```
+
+권장 실행 예시:
+```bash
+python -m training.pretrain \
+  --corpus corpus/sample_10g.jsonl \
+  --text_key text \
+  --size 128M \
+  --pack_size 4096 \
+  --tokenizer keyboard \
+  --batch_size 2 \
+  --grad_accum_steps 1 \
+  --bf16 \
+  --int8 \
+  --int8_backend cuda \
+  --lr 1.6e-4 \
+  --warmup_steps 100 \
+  --val_corpus corpus/val_50k.jsonl \
+  --val_every 200 \
+  --save_dir checkpoints/run_v1 \
+  --save_every 100 \
+  --log_every 10 \
+  --num_workers 0
+```
