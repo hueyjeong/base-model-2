@@ -1,14 +1,14 @@
-# 빌드 이미지를 CUDA 13.0.0 (Ubuntu 22.04 기반)으로 상향
-FROM nvidia/cuda:13.0.0-devel-ubuntu24.04
+# 빌드 이미지를 CUDA 12.8 (Ubuntu 24.04 기반)으로 맞춰 mamba_ssm 및 pytorch 컴파일 버전과 동일하게 합니다.
+FROM nvidia/cuda:12.8.0-devel-ubuntu24.04
 
 # 컨테이너 내 상호작용 프롬프트 무시
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 ENV PIP_NO_CACHE_DIR=1
 
-# CUDA 13.0 경로 설정
-ENV PATH=/usr/local/cuda-13.0/bin${PATH:+:${PATH}}
-ENV LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
+# CUDA 12.8 경로 설정
+ENV PATH=/usr/local/cuda-12.8/bin${PATH:+:${PATH}}
+ENV LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
 
 # 시스템 종속성 설치용 저장소 추가 및 기본 패키지 설치
 RUN apt-get update && apt-get install -y \
@@ -112,7 +112,7 @@ RUN echo 'Installing Requirement...' && \
     pip install -r requirements.txt
 
 RUN echo 'Installing PyTorch...' && \
-    pip install torch --index-url https://download.pytorch.org/whl/cu130 --force-reinstall
+    pip install torch --index-url https://download.pytorch.org/whl/cu128 --force-reinstall
 
 RUN echo 'Installing Core Dependencies...' && \
     pip install wheel tokenizers transformers sentencepiece einops ninja packaging
