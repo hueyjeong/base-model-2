@@ -423,6 +423,10 @@ def train(args):
         raw_model = model
 
     start_step = 0
+    ckpt = None
+    needs_data_recovery = False
+    recovered_chars_from_replay = None
+    restored_total_chars = None
     if args.resume and os.path.exists(args.resume):
         if global_rank == 0:
             print(f"\n체크포인트 로드: {args.resume}")
@@ -433,8 +437,20 @@ def train(args):
         start_step = ckpt.get("step", 0)
         if scaler and "scaler" in ckpt:
             scaler.load_state_dict(ckpt["scaler"])
+
+        if "total_chars" in ckpt and isinstance(ckpt["total_chars"], int):
+            restored_total_chars = ckpt["total_chars"]
+
+        data_state = ckpt.get("data_state")
+        # 기존 체크포인트(데이터 상태 없음)는 데이터 소비를 시뮬레이션하여 복구
+        needs_data_recovery = (start_step > 0 and not isinstance(data_state, dict))
+
         if global_rank == 0:
             print(f"  스텝 {start_step}부터 재시작")
+            if restored_total_chars is not None:
+                print(f"  total_chars 복원: {format_chars(restored_total_chars)}")
+            if needs_data_recovery:
+                print("  ℹ️  data_state 미포함 체크포인트 감지: 데이터 RNG/커서 복구 시뮬레이션 수행")
 
     # CUDA Graph (실험): 고정 shape + 단일 GPU + 비스케일러 경로에서만 활성화
     use_cuda_graph = (
@@ -479,7 +495,7 @@ def train(args):
     optimizer.zero_grad()
 
     global_step = start_step
-    total_chars = args.start_chars
+    total_chars = restored_total_chars if restored_total_chars is not None else args.start_chars
     accum_loss = 0.0
     accum_tokens = 0
     log_loss = 0.0
@@ -502,6 +518,58 @@ def train(args):
             if global_rank == 0:
                 print(f"  ── epoch {epoch} 시작 (step {global_step}) ──", flush=True)
             return b
+
+    def _simulate_val_consumption_for_rng() -> None:
+        """validate()와 동일하게 val_loader를 소비해 RNG 진행량을 맞춘다."""
+        if val_loader is None or not args.val_steps:
+            return
+        val_iter = iter(val_loader)
+        for _ in range(args.val_steps):
+            try:
+                next(val_iter)
+            except StopIteration:
+                break
+
+    if needs_data_recovery:
+        if global_rank == 0:
+            print(f"\n🔁 데이터 복구 시뮬레이션 시작: 0 → step {start_step}")
+
+        replay_chars = 0
+        replay_t0 = time.time()
+
+        # 데이터 소비 패턴 재생: train(grad_accum) + 주기적 validate 소비
+        for replay_step in range(start_step):
+            for _ in range(args.grad_accum_steps):
+                replay_batch = _next_batch()
+                local_chars = int(replay_batch["n_chars"])
+                if is_distributed:
+                    chars_tensor = torch.tensor([local_chars], device=device, dtype=torch.long)
+                    dist.all_reduce(chars_tensor, op=dist.ReduceOp.SUM)
+                    local_chars = int(chars_tensor.item())
+                replay_chars += local_chars
+
+            if val_loader is not None and args.val_every and ((replay_step + 1) % args.val_every == 0):
+                _simulate_val_consumption_for_rng()
+                if is_distributed:
+                    dist.barrier()
+
+            if global_rank == 0 and (replay_step + 1) % max(args.log_every * 20, 200) == 0:
+                print(f"  [replay] step {replay_step + 1}/{start_step} | chars {format_chars(replay_chars)}", flush=True)
+
+        recovered_chars_from_replay = replay_chars
+        if restored_total_chars is None:
+            total_chars = replay_chars
+        else:
+            if global_rank == 0 and restored_total_chars != replay_chars:
+                print(
+                    f"  ⚠️  total_chars 불일치: ckpt={format_chars(restored_total_chars)} vs replay={format_chars(replay_chars)}"
+                )
+                print("     체크포인트 total_chars 값을 우선 사용합니다.")
+                total_chars = restored_total_chars
+
+        if global_rank == 0:
+            dt = time.time() - replay_t0
+            print(f"✅ 데이터 복구 시뮬레이션 완료 ({dt:.1f}s) | total_chars={format_chars(total_chars)}")
 
     graph_runner = None
     if use_cuda_graph:
@@ -747,10 +815,22 @@ def train(args):
             ckpt_path = os.path.join(args.save_dir, f"step_{global_step}.pt")
             ckpt = {
                 "step": global_step,
+                "total_chars": int(total_chars),
                 "model": raw_model.state_dict(),
                 "optimizer": optimizer.state_dict(),
                 "config": model_kwargs,
                 "args": vars(args),
+                "data_state": {
+                    "version": 1,
+                    "needs_replay_for_exact_resume": True,
+                    "global_step": int(global_step),
+                    "total_chars": int(total_chars),
+                    "grad_accum_steps": int(args.grad_accum_steps),
+                    "val_every": int(args.val_every) if args.val_every is not None else None,
+                    "val_steps": int(args.val_steps) if args.val_steps is not None else None,
+                    "num_workers": int(args.num_workers),
+                    "recovered_chars_from_replay": int(recovered_chars_from_replay) if recovered_chars_from_replay is not None else None,
+                },
             }
             if scaler:
                 ckpt["scaler"] = scaler.state_dict()
@@ -767,8 +847,15 @@ def train(args):
         final_path = os.path.join(args.save_dir, "final.pt")
         torch.save({
             "step": global_step,
+            "total_chars": int(total_chars),
             "model": raw_model.state_dict(),
             "config": model_kwargs,
+            "data_state": {
+                "version": 1,
+                "needs_replay_for_exact_resume": True,
+                "global_step": int(global_step),
+                "total_chars": int(total_chars),
+            },
         }, final_path)
         print(f"\n최종 모델 저장: {final_path}")
         print(f"\n학습 완료! (총 {global_step} 스텝)")
