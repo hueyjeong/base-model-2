@@ -22,6 +22,7 @@ The primary language of in-code comments and docstrings is **Korean (한국어)*
 base-model-2/
 ├── tokenizer_base.py          # Abstract base class (BaseTokenizer) for all tokenizers
 ├── verify_model.py            # Model verification script (forward/backward pass tests)
+├── bench_cuda_ablation.py     # INT8 CUDA 최적화 A/B 벤치 스크립트
 ├── requirements.txt           # Python dependencies (pip freeze)
 │
 ├── model/                     # BitNet-Mamba Seq2Seq model package
@@ -32,6 +33,9 @@ base-model-2/
 │   ├── decoder.py             # Mamba-based decoder
 │   ├── mamba_block.py         # Mamba SSM block
 │   ├── bitlinear.py           # BitLinear (1.58b weight, 8-bit activation) layer
+│   ├── cuda_bitlinear.py      # CUDA INT8 BitLinear backend (custom autograd)
+│   ├── cuda_bitlinear_ext.cpp # CUDA extension C++ binding
+│   ├── cuda_bitlinear_kernel.cu # CUDA kernels (__dp4a, quantize, grad weight)
 │   └── cross_attention.py     # (Deprecated) Cross-attention between encoder/decoder
 │
 ├── training/                  # Pre-training scripts
@@ -185,8 +189,22 @@ The model uses `training/pretrain.py` for training the Seq2Seq BitMamba architec
 - **Optimization Strategy**: 
   - Requires PyTorch `bfloat16` (`--bf16`) for mixed-precision to avoid BitLinear scaler overflow.
   - Leverages `liger-kernel` for Fused Cross-Entropy (`--fused_ce`) to completely avoid materializing `logits` matrices in VRAM.
-  - Supports `torch.compile` (`--compile`) for JIT kernel fusions and speedups.
+  - Supports `torch.compile` (`--compile`) for non-INT8 eager path speedups.
   - Provides Gradient Checkpointing (`--grad_ckpt`) and chunked cross-entropy fallback (`--chunk_ce`).
+  - Supports INT8 backend selection: `--int8 --int8_backend {triton,cuda}`.
+  - `--cuda_graph` is experimental-only and should be treated as opt-in benchmarking mode.
+
+#### INT8 CUDA practical guidance (latest)
+- Recommended stack phrase: **non-graph + `gradw_lt` + `fused_quant`**.
+- Recommended default on current codebase:
+  - `BITLINEAR_CUDA_BACKWARD=bf16_tc`
+  - `BITLINEAR_CUDA_GRADW_LT=1`
+  - `BITLINEAR_CUDA_FUSED_ACT=1`
+  - `BITLINEAR_CUDA_FUSED_WEIGHT=1`
+- `--int8` with `--compile` is currently skipped by design (custom autograd path).
+- `grad_ckpt` has strong memory impact and notable speed cost (memory ↓, tok/s ↓).
+- `fused_ce` impact is usually smaller than `grad_ckpt` for memory/throughput trade-off.
+- Current low/mid VRAM reliability target is batch `1~2`; batch `4+` requires stronger GPU or tighter settings.
 
 ### Testing
 - Most scripts include inline `if __name__ == "__main__"` test blocks

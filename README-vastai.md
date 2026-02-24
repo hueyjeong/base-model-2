@@ -72,7 +72,7 @@ torchrun --nproc_per_node=2 training/pretrain.py \
    --int8_backend cuda
 
 # 권장 환경변수 (non-graph 가속)
-export BITLINEAR_CUDA_BACKWARD=fp32_tf32
+export BITLINEAR_CUDA_BACKWARD=bf16_tc
 export BITLINEAR_CUDA_GRADW_LT=1
 export BITLINEAR_CUDA_FUSED_ACT=1
 export BITLINEAR_CUDA_FUSED_WEIGHT=1
@@ -81,6 +81,9 @@ export BITLINEAR_CUDA_FUSED_WEIGHT=1
 # (일부 배치/시퀀스 조합에서 오히려 감속 가능)
 # --cuda_graph
 ```
+
+- `--int8` 경로에서는 현재 `--compile`이 자동으로 건너뛰어집니다(custom autograd 제약).
+- 메모리/처리량 균형 기준으로, 현재 환경의 안정 기본값은 `batch_size=1~2`입니다.
 
 상세 사용법과 트러블슈팅은 `docs/int8_cuda_backend.md`를 참고하세요.
 
