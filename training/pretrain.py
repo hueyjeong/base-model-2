@@ -480,6 +480,8 @@ def train(args):
               f"max_chars={format_chars(max_chars) if max_chars else 'unlimited'}, "
               f"grad_accum={args.grad_accum_steps})")
         print(f"  effective batch = {args.batch_size} × {args.grad_accum_steps} × {world_size} = {args.batch_size * args.grad_accum_steps * world_size} packs")
+        if args.microbatch_size and args.microbatch_size > 0:
+            print(f"  microbatch forward = {args.microbatch_size} (VRAM 피크 절감)")
         print(f"  종료 기준: {stop_mode}")
         print("=" * 60)
 
@@ -662,9 +664,14 @@ def train(args):
             tgt_target = tgt_ids[:, 1:]
 
             used_graph = False
+            microbatch_size = args.microbatch_size if args.microbatch_size and args.microbatch_size > 0 else 0
+            use_microbatch = microbatch_size > 0 and microbatch_size < src_ids.size(0)
             if graph_runner is not None:
                 cur_shape = (tuple(src_ids.shape), tuple(tgt_ids.shape), tuple(src_mask.shape))
-                if cur_shape == graph_runner["shape"]:
+                if use_microbatch:
+                    if global_rank == 0 and global_step == start_step and accum_i == 0:
+                        print("ℹ️  microbatch 활성화로 CUDA Graph 경로를 건너뜁니다.")
+                elif cur_shape == graph_runner["shape"]:
                     graph_runner["static_src"].copy_(src_ids)
                     graph_runner["static_tgt"].copy_(tgt_ids)
                     graph_runner["static_mask"].copy_(src_mask)
@@ -675,7 +682,87 @@ def train(args):
                     if global_rank == 0:
                         print("⚠️  CUDA Graph shape 불일치 감지. 해당 스텝은 eager 경로로 실행")
 
-            if (not used_graph) and fused_ce_loss is not None:
+            if (not used_graph) and use_microbatch:
+                # ── 마이크로배치 경로: DataLoader 배치는 유지, forward/backward만 분할 ──
+                total_tokens_in_batch = int((tgt_target != config.pad_id).sum().item())
+                if total_tokens_in_batch == 0:
+                    total_tokens_in_batch = 1
+
+                loss_val = 0.0
+                bsz = src_ids.size(0)
+                for mb_start in range(0, bsz, microbatch_size):
+                    mb_end = min(mb_start + microbatch_size, bsz)
+                    mb_src_ids = src_ids[mb_start:mb_end]
+                    mb_tgt_input = tgt_input[mb_start:mb_end]
+                    mb_tgt_target = tgt_target[mb_start:mb_end]
+                    mb_src_mask = src_mask[mb_start:mb_end]
+
+                    mb_tokens = int((mb_tgt_target != config.pad_id).sum().item())
+                    if mb_tokens == 0:
+                        continue
+                    token_weight = mb_tokens / total_tokens_in_batch
+
+                    if fused_ce_loss is not None:
+                        if use_amp:
+                            with torch.amp.autocast("cuda", dtype=amp_dtype):
+                                encoder_out = raw_model.encode(mb_src_ids, mb_src_mask)
+                                hidden = raw_model.decode(
+                                    mb_tgt_input,
+                                    encoder_out,
+                                    mb_src_mask,
+                                    return_hidden=True,
+                                    src_ids=mb_src_ids,
+                                    source_bias=args.source_bias,
+                                )
+                                mb_loss = fused_ce_loss(
+                                    raw_model.lm_head.weight.float(),
+                                    hidden.view(-1, hidden.size(-1)).float(),
+                                    mb_tgt_target.reshape(-1),
+                                )
+                        else:
+                            encoder_out = raw_model.encode(mb_src_ids, mb_src_mask)
+                            hidden = raw_model.decode(
+                                mb_tgt_input,
+                                encoder_out,
+                                mb_src_mask,
+                                return_hidden=True,
+                                src_ids=mb_src_ids,
+                                source_bias=args.source_bias,
+                            )
+                            mb_loss = fused_ce_loss(
+                                raw_model.lm_head.weight.float(),
+                                hidden.view(-1, hidden.size(-1)).float(),
+                                mb_tgt_target.reshape(-1),
+                            )
+                    else:
+                        if use_amp:
+                            with torch.amp.autocast("cuda", dtype=amp_dtype):
+                                mb_logits = model(mb_src_ids, mb_tgt_input, mb_src_mask, source_bias=args.source_bias)
+                                mb_loss = criterion(
+                                    mb_logits.view(-1, config.vocab_size),
+                                    mb_tgt_target.reshape(-1),
+                                )
+                        else:
+                            mb_logits = model(mb_src_ids, mb_tgt_input, mb_src_mask, source_bias=args.source_bias)
+                            mb_loss = criterion(
+                                mb_logits.view(-1, config.vocab_size),
+                                mb_tgt_target.reshape(-1),
+                            )
+
+                    mb_loss = mb_loss * token_weight / args.grad_accum_steps
+                    if scaler:
+                        scaler.scale(mb_loss).backward()
+                    else:
+                        mb_loss.backward()
+
+                    loss_val += mb_loss.item()
+
+                    if fused_ce_loss is not None:
+                        del mb_loss, mb_src_ids, mb_tgt_input, mb_tgt_target, mb_src_mask, encoder_out, hidden
+                    else:
+                        del mb_loss, mb_src_ids, mb_tgt_input, mb_tgt_target, mb_src_mask, mb_logits
+
+            elif (not used_graph) and fused_ce_loss is not None:
                 # ── Fused Cross-Entropy (logits 미생성) ──
                 if use_amp:
                     with torch.amp.autocast("cuda", dtype=amp_dtype):
@@ -922,6 +1009,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_workers", type=int, default=4,
                         help="DataLoader worker 수 (0=메인 프로세스만)")
+    parser.add_argument("--microbatch_size", type=int, default=0,
+                        help="forward/backward 마이크로배치 크기 (0이면 비활성, batch_size는 그대로 유지)")
 
     # 원문 참조력 실험 (Trial A & B 기본 적용)
     parser.add_argument("--source_bias", type=float, default=0.5,
