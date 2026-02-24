@@ -275,7 +275,7 @@ def train(args):
     tokenizer = load_tokenizer(args.tokenizer)
     print(f"토크나이저 로드: {args.tokenizer}, vocab_size={tokenizer.vocab_size}")
 
-    # ── 모델 생성 ──
+    # ── 모델 설정 확인 (config만, GPU 할당은 아직) ──
     if args.size not in SMALL_CONFIGS:
         print(f"❌ 지원하지 않는 사이즈: {args.size}")
         print(f"   사용 가능: {list(SMALL_CONFIGS.keys())}")
@@ -285,42 +285,39 @@ def train(args):
     model_kwargs["vocab_size"] = tokenizer.vocab_size
     model_kwargs["use_copy_gate"] = args.use_copy_gate
     config = BitMambaSeq2SeqConfig(**model_kwargs)
-    model = BitMambaSeq2Seq(config).to(device)
-    # 임베딩만 FP32로 (FP16 임베딩 gradient NaN 방지, 나머지는 native dtype 유지)
-    model.encoder_embedding.float()
-    if not config.tie_embeddings:
-        model.decoder_embedding.float()
 
-    counts = model.count_parameters()
     if global_rank == 0:
-        print(f"\n모델: {args.size}")
+        print(f"\n모델 설정: {args.size}")
         print(f"  d_model={config.d_model}, enc={config.n_encoder_layers}, "
               f"dec={config.n_decoder_layers}")
-        print(f"  임베딩 제외 파라미터: {format_params(counts['total_excl_embedding'])}")
-        print(f"  전체 파라미터: {format_params(counts['total'])}")
 
-    # INT8 텐서코어 BitLinear 교체
-    if args.int8:
-        if args.int8_backend == "cuda":
-            try:
-                from model.cuda_bitlinear import replace_bitlinear_with_cuda
-                model = replace_bitlinear_with_cuda(model)
-            except Exception as e:
-                print(f"⚠️ CUDA BitLinear 로드 실패: {e}")
-                print("   triton backend로 fallback 합니다.")
-                from model.triton_bitlinear import replace_bitlinear_with_triton
-                model = replace_bitlinear_with_triton(model)
-        else:
-            from model.triton_bitlinear import replace_bitlinear_with_triton
-            model = replace_bitlinear_with_triton(model)
+    # ── 체크포인트 메타 선행 로드 (CPU, GPU 할당 없음) ──
+    start_step = 0
+    needs_data_recovery = False
+    recovered_chars_from_replay = None
+    restored_total_chars = None
+    _resume_path = None
 
-    # Gradient Checkpointing
-    if args.grad_ckpt:
-        model.encoder.gradient_checkpointing = True
-        model.decoder.gradient_checkpointing = True
-        print("  Gradient Checkpointing: ✔")
+    if args.resume and os.path.exists(args.resume):
+        _resume_path = args.resume
+        if global_rank == 0:
+            print(f"\n체크포인트 메타 로드: {args.resume}")
+        ckpt_meta = torch.load(args.resume, map_location='cpu', weights_only=False)
+        start_step = ckpt_meta.get("step", 0)
+        if "total_chars" in ckpt_meta and isinstance(ckpt_meta["total_chars"], int):
+            restored_total_chars = ckpt_meta["total_chars"]
+        data_state = ckpt_meta.get("data_state")
+        needs_data_recovery = (start_step > 0 and not isinstance(data_state, dict))
+        del ckpt_meta
+        gc.collect()
+        if global_rank == 0:
+            print(f"  스텝: {start_step}")
+            if restored_total_chars is not None:
+                print(f"  total_chars: {format_chars(restored_total_chars)}")
+            if needs_data_recovery:
+                print("  ℹ️  data_state 미포함 → 데이터 RNG 복구 시뮬레이션 필요")
 
-    # ── 데이터셋 (스트리밍 + 패킹) ──
+    # ── 데이터 파이프라인 (CPU only) ──
     noiser = DenoisingNoiser(
         tokenizer, NoiseConfig(), seed=args.seed + global_rank, use_korean_errors=True,
     )
@@ -335,7 +332,6 @@ def train(args):
     if global_rank == 0:
         print(f"\n데이터셋: 스트리밍 (pack_size={args.pack_size})")
 
-    # ── 검증 데이터셋 ──
     val_loader = None
     if args.val_corpus:
         val_dataset = StreamingPackedDataset(
@@ -349,21 +345,6 @@ def train(args):
         if global_rank == 0:
             print(f"검증 데이터: {args.val_corpus}")
 
-    # Fused Cross-Entropy 설정
-    fused_ce_loss = None
-    if args.fused_ce:
-        if not FUSED_CE_AVAILABLE:
-            print("⚠️  liger-kernel 미설치. pip install liger-kernel 후 재시도")
-            print("   기존 CE 방식으로 대체합니다.")
-        else:
-            fused_ce_loss = LigerFusedLinearCrossEntropyLoss(
-                ignore_index=config.pad_id,
-                reduction="mean",
-            )
-            if global_rank == 0:
-                print(f"💫 Fused Cross-Entropy 활성화 (logits 메모리 0)")
-
-    # DataLoader: IterableDataset이므로 shuffle 불필요
     def collate_packed(batch):
         """패킹된 샘플들을 배치로 묶기 (길이가 다를 수 있으므로 패딩)"""
         from torch.nn.utils.rnn import pad_sequence
@@ -372,7 +353,6 @@ def train(args):
         n_chars = sum(b["n_chars"] for b in batch)
         src_ids = pad_sequence(src_list, batch_first=True, padding_value=0)
         tgt_ids = pad_sequence(tgt_list, batch_first=True, padding_value=0)
-        # 패딩 위치 마스크 (True=유효, False=패딩)
         src_mask = src_ids != 0
         return {"src_ids": src_ids, "tgt_ids": tgt_ids, "src_mask": src_mask,
                 "n_chars": n_chars}
@@ -391,123 +371,12 @@ def train(args):
             persistent_workers=args.num_workers > 0,
         )
 
-    # ── Optimizer + Scheduler ──
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.lr,
-        betas=(0.9, 0.98), weight_decay=args.weight_decay,
-    )
-    # Loss: cross-entropy (PAD 무시)
-    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_id)
-
-    # AMP 설정 (BF16 우선, FP16 fallback)
-    use_amp = (args.bf16 or args.amp) and torch.cuda.is_available()
-    if args.bf16 and torch.cuda.is_available():
-        amp_dtype = torch.bfloat16
-        scaler = None  # BF16은 GradScaler 불필요 (FP32 동일 dynamic range)
-        if global_rank == 0:
-            print(f"⚡ BF16 Mixed Precision 활성화 (GradScaler 없음)")
-    elif args.amp and torch.cuda.is_available():
-        amp_dtype = torch.float16
-        scaler = torch.amp.GradScaler("cuda")
-        if global_rank == 0:
-            print(f"⚡ FP16 Mixed Precision 활성화 (GradScaler 사용)")
-    else:
-        amp_dtype = None
-        scaler = None
-
-    # DDP Wrapping 모델
-    if is_distributed:
-        model = DDP(model, device_ids=[local_rank])
-        raw_model = model.module
-    else:
-        raw_model = model
-
-    start_step = 0
-    ckpt = None
-    needs_data_recovery = False
-    recovered_chars_from_replay = None
-    restored_total_chars = None
-    if args.resume and os.path.exists(args.resume):
-        if global_rank == 0:
-            print(f"\n체크포인트 로드: {args.resume}")
-        # DDP 환경에서는 map_location에 device를 지정하여 바로 해당 GPU 램에 로드하는 것이 효율적입니다.
-        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        raw_model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        start_step = ckpt.get("step", 0)
-        if scaler and "scaler" in ckpt:
-            scaler.load_state_dict(ckpt["scaler"])
-
-        if "total_chars" in ckpt and isinstance(ckpt["total_chars"], int):
-            restored_total_chars = ckpt["total_chars"]
-
-        data_state = ckpt.get("data_state")
-        # 기존 체크포인트(데이터 상태 없음)는 데이터 소비를 시뮬레이션하여 복구
-        needs_data_recovery = (start_step > 0 and not isinstance(data_state, dict))
-
-        if global_rank == 0:
-            print(f"  스텝 {start_step}부터 재시작")
-            if restored_total_chars is not None:
-                print(f"  total_chars 복원: {format_chars(restored_total_chars)}")
-            if needs_data_recovery:
-                print("  ℹ️  data_state 미포함 체크포인트 감지: 데이터 RNG/커서 복구 시뮬레이션 수행")
-
-    # CUDA Graph (실험): 고정 shape + 단일 GPU + 비스케일러 경로에서만 활성화
-    use_cuda_graph = (
-        args.cuda_graph
-        and torch.cuda.is_available()
-        and (not is_distributed)
-        and (not args.grad_ckpt)
-        and (not args.compile)
-        and (not args.fused_ce)
-        and (scaler is None)
-    )
-    if args.cuda_graph and not use_cuda_graph and global_rank == 0:
-        print("⚠️  CUDA Graph 조건 미충족(단일GPU/grad_ckpt off/compile off/fused_ce off/FP16 scaler off). 비활성화합니다.")
-    if use_cuda_graph:
-        try:
-            torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
-            if global_rank == 0:
-                print("ℹ️  CUDA Graph 모드: AccumulateGrad stream mismatch 경고 비활성화")
-        except Exception:
-            pass
-
-    # ── 학습 루프 ──
-    max_chars = args.max_chars
-    stop_mode = "chars" if max_chars else "steps"
-    if global_rank == 0:
-        print(f"\n학습 시작 (max_steps={args.max_steps}, "
-              f"max_chars={format_chars(max_chars) if max_chars else 'unlimited'}, "
-              f"grad_accum={args.grad_accum_steps})")
-        print(f"  effective batch = {args.batch_size} × {args.grad_accum_steps} × {world_size} = {args.batch_size * args.grad_accum_steps * world_size} packs")
-        if args.microbatch_size and args.microbatch_size > 0:
-            print(f"  microbatch forward = {args.microbatch_size} (VRAM 피크 절감)")
-        print(f"  종료 기준: {stop_mode}")
-        print("=" * 60)
-
-    # torch.compile (커널 fusion으로 속도 향상)
-    if args.compile:
-        if args.int8:
-            print("⚠️  --int8과 --compile은 동시 사용 불가 (custom autograd). --compile 건너뜀")
-        else:
-            print("🔧 torch.compile 적용 중... (첫 step 느림, 이후 빠름)")
-            model = torch.compile(model)
-
-    model.train()
-    optimizer.zero_grad()
-
-    global_step = start_step
+    # ── 데이터 복구 시뮬레이션 (GPU 할당 0, CPU only) ──
     total_chars = restored_total_chars if restored_total_chars is not None else args.start_chars
-    accum_loss = 0.0
-    accum_tokens = 0
-    log_loss = 0.0
-    log_tokens = 0
-    log_chars = 0
-    t_start = time.time()
 
     data_iter = iter(loader)
     epoch = 1
-    training_done = False
+    global_step = start_step  # _next_batch 에서 참조
 
     def _next_batch():
         nonlocal data_iter, epoch, global_step
@@ -534,12 +403,11 @@ def train(args):
 
     if needs_data_recovery:
         if global_rank == 0:
-            print(f"\n🔁 데이터 복구 시뮬레이션 시작: 0 → step {start_step}")
+            print(f"\n🔁 데이터 복구 시뮬레이션 시작: 0 → step {start_step} (GPU 미사용)")
 
         replay_chars = 0
         replay_t0 = time.time()
 
-        # 데이터 소비 패턴 재생: train(grad_accum) + 주기적 validate 소비
         for replay_step in range(start_step):
             for _ in range(args.grad_accum_steps):
                 replay_batch = _next_batch()
@@ -572,6 +440,151 @@ def train(args):
         if global_rank == 0:
             dt = time.time() - replay_t0
             print(f"✅ 데이터 복구 시뮬레이션 완료 ({dt:.1f}s) | total_chars={format_chars(total_chars)}")
+
+    # ── 모델 생성 + GPU 로드 (리플레이 후, VRAM 깨끗한 상태) ──
+    model = BitMambaSeq2Seq(config).to(device)
+    model.encoder_embedding.float()
+    if not config.tie_embeddings:
+        model.decoder_embedding.float()
+
+    counts = model.count_parameters()
+    if global_rank == 0:
+        print(f"\n  임베딩 제외 파라미터: {format_params(counts['total_excl_embedding'])}")
+        print(f"  전체 파라미터: {format_params(counts['total'])}")
+
+    # INT8 텐서코어 BitLinear 교체
+    if args.int8:
+        if args.int8_backend == "cuda":
+            try:
+                from model.cuda_bitlinear import replace_bitlinear_with_cuda
+                model = replace_bitlinear_with_cuda(model)
+            except Exception as e:
+                print(f"⚠️ CUDA BitLinear 로드 실패: {e}")
+                print("   triton backend로 fallback 합니다.")
+                from model.triton_bitlinear import replace_bitlinear_with_triton
+                model = replace_bitlinear_with_triton(model)
+        else:
+            from model.triton_bitlinear import replace_bitlinear_with_triton
+            model = replace_bitlinear_with_triton(model)
+
+    # Gradient Checkpointing
+    if args.grad_ckpt:
+        model.encoder.gradient_checkpointing = True
+        model.decoder.gradient_checkpointing = True
+        print("  Gradient Checkpointing: ✔")
+
+    # Fused Cross-Entropy 설정
+    fused_ce_loss = None
+    if args.fused_ce:
+        if not FUSED_CE_AVAILABLE:
+            print("⚠️  liger-kernel 미설치. pip install liger-kernel 후 재시도")
+            print("   기존 CE 방식으로 대체합니다.")
+        else:
+            fused_ce_loss = LigerFusedLinearCrossEntropyLoss(
+                ignore_index=config.pad_id,
+                reduction="mean",
+            )
+            if global_rank == 0:
+                print(f"💫 Fused Cross-Entropy 활성화 (logits 메모리 0)")
+
+    # ── Optimizer + Scheduler ──
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=args.lr,
+        betas=(0.9, 0.98), weight_decay=args.weight_decay,
+    )
+    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_id)
+
+    # AMP 설정 (BF16 우선, FP16 fallback)
+    use_amp = (args.bf16 or args.amp) and torch.cuda.is_available()
+    if args.bf16 and torch.cuda.is_available():
+        amp_dtype = torch.bfloat16
+        scaler = None
+        if global_rank == 0:
+            print(f"⚡ BF16 Mixed Precision 활성화 (GradScaler 없음)")
+    elif args.amp and torch.cuda.is_available():
+        amp_dtype = torch.float16
+        scaler = torch.amp.GradScaler("cuda")
+        if global_rank == 0:
+            print(f"⚡ FP16 Mixed Precision 활성화 (GradScaler 사용)")
+    else:
+        amp_dtype = None
+        scaler = None
+
+    # DDP Wrapping
+    if is_distributed:
+        model = DDP(model, device_ids=[local_rank])
+        raw_model = model.module
+    else:
+        raw_model = model
+
+    # ── 체크포인트 가중치 로드 (GPU, 리플레이 이후) ──
+    if _resume_path:
+        if global_rank == 0:
+            print(f"\n체크포인트 가중치 로드: {_resume_path}")
+        ckpt = torch.load(_resume_path, map_location=device, weights_only=False)
+        raw_model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        if scaler and "scaler" in ckpt:
+            scaler.load_state_dict(ckpt["scaler"])
+        del ckpt
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if global_rank == 0:
+            print(f"  ✅ 가중치 복원 완료 (step {start_step}부터 학습 재개)")
+
+    # CUDA Graph (실험)
+    use_cuda_graph = (
+        args.cuda_graph
+        and torch.cuda.is_available()
+        and (not is_distributed)
+        and (not args.grad_ckpt)
+        and (not args.compile)
+        and (not args.fused_ce)
+        and (scaler is None)
+    )
+    if args.cuda_graph and not use_cuda_graph and global_rank == 0:
+        print("⚠️  CUDA Graph 조건 미충족(단일GPU/grad_ckpt off/compile off/fused_ce off/FP16 scaler off). 비활성화합니다.")
+    if use_cuda_graph:
+        try:
+            torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
+            if global_rank == 0:
+                print("ℹ️  CUDA Graph 모드: AccumulateGrad stream mismatch 경고 비활성화")
+        except Exception:
+            pass
+
+    # ── 학습 루프 ──
+    max_chars = args.max_chars
+    stop_mode = "chars" if max_chars else "steps"
+    if global_rank == 0:
+        print(f"\n학습 시작 (max_steps={args.max_steps}, "
+              f"max_chars={format_chars(max_chars) if max_chars else 'unlimited'}, "
+              f"grad_accum={args.grad_accum_steps})")
+        print(f"  effective batch = {args.batch_size} × {args.grad_accum_steps} × {world_size} = {args.batch_size * args.grad_accum_steps * world_size} packs")
+        if args.microbatch_size and args.microbatch_size > 0:
+            print(f"  microbatch forward = {args.microbatch_size} (VRAM 피크 절감)")
+        print(f"  종료 기준: {stop_mode}")
+        print("=" * 60)
+
+    # torch.compile
+    if args.compile:
+        if args.int8:
+            print("⚠️  --int8과 --compile은 동시 사용 불가 (custom autograd). --compile 건너뜀")
+        else:
+            print("🔧 torch.compile 적용 중... (첫 step 느림, 이후 빠름)")
+            model = torch.compile(model)
+
+    model.train()
+    optimizer.zero_grad()
+
+    # Training state (global_step, total_chars는 이미 리플레이에서 설정됨)
+    accum_loss = 0.0
+    accum_tokens = 0
+    log_loss = 0.0
+    log_tokens = 0
+    log_chars = 0
+    t_start = time.time()
+    training_done = False
 
     graph_runner = None
     if use_cuda_graph:
@@ -813,14 +826,14 @@ def train(args):
                     loss = loss / args.grad_accum_steps
                     loss.backward()
 
-            if not used_graph:
+            if not used_graph and not use_microbatch:
                 loss_val = loss.item()
 
             n_tokens = tgt_target.numel()
 
             # 분산 환경일 경우 손실과 통계를 동기화(reduce)하여 로깅 정확성 보장
             if is_distributed:
-                loss_info = torch.tensor([loss.item(), n_tokens, batch_chars], device=device)
+                loss_info = torch.tensor([loss_val, n_tokens, batch_chars], device=device)
                 dist.all_reduce(loss_info, op=dist.ReduceOp.SUM)
                 sync_loss = loss_info[0].item() / world_size
                 sync_tokens = int(loss_info[1].item())
@@ -838,7 +851,7 @@ def train(args):
             total_chars += sync_chars
 
             # 메모리 해제: 계산 그래프 참조 제거
-            if used_graph:
+            if used_graph or use_microbatch:
                 del src_ids, tgt_ids, src_mask, tgt_input, tgt_target
             else:
                 del loss, src_ids, tgt_ids, src_mask, tgt_input, tgt_target
