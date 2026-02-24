@@ -400,6 +400,19 @@ class DenoisingNoiser:
         if self._error_gen is not None:
             self._error_gen.set_seed(seed)
 
+    def state_dict(self) -> dict:
+        """RNG 내부 상태를 직렬화 가능한 dict로 반환"""
+        state = {"rng_state": self.rng.getstate()}
+        if self._error_gen is not None:
+            state["error_gen_state"] = self._error_gen.state_dict()
+        return state
+
+    def load_state_dict(self, state: dict) -> None:
+        """저장된 RNG 상태를 복원"""
+        self.rng.setstate(state["rng_state"])
+        if self._error_gen is not None and "error_gen_state" in state:
+            self._error_gen.load_state_dict(state["error_gen_state"])
+
     def _detect_lang(self, text: str) -> str:
         """간단한 언어 감지 (한글/일본어/영어)"""
         ko_count = 0

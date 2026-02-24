@@ -108,6 +108,12 @@ class KoreanErrorGenerator:
         """랜덤 시드를 재설정. 에포크마다 호출 권장."""
         self._rng = random.Random(seed)
 
+    def state_dict(self) -> dict:
+        return {"rng_state": self._rng.getstate()}
+
+    def load_state_dict(self, state: dict) -> None:
+        self._rng.setstate(state["rng_state"])
+
     def apply_single_error(self, text: str,
                            error_type: Optional[str] = None) -> Optional[str]:
         """

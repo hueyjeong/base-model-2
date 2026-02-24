@@ -65,6 +65,19 @@ class StreamingPackedDataset(IterableDataset):
         self.rng = random.Random(seed)
         self.rank = rank
         self.world_size = world_size
+        self._line_counter = 0  # 현재 에폭 내 처리한 라인 수 추적
+
+    def state_dict(self) -> dict:
+        """파일셔플 RNG 상태 + 라인 카운터 반환"""
+        return {
+            "rng_state": self.rng.getstate(),
+            "line_counter": self._line_counter,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """저장된 RNG 상태 + 라인 카운터 복원"""
+        self.rng.setstate(state["rng_state"])
+        self._line_counter = state.get("line_counter", 0)
 
     def _iter_lines(self):
         """파일에서 (text, lang) 한 줄씩 스트리밍"""
@@ -158,6 +171,7 @@ class StreamingPackedDataset(IterableDataset):
 
         def noised_stream():
             for i, (text, lang) in enumerate(self._iter_lines()):
+                self._line_counter = i + 1
                 if i % total_workers != global_worker_id:
                     continue
                 noised_ids, target_ids = self.noiser(text, lang)

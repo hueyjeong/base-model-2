@@ -297,6 +297,7 @@ def train(args):
     recovered_chars_from_replay = None
     restored_total_chars = None
     _resume_path = None
+    _saved_data_state = None
 
     if args.resume and os.path.exists(args.resume):
         _resume_path = args.resume
@@ -307,7 +308,13 @@ def train(args):
         if "total_chars" in ckpt_meta and isinstance(ckpt_meta["total_chars"], int):
             restored_total_chars = ckpt_meta["total_chars"]
         data_state = ckpt_meta.get("data_state")
-        needs_data_recovery = (start_step > 0 and not isinstance(data_state, dict))
+        # data_state에 실제 RNG state가 있어야 즉시 복원 가능
+        has_rng_state = (isinstance(data_state, dict) and "noiser_state" in data_state)
+        needs_data_recovery = (start_step > 0 and not has_rng_state)
+        if has_rng_state:
+            _saved_data_state = data_state  # 나중에 복원용
+        else:
+            _saved_data_state = None
         del ckpt_meta
         gc.collect()
         if global_rank == 0:
@@ -401,7 +408,13 @@ def train(args):
             except StopIteration:
                 break
 
-    if needs_data_recovery:
+    if _saved_data_state is not None:
+        # ── 즉시 복원: 저장된 RNG state로 데이터 파이프라인 복원 ──
+        noiser.load_state_dict(_saved_data_state["noiser_state"])
+        dataset.load_state_dict(_saved_data_state["dataset_state"])
+        if global_rank == 0:
+            print(f"✅ 데이터 RNG 상태 즉시 복원 완료 (리플레이 불필요)")
+    elif needs_data_recovery:
         if global_rank == 0:
             print(f"\n🔁 데이터 복구 시뮬레이션 시작: 0 → step {start_step} (GPU 미사용)")
 
@@ -921,15 +934,10 @@ def train(args):
                 "config": model_kwargs,
                 "args": vars(args),
                 "data_state": {
-                    "version": 1,
-                    "needs_replay_for_exact_resume": True,
-                    "global_step": int(global_step),
+                    "version": 2,
+                    "noiser_state": noiser.state_dict(),
+                    "dataset_state": dataset.state_dict(),
                     "total_chars": int(total_chars),
-                    "grad_accum_steps": int(args.grad_accum_steps),
-                    "val_every": int(args.val_every) if args.val_every is not None else None,
-                    "val_steps": int(args.val_steps) if args.val_steps is not None else None,
-                    "num_workers": int(args.num_workers),
-                    "recovered_chars_from_replay": int(recovered_chars_from_replay) if recovered_chars_from_replay is not None else None,
                 },
             }
             if scaler:
@@ -951,9 +959,9 @@ def train(args):
             "model": raw_model.state_dict(),
             "config": model_kwargs,
             "data_state": {
-                "version": 1,
-                "needs_replay_for_exact_resume": True,
-                "global_step": int(global_step),
+                "version": 2,
+                "noiser_state": noiser.state_dict(),
+                "dataset_state": dataset.state_dict(),
                 "total_chars": int(total_chars),
             },
         }, final_path)
