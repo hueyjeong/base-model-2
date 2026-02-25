@@ -65,25 +65,38 @@ class StreamingPackedDataset(IterableDataset):
         self.rng = random.Random(seed)
         self.rank = rank
         self.world_size = world_size
-        self._line_counter = 0  # 현재 에폭 내 처리한 라인 수 추적
+        self._line_counter = 0  # 현재 에폭에서 지금까지 읽은 절대 라인 수
+        self._last_file_order: list[str] = []  # 마지막 에폭의 파일 순서 (state_dict 용)
+        self._resume_file_order: list[str] | None = None  # 복원 시 사용할 파일 순서
+        self._resume_line: int = 0  # 복원 후 fast-forward 목표 라인 수
 
     def state_dict(self) -> dict:
-        """파일셔플 RNG 상태 + 라인 카운터 반환"""
+        """파일 순서 + 라인 카운터 + 다음 에폭 셔플 RNG 반환"""
         return {
             "rng_state": self.rng.getstate(),
             "line_counter": self._line_counter,
+            "file_order": list(self._last_file_order),  # 현재 에폭 파일 순서 저장
         }
 
     def load_state_dict(self, state: dict) -> None:
-        """저장된 RNG 상태 + 라인 카운터 복원"""
+        """저장된 파일 순서 + 라인 카운터로 복원 준비"""
         self.rng.setstate(state["rng_state"])
-        self._line_counter = state.get("line_counter", 0)
+        self._resume_line = state.get("line_counter", 0)
+        self._line_counter = self._resume_line
+        # 저장된 파일 순서가 있으면 복원 시 재사용 (re-shuffle 방지)
+        self._resume_file_order = state.get("file_order") or None
 
     def _iter_lines(self):
         """파일에서 (text, lang) 한 줄씩 스트리밍"""
-        files = list(self.file_paths)
-        if self.shuffle_files:
-            self.rng.shuffle(files)
+        if self._resume_file_order is not None:
+            # 복원 모드: 저장된 순서 사용 (re-shuffle 금지)
+            files = self._resume_file_order
+            self._resume_file_order = None  # 한 번만 사용
+        else:
+            files = list(self.file_paths)
+            if self.shuffle_files:
+                self.rng.shuffle(files)
+        self._last_file_order = list(files)  # state_dict 용 기록
 
         for fpath in files:
             is_jsonl = fpath.endswith(".jsonl") or fpath.endswith(".json")
@@ -170,8 +183,14 @@ class StreamingPackedDataset(IterableDataset):
         global_worker_id = (self.rank * num_workers) + worker_id
 
         def noised_stream():
+            # 복원 후 fast-forward: resume_line 미만의 라인은 noiser 호출 없이 건너뜀
+            resume_line = self._resume_line
+            if resume_line > 0:
+                self._resume_line = 0  # 다음 에폭에서는 정상 동작
             for i, (text, lang) in enumerate(self._iter_lines()):
                 self._line_counter = i + 1
+                if i < resume_line:
+                    continue  # fast-forward: 파일만 읽고 noiser/pack은 건너뜀
                 if i % total_workers != global_worker_id:
                     continue
                 noised_ids, target_ids = self.noiser(text, lang)

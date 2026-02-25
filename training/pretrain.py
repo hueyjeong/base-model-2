@@ -249,7 +249,33 @@ def get_lr(step: int, warmup: int, max_lr: float, max_steps: int) -> float:
         return min_lr + (max_lr - min_lr) * step / max(warmup, 1)
     # cosine decay
     progress = (step - warmup) / max(max_steps - warmup, 1)
-    return min_lr + (max_lr - min_lr) * 0.5 * (1 + __import__("math").cos(__import__("math").pi * progress))
+    return min_lr + (max_lr - min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
+
+
+def get_lr_sgdr(step: int, warmup: int, max_lr: float, cycle_steps: int,
+                lr_decay: float = 0.85, min_lr: float = 1e-5) -> float:
+    """Cosine Annealing with Warm Restarts (SGDR) + 주기별 max_lr 감쇠
+
+    Args:
+        step: 현재 글로벌 스텝
+        warmup: 초기 linear warmup 스텝 수
+        max_lr: 첫 cycle의 최대 학습률
+        cycle_steps: 한 cycle의 길이 (restart 간격)
+        lr_decay: 매 cycle마다 max_lr에 곱할 감쇠 계수 (0.85 → cycle마다 15% 감소)
+        min_lr: 학습률 하한선 (BitNet weight 고착 방지)
+    """
+    if step < warmup:
+        return min_lr + (max_lr - min_lr) * step / max(warmup, 1)
+
+    effective_step = step - warmup
+    cycle_num = effective_step // cycle_steps
+    step_in_cycle = effective_step % cycle_steps
+    progress = step_in_cycle / max(cycle_steps, 1)
+
+    # 매 cycle마다 max_lr 감쇠
+    cycle_max_lr = max(max_lr * (lr_decay ** cycle_num), min_lr)
+
+    return min_lr + (cycle_max_lr - min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
 
 
 def train(args):
@@ -870,7 +896,11 @@ def train(args):
                 del loss, src_ids, tgt_ids, src_mask, tgt_input, tgt_target
 
         # Optimizer step
-        lr = get_lr(global_step, args.warmup_steps, args.lr, args.max_steps)
+        if args.lr_schedule == "sgdr":
+            lr = get_lr_sgdr(global_step, args.warmup_steps, args.lr,
+                             args.cycle_steps, args.lr_decay, args.min_lr)
+        else:
+            lr = get_lr(global_step, args.warmup_steps, args.lr, args.max_steps)
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
@@ -998,6 +1028,15 @@ def main():
 
     # 학습
     parser.add_argument("--lr", type=float, default=5e-4, help="최대 학습률")
+    parser.add_argument("--lr_schedule", default="cosine",
+                        choices=["cosine", "sgdr"],
+                        help="학습률 스케줄 (cosine: 단일 감쇠, sgdr: warm restarts)")
+    parser.add_argument("--cycle_steps", type=int, default=8000,
+                        help="SGDR cycle 길이 (restart 간격, --lr_schedule sgdr 전용)")
+    parser.add_argument("--lr_decay", type=float, default=0.85,
+                        help="SGDR cycle마다 max_lr 감쇠 계수 (--lr_schedule sgdr 전용)")
+    parser.add_argument("--min_lr", type=float, default=1e-5,
+                        help="SGDR 학습률 하한선 (--lr_schedule sgdr 전용)")
     parser.add_argument("--warmup_steps", type=int, default=1000, help="워밍업 스텝")
     parser.add_argument("--max_steps", type=int, default=100000, help="최대 학습 스텝")
     parser.add_argument("--max_chars", type=int, default=None,
