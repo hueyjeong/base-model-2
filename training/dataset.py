@@ -124,46 +124,52 @@ class StreamingPackedDataset(IterableDataset):
                     yield text, lang
 
     def _pack_sequences(self, noised_pairs):
-        """(noised_ids, target_ids, n_chars) 스트림을 pack_size까지 이어붙이기
+        """(noised_ids, target_ids, n_chars, src_weights) 스트림을 pack_size까지 이어붙이기
 
-        noised_ids, target_ids 모두 이미 [BOS]...[EOS] 포함 상태.
+        noised_ids, target_ids, src_weights 모두 이미 [BOS]...[EOS] 등 특수토큰 포함 상태.
         패킹은 단순 연결: [BOS]s1[EOS][BOS]s2[EOS]...
         """
         src_buf = []
         tgt_buf = []
+        weight_buf = []
         char_buf = 0
 
-        for noised_ids, target_ids, n_chars in noised_pairs:
+        for noised_ids, target_ids, n_chars, src_weights in noised_pairs:
             src_buf.extend(noised_ids)
             tgt_buf.extend(target_ids)
+            weight_buf.extend(src_weights)
             char_buf += n_chars
 
             # pack_size 이상이면 yield
             if len(src_buf) >= self.pack_size or len(tgt_buf) >= self.pack_size:
-                yield self._make_sample(src_buf, tgt_buf, char_buf)
+                yield self._make_sample(src_buf, tgt_buf, weight_buf, char_buf)
                 src_buf = []
                 tgt_buf = []
+                weight_buf = []
                 char_buf = 0
 
         # 잔여 버퍼 (마지막 불완전 팩)
         if src_buf:
-            yield self._make_sample(src_buf, tgt_buf, char_buf)
+            yield self._make_sample(src_buf, tgt_buf, weight_buf, char_buf)
 
-    def _make_sample(self, src_ids, tgt_ids, n_chars=0):
+    def _make_sample(self, src_ids, tgt_ids, src_weights, n_chars=0):
         """버퍼 → 텐서 dict (pack_size 초과 시 truncate, 부족 시 tokenizer.pad_id 로 pad)"""
         src_ids = src_ids[:self.pack_size]
         tgt_ids = tgt_ids[:self.pack_size]
+        src_weights = src_weights[:self.pack_size]
         
         # Pad if shorter than pack_size
         pad_id = self.tokenizer.pad_id
         if len(src_ids) < self.pack_size:
             src_ids.extend([pad_id] * (self.pack_size - len(src_ids)))
+            src_weights.extend([0.0] * (self.pack_size - len(src_weights)))
         if len(tgt_ids) < self.pack_size:
             tgt_ids.extend([pad_id] * (self.pack_size - len(tgt_ids)))
             
         return {
             "src_ids": torch.tensor(src_ids, dtype=torch.long),
             "tgt_ids": torch.tensor(tgt_ids, dtype=torch.long),
+            "src_weights": torch.tensor(src_weights, dtype=torch.float),
             "n_chars": n_chars,
         }
 
@@ -193,8 +199,8 @@ class StreamingPackedDataset(IterableDataset):
                     continue  # fast-forward: 파일만 읽고 noiser/pack은 건너뜀
                 if i % total_workers != global_worker_id:
                     continue
-                noised_ids, target_ids = self.noiser(text, lang)
-                yield noised_ids, target_ids, len(text)
+                noised_ids, target_ids, src_weights = self.noiser(text, lang)
+                yield noised_ids, target_ids, len(text), src_weights
 
         yield from self._pack_sequences(noised_stream())
 

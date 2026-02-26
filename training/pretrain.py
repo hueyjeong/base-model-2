@@ -383,12 +383,18 @@ def train(args):
         from torch.nn.utils.rnn import pad_sequence
         src_list = [b["src_ids"] for b in batch]
         tgt_list = [b["tgt_ids"] for b in batch]
-        n_chars = sum(b["n_chars"] for b in batch)
+        # src_weights 추출 (이전 생성 데이터 등 하위 호환을 위해 get 사용)
+        weight_list = [b.get("src_weights", torch.ones_like(b["src_ids"], dtype=torch.float)) for b in batch]
+        
+        n_chars = sum(b.get("n_chars", 0) for b in batch)
+        
         src_ids = pad_sequence(src_list, batch_first=True, padding_value=0)
         tgt_ids = pad_sequence(tgt_list, batch_first=True, padding_value=0)
+        src_weights = pad_sequence(weight_list, batch_first=True, padding_value=0.0)
+        
         src_mask = src_ids != 0
         return {"src_ids": src_ids, "tgt_ids": tgt_ids, "src_mask": src_mask,
-                "n_chars": n_chars}
+                "src_weights": src_weights, "n_chars": n_chars}
 
     loader = DataLoader(
         dataset, batch_size=args.batch_size,
@@ -708,6 +714,9 @@ def train(args):
             src_ids = batch["src_ids"].to(device)  # (B, src_len)
             tgt_ids = batch["tgt_ids"].to(device)  # (B, tgt_len)
             src_mask = batch["src_mask"].to(device)  # (B, src_len)
+            src_weights = batch.get("src_weights")
+            if src_weights is not None:
+                src_weights = src_weights.to(device)
             batch_chars = batch["n_chars"]
             del batch  # CPU 텐서 참조 제거
 
@@ -748,6 +757,7 @@ def train(args):
                     mb_tgt_input = tgt_input[mb_start:mb_end]
                     mb_tgt_target = tgt_target[mb_start:mb_end]
                     mb_src_mask = src_mask[mb_start:mb_end]
+                    mb_src_weights = src_weights[mb_start:mb_end] if src_weights is not None else None
 
                     mb_tokens = int((mb_tgt_target != config.pad_id).sum().item())
                     if mb_tokens == 0:
@@ -765,6 +775,7 @@ def train(args):
                                     return_hidden=True,
                                     src_ids=mb_src_ids,
                                     source_bias=args.source_bias,
+                                    src_weights=mb_src_weights,
                                 )
                                 mb_loss = fused_ce_loss(
                                     raw_model.lm_head.weight.float(),
@@ -780,6 +791,7 @@ def train(args):
                                 return_hidden=True,
                                 src_ids=mb_src_ids,
                                 source_bias=args.source_bias,
+                                src_weights=mb_src_weights,
                             )
                             mb_loss = fused_ce_loss(
                                 raw_model.lm_head.weight.float(),
@@ -789,13 +801,13 @@ def train(args):
                     else:
                         if use_amp:
                             with torch.amp.autocast("cuda", dtype=amp_dtype):
-                                mb_logits = model(mb_src_ids, mb_tgt_input, mb_src_mask, source_bias=args.source_bias)
+                                mb_logits = model(mb_src_ids, mb_tgt_input, mb_src_mask, source_bias=args.source_bias, src_weights=mb_src_weights)
                                 mb_loss = criterion(
                                     mb_logits.view(-1, config.vocab_size),
                                     mb_tgt_target.reshape(-1),
                                 )
                         else:
-                            mb_logits = model(mb_src_ids, mb_tgt_input, mb_src_mask, source_bias=args.source_bias)
+                            mb_logits = model(mb_src_ids, mb_tgt_input, mb_src_mask, source_bias=args.source_bias, src_weights=mb_src_weights)
                             mb_loss = criterion(
                                 mb_logits.view(-1, config.vocab_size),
                                 mb_tgt_target.reshape(-1),
@@ -820,7 +832,7 @@ def train(args):
                     with torch.amp.autocast("cuda", dtype=amp_dtype):
                         encoder_out = raw_model.encode(src_ids, src_mask)
                         hidden = raw_model.decode(tgt_input, encoder_out,
-                                              src_mask, return_hidden=True, src_ids=src_ids, source_bias=args.source_bias)
+                                              src_mask, return_hidden=True, src_ids=src_ids, source_bias=args.source_bias, src_weights=src_weights)
                         loss = fused_ce_loss(
                             raw_model.lm_head.weight.float(),
                             hidden.view(-1, hidden.size(-1)).float(),
@@ -834,7 +846,7 @@ def train(args):
                 else:
                     encoder_out = raw_model.encode(src_ids, src_mask)
                     hidden = raw_model.decode(tgt_input, encoder_out,
-                                          src_mask, return_hidden=True, src_ids=src_ids, source_bias=args.source_bias)
+                                          src_mask, return_hidden=True, src_ids=src_ids, source_bias=args.source_bias, src_weights=src_weights)
                     loss = fused_ce_loss(
                         raw_model.lm_head.weight.float(),
                         hidden.view(-1, hidden.size(-1)).float(),
@@ -846,7 +858,7 @@ def train(args):
                 # ── 기존 방식 ──
                 if use_amp:
                     with torch.amp.autocast("cuda", dtype=amp_dtype):
-                        logits = model(src_ids, tgt_input, src_mask, source_bias=args.source_bias)
+                        logits = model(src_ids, tgt_input, src_mask, source_bias=args.source_bias, src_weights=src_weights)
                         loss = criterion(
                             logits.view(-1, config.vocab_size),
                             tgt_target.reshape(-1),
@@ -857,7 +869,7 @@ def train(args):
                     else:
                         loss.backward()
                 else:
-                    logits = model(src_ids, tgt_input, src_mask, source_bias=args.source_bias)
+                    logits = model(src_ids, tgt_input, src_mask, source_bias=args.source_bias, src_weights=src_weights)
                     loss = criterion(
                         logits.view(-1, config.vocab_size),
                         tgt_target.reshape(-1),

@@ -142,6 +142,7 @@ class BitMambaSeq2Seq(nn.Module):
         return_hidden: bool = False,
         src_ids: torch.Tensor | None = None,
         source_bias: float = 0.0,
+        src_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """디코더 forward → logits (또는 hidden states)
 
@@ -171,15 +172,8 @@ class BitMambaSeq2Seq(nn.Module):
         if encoder_mask is not None:
             encoder_out = encoder_out * (encoder_mask.unsqueeze(-1).float() + 1e-5)
 
-        # Encoder 출력 + Target 임베딩 concat
-        # [encoder_out (B, src_len, d)] ; [tgt_emb (B, tgt_len, d)]
-        x = torch.cat([encoder_out, tgt_emb], dim=1)  # (B, src_len + tgt_len, d)
-
-        # 디코더 스택 (Mamba가 encoder 정보를 state로 축적)
-        x = self.decoder(x)
-
-        # Target 부분만 슬라이스
-        x = x[:, src_len:, :]  # (B, tgt_len, d_model)
+        # 디코더 스택 (Target Embedding만 Mamba로 들어가고, encoder_out은 Linear Cross-Attention으로 전달됨)
+        x = self.decoder(tgt_emb, encoder_out=encoder_out, encoder_mask=encoder_mask)
 
         # 최종 정규화
         x = self.final_norm(x)
@@ -224,10 +218,16 @@ class BitMambaSeq2Seq(nn.Module):
         if source_bias > 0.0 and src_ids is not None:
             B, V = logits.size(0), logits.size(-1)
             src_mask_vocab = torch.zeros(B, V, dtype=logits.dtype, device=logits.device)
-            src_mask_vocab.scatter_(1, src_ids, 1.0)
+            
+            if src_weights is not None:
+                # src_weights에 기반하여 bias mask 생성 (동일 토큰이 여러 번 등장하면 최대 가중치 유지)
+                src_mask_vocab.scatter_reduce_(1, src_ids, src_weights.to(logits.dtype), reduce="amax", include_self=False)
+            else:
+                src_mask_vocab.scatter_(1, src_ids, 1.0)
+                
             src_mask_vocab[:, self.config.pad_id] = 0.0
             
-            # 원문에 등장한 토큰들(mask=1.0)에게 source_bias 가산
+            # 원문에 등장한 토큰들에게 source_bias 가산 (src_weights 값에 비례)
             logits = logits + src_mask_vocab.unsqueeze(1) * source_bias
 
         return logits
@@ -238,6 +238,7 @@ class BitMambaSeq2Seq(nn.Module):
         tgt_ids: torch.Tensor,
         src_mask: torch.Tensor | None = None,
         source_bias: float = 0.0,
+        src_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """전체 Encoder-Decoder forward
 
@@ -260,6 +261,7 @@ class BitMambaSeq2Seq(nn.Module):
             encoder_mask=src_mask,
             src_ids=src_ids,
             source_bias=source_bias,
+            src_weights=src_weights,
         )
 
         return logits

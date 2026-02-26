@@ -25,14 +25,41 @@ from tokenizer_base import BaseTokenizer
 # 영문 QWERTY — (row, col) 좌표
 _EN_LAYOUT: dict[str, tuple[float, float]] = {}
 _EN_ROWS = [
-    "qwertyuiop",
-    "asdfghjkl",
-    "zxcvbnm",
+    "`1234567890-=",
+    "qwertyuiop[]\\",
+    "asdfghjkl;'",
+    "zxcvbnm,./",
 ]
 for _r, _row in enumerate(_EN_ROWS):
-    _offset = [0.0, 0.25, 0.75][_r]
+    _offset = [0.0, 0.5, 0.75, 1.25][_r]  # QWERTY standard staggering
     for _c, _ch in enumerate(_row):
         _EN_LAYOUT[_ch] = (float(_r), _c + _offset)
+
+# 특수문자 Shift 레이아웃 
+_SHIFT_MAP_EN = {
+    "`": "~", "1": "!", "2": "@", "3": "#", "4": "$", "5": "%",
+    "6": "^", "7": "&", "8": "*", "9": "(", "0": ")", "-": "_", "=": "+",
+    "[": "{", "]": "}", "\\": "|", ";": ":", "'": "\"", ",": "<", ".": ">", "/": "?"
+}
+_SHIFT_MAP_KO = {
+    "ㄱ": "ㄲ", "ㄷ": "ㄸ", "ㅂ": "ㅃ", "ㅅ": "ㅆ", "ㅈ": "ㅉ",
+    "ㅐ": "ㅒ", "ㅔ": "ㅖ",
+}
+_SHIFT_MAP_REVERSE = {v: k for k, v in {**_SHIFT_MAP_EN, **_SHIFT_MAP_KO}.items()}
+
+# 특수문자(Shift 입력)의 좌표는 원래 키와 동일하게 설정
+for _base, _shift in _SHIFT_MAP_EN.items():
+    if _base in _EN_LAYOUT:
+        _EN_LAYOUT[_shift] = _EN_LAYOUT[_base]
+
+# Numpad 좌표 (row는 QWERTY 배열 기준 0.0=숫자열 수준)
+_NUMPAD_LAYOUT: dict[str, tuple[float, float]] = {
+    "/": (0.0, 15.0), "*": (0.0, 16.0), "-": (0.0, 17.0),
+    "7": (1.0, 14.5), "8": (1.0, 15.5), "9": (1.0, 16.5), "+": (1.0, 17.5),
+    "4": (2.0, 14.5), "5": (2.0, 15.5), "6": (2.0, 16.5), # + continues down
+    "1": (3.0, 14.5), "2": (3.0, 15.5), "3": (3.0, 16.5), "Enter": (3.0, 17.5),
+    "0": (4.0, 15.0), ".": (4.0, 16.5)
+}
 
 # 한글 2벌식 — QWERTY 키에 대응하는 자모
 _KO_QWERTY_MAP = {
@@ -44,11 +71,17 @@ _KO_QWERTY_MAP = {
     "b": "ㅠ", "n": "ㅜ", "m": "ㅡ",
 }
 _KO_KEY_TO_EN: dict[str, str] = {v: k for k, v in _KO_QWERTY_MAP.items()}
+
+# 한글 기본 자모 좌표
 _KO_LAYOUT: dict[str, tuple[float, float]] = {
     jamo: _EN_LAYOUT[en_key]
     for jamo, en_key in _KO_KEY_TO_EN.items()
     if en_key in _EN_LAYOUT
 }
+# 한글 쌍자모(Shift)의 좌표
+for _base, _shift in _SHIFT_MAP_KO.items():
+    if _base in _KO_LAYOUT:
+        _KO_LAYOUT[_shift] = _KO_LAYOUT[_base]
 
 # 일본어 로마자 — 영문 QWERTY와 동일 좌표 사용
 _JA_LAYOUT = _EN_LAYOUT  # 로마자 입력이므로 동일
@@ -74,11 +107,20 @@ def _get_neighbors(
         if k != key and _keyboard_distance(key, k, layout) <= max_dist
     ]
 
-
-# 인접 키 캐시 사전 생성
-_EN_NEIGHBORS: dict[str, list[str]] = {k: _get_neighbors(k, _EN_LAYOUT) for k in _EN_LAYOUT}
+# 인접 키 캐시 사전 생성 (Shift + Numpad 포함 통합 거리)
+_ALL_LAYOUT = {**_EN_LAYOUT, **_NUMPAD_LAYOUT}
+_EN_NEIGHBORS: dict[str, list[str]] = {k: _get_neighbors(k, _ALL_LAYOUT) for k in _ALL_LAYOUT}
 _KO_NEIGHBORS: dict[str, list[str]] = {k: _get_neighbors(k, _KO_LAYOUT) for k in _KO_LAYOUT}
 _JA_NEIGHBORS: dict[str, list[str]] = _EN_NEIGHBORS  # 동일
+
+# 대소문자 변환 (Shift 오입력)
+def _get_shift_typo(ch: str) -> str | None:
+    if ch in _SHIFT_MAP_EN: return _SHIFT_MAP_EN[ch]
+    if ch in _SHIFT_MAP_KO: return _SHIFT_MAP_KO[ch]
+    if ch in _SHIFT_MAP_REVERSE: return _SHIFT_MAP_REVERSE[ch]
+    if ch.islower(): return ch.upper()
+    if ch.isupper(): return ch.lower()
+    return None
 
 
 # ── 한글 자모 분해/조합 유틸리티 ──────────────────────────────────────
@@ -191,69 +233,130 @@ def _apply_keyboard_typo_alpha(
     text: str, rng: random.Random, cfg: NoiseConfig,
     neighbors: dict[str, list[str]]
 ) -> str:
-    """영문/일본어(로마자) 키보드 타이포"""
+    """영문/일본어(로마자) 및 숫자, 특수문자 키보드 타이포"""
     chars = list(text)
     n_typo = max(1, int(len(chars) * cfg.keyboard_typo_ratio))
-    indices = [i for i, ch in enumerate(chars) if ch.lower() in neighbors]
+    
+    # Numpad/기호/알파벳 인접키 캐시 활용
+    indices = [i for i, ch in enumerate(chars) if ch in neighbors or ch.lower() in neighbors or ch.upper() in neighbors]
     if not indices:
         return text
+        
     chosen = rng.sample(indices, min(n_typo, len(indices)))
     for i in chosen:
         ch = chars[i]
+        
+        # 30% 확률로 Shift 오입력 실수 발생 (Numpad는 Shift가 안 먹으므로 제외)
+        shift_typo = _get_shift_typo(ch)
+        if shift_typo and rng.random() < 0.3:
+            chars[i] = shift_typo
+            continue
+            
         lower = ch.lower()
-        nbr = neighbors.get(lower, [])
+        if ch in neighbors:
+            nbr = neighbors.get(ch, [])
+        else:
+            nbr = neighbors.get(lower, [])
+            
         if nbr:
             replacement = rng.choice(nbr)
-            chars[i] = replacement.upper() if ch.isupper() else replacement
+            # 원래 문자가 영문 대문자였다면 대문자로 바꿔줌 
+            # (기호나 숫자의 이웃인 경우 isupper/lower가 무시됨)
+            if ch.isupper() and replacement.isalpha():
+                chars[i] = replacement.upper()
+            else:
+                chars[i] = replacement
     return "".join(chars)
 
 
 def _apply_keyboard_typo_ko(
     text: str, rng: random.Random, cfg: NoiseConfig
 ) -> str:
-    """한글 키보드 타이포 — 자모 단위로 인접 키 치환"""
+    """한글 키보드 타이포 — 자모 단위로 인접 키 치환 및 Shift 치환"""
     chars = list(text)
-    hangul_indices = [i for i, ch in enumerate(chars) if _decompose_hangul(ch) is not None]
-    if not hangul_indices:
+    
+    # 한글 및 기호, 숫자가 섞여있을 수 있으므로 알파벳/기호 타이포 로직도 혼합 처리
+    # 한글은 자모 분해하여 치환, 그 외(숫자, 기호)는 알파벳 로직으로
+    indices = []
+    for i, ch in enumerate(chars):
+        if _decompose_hangul(ch) is not None:
+            indices.append((i, "ko"))
+        elif ch in _EN_NEIGHBORS or ch.lower() in _EN_NEIGHBORS or ch.upper() in _EN_NEIGHBORS:
+            indices.append((i, "alpha"))
+            
+    if not indices:
         return text
 
-    n_typo = max(1, int(len(hangul_indices) * cfg.keyboard_typo_ratio))
-    chosen = rng.sample(hangul_indices, min(n_typo, len(hangul_indices)))
+    n_typo = max(1, int(len(indices) * cfg.keyboard_typo_ratio))
+    chosen = rng.sample(indices, min(n_typo, len(indices)))
 
-    for i in chosen:
-        decomposed = _decompose_hangul(chars[i])
-        if decomposed is None:
-            continue
-        cho, jung, jong = decomposed
-        cho_jamo = _CHO_LIST[cho]
-        jung_jamo = _JUNG_LIST[jung]
+    for i, lang_type in chosen:
+        ch = chars[i]
+        
+        if lang_type == "alpha":
+            # 숫자, 알파벳, 특수문자에 대한 Shift / 인접 오타
+            shift_typo = _get_shift_typo(ch)
+            if shift_typo and rng.random() < 0.3:
+                chars[i] = shift_typo
+                continue
+            
+            lower = ch.lower()
+            nbr = _EN_NEIGHBORS.get(ch, _EN_NEIGHBORS.get(lower, []))
+            if nbr:
+                replacement = rng.choice(nbr)
+                if ch.isupper() and replacement.isalpha():
+                    chars[i] = replacement.upper()
+                else:
+                    chars[i] = replacement
+        else:
+            # 한글 오타
+            decomposed = _decompose_hangul(ch)
+            if decomposed is None:
+                continue
+            cho, jung, jong = decomposed
+            cho_jamo = _CHO_LIST[cho]
+            jung_jamo = _JUNG_LIST[jung]
 
-        # 랜덤으로 초성, 중성, 종성 중 하나를 타이포
-        targets = ["cho", "jung"]
-        if jong > 0:
-            targets.append("jong")
-        target = rng.choice(targets)
+            targets = ["cho", "jung"]
+            if jong > 0:
+                targets.append("jong")
+            target = rng.choice(targets)
+            
+            # Shift 오타 적용 (30% 확률)
+            if rng.random() < 0.3:
+                if target == "cho":
+                    shift_cho = _get_shift_typo(cho_jamo)
+                    if shift_cho and shift_cho in _CHO_LIST:
+                        new_cho = _CHO_LIST.index(shift_cho)
+                        chars[i] = _compose_hangul(new_cho, jung, jong)
+                        continue
+                elif target == "jung":
+                    shift_jung = _get_shift_typo(jung_jamo)
+                    if shift_jung and shift_jung in _JUNG_LIST:
+                        new_jung = _JUNG_LIST.index(shift_jung)
+                        chars[i] = _compose_hangul(cho, new_jung, jong)
+                        continue
 
-        if target == "cho" and cho_jamo in _KO_NEIGHBORS:
-            nbr = _KO_NEIGHBORS[cho_jamo]
-            nbr_cho = [j for j in nbr if j in _BASIC_CHO and j in _CHO_LIST]
-            if nbr_cho:
-                new_cho = _CHO_LIST.index(rng.choice(nbr_cho))
-                chars[i] = _compose_hangul(new_cho, jung, jong)
-        elif target == "jung" and jung_jamo in _KO_NEIGHBORS:
-            nbr = _KO_NEIGHBORS[jung_jamo]
-            nbr_jung = [j for j in nbr if j in _BASIC_JUNG and j in _JUNG_LIST]
-            if nbr_jung:
-                new_jung = _JUNG_LIST.index(rng.choice(nbr_jung))
-                chars[i] = _compose_hangul(cho, new_jung, jong)
-        elif target == "jong" and jong > 0:
-            jong_jamo = _JONG_LIST[jong]
-            if jong_jamo and jong_jamo in _KO_NEIGHBORS:
-                nbr = _KO_NEIGHBORS[jong_jamo]
-                nbr_jong = [j for j in nbr if j in _JONG_LIST[1:]]
-                if nbr_jong:
-                    new_jong = _JONG_LIST.index(rng.choice(nbr_jong))
-                    chars[i] = _compose_hangul(cho, jung, new_jong)
+            if target == "cho" and cho_jamo in _KO_NEIGHBORS:
+                nbr = _KO_NEIGHBORS[cho_jamo]
+                nbr_cho = [j for j in nbr if j in _BASIC_CHO and j in _CHO_LIST]
+                if nbr_cho:
+                    new_cho = _CHO_LIST.index(rng.choice(nbr_cho))
+                    chars[i] = _compose_hangul(new_cho, jung, jong)
+            elif target == "jung" and jung_jamo in _KO_NEIGHBORS:
+                nbr = _KO_NEIGHBORS[jung_jamo]
+                nbr_jung = [j for j in nbr if j in _BASIC_JUNG and j in _JUNG_LIST]
+                if nbr_jung:
+                    new_jung = _JUNG_LIST.index(rng.choice(nbr_jung))
+                    chars[i] = _compose_hangul(cho, new_jung, jong)
+            elif target == "jong" and jong > 0:
+                jong_jamo = _JONG_LIST[jong]
+                if jong_jamo and jong_jamo in _KO_NEIGHBORS:
+                    nbr = _KO_NEIGHBORS[jong_jamo]
+                    nbr_jong = [j for j in nbr if j in _JONG_LIST[1:]]
+                    if nbr_jong:
+                        new_jong = _JONG_LIST.index(rng.choice(nbr_jong))
+                        chars[i] = _compose_hangul(cho, jung, new_jong)
 
     return "".join(chars)
 
@@ -301,64 +404,87 @@ def _apply_word_reorder(
 # ── 토큰 레벨 노이즈 함수 ────────────────────────────────────────────
 
 def _apply_token_masking(
-    ids: list[int], mask_id: int, rng: random.Random, ratio: float
-) -> list[int]:
-    """토큰 마스킹 — 랜덤 토큰을 [MASK]로 교체"""
-    result = list(ids)
-    n_mask = max(1, int(len(result) * ratio))
-    indices = list(range(len(result)))
-    rng.shuffle(indices)
-    for i in indices[:n_mask]:
-        result[i] = mask_id
-    return result
+    ids: list[int], weights: list[float], mask_id: int, rng: random.Random, ratio: float
+) -> tuple[list[int], list[float]]:
+    """토큰 마스킹 — 원본 토큰(weight=1.0) 중에서만 마스킹"""
+    result_ids = list(ids)
+    result_weights = list(weights)
+    
+    valid_indices = [i for i, w in enumerate(weights) if w == 1.0]
+    n_mask = max(1, int(len(result_ids) * ratio))
+    
+    rng.shuffle(valid_indices)
+    for i in valid_indices[:n_mask]:
+        result_ids[i] = mask_id
+        result_weights[i] = 0.5  # 마스킹된 토큰도 노이즈이므로 0.5
+    return result_ids, result_weights
 
 
 def _apply_token_deletion(
-    ids: list[int], rng: random.Random, ratio: float
-) -> list[int]:
-    """토큰 삭제 — 랜덤 토큰 제거"""
-    result = []
-    for tok_id in ids:
-        if rng.random() >= ratio:
-            result.append(tok_id)
-    return result if result else ids[:1]  # 최소 1토큰 유지
+    ids: list[int], weights: list[float], rng: random.Random, ratio: float
+) -> tuple[list[int], list[float]]:
+    """토큰 삭제 — 원본 토큰(weight=1.0) 중에서만 랜덤 제거"""
+    result_ids = []
+    result_weights = []
+    
+    for tok_id, w in zip(ids, weights):
+        # 원본 토큰이 아니면 삭제하지 않음
+        if w == 1.0 and rng.random() < ratio:
+            continue
+        result_ids.append(tok_id)
+        result_weights.append(w)
+        
+    if not result_ids:  # 최소 1토큰 유지
+        return ids[:1], weights[:1]
+    return result_ids, result_weights
 
 
 def _apply_text_infilling(
-    ids: list[int], mask_id: int, rng: random.Random,
+    ids: list[int], weights: list[float], mask_id: int, rng: random.Random,
     ratio: float, poisson_lambda: float
-) -> list[int]:
-    """텍스트 인필링 — Poisson(λ) 길이 span을 단일 [MASK]로 교체"""
+) -> tuple[list[int], list[float]]:
+    """텍스트 인필링 — 원본 토큰 구간(weight=1.0)에서 span을 단일 [MASK]로 교체"""
     n = len(ids)
     n_to_mask = max(1, int(n * ratio))
     masked = 0
-    result = list(ids)
+    
+    result_ids = list(ids)
+    result_weights = list(weights)
     visited = [False] * n
 
     max_attempts = n * 2
     attempts = 0
     while masked < n_to_mask and attempts < max_attempts:
         attempts += 1
-        # span 길이 샘플
         span_len = min(max(1, int(rng.expovariate(1.0 / poisson_lambda))), n - masked)
-        # 시작 위치 랜덤
         start = rng.randint(0, n - 1)
-        if visited[start]:
-            continue
-        # span 범위 결정
+        
+        if visited[start]: continue
         end = min(start + span_len, n)
-        # 이미 방문한 위치 건너뛰기
-        if any(visited[j] for j in range(start, end)):
+        
+        # 이미 방문했거나, 노이즈가 섞여있으면(weight != 1.0) 건너뛰기
+        can_mask = True
+        for j in range(start, end):
+            if visited[j] or result_weights[j] != 1.0:
+                can_mask = False
+                break
+        if not can_mask:
             continue
-        # span을 [MASK] 하나로 교체 (나머지는 None으로 마크)
+
         for j in range(start, end):
             visited[j] = True
-        result[start] = mask_id
+        result_ids[start] = mask_id
+        result_weights[start] = 0.5  # 인필링 마스크 토큰 가중치
+        
         for j in range(start + 1, end):
-            result[j] = None  # 삭제 마크
+            result_ids[j] = None  # 삭제 마크
+            result_weights[j] = None
+            
         masked += (end - start)
 
-    return [tok for tok in result if tok is not None]
+    final_ids = [tok for tok in result_ids if tok is not None]
+    final_weights = [w for w in result_weights if w is not None]
+    return final_ids, final_weights
 
 
 # ── 메인 DenoisingNoiser 클래스 ──────────────────────────────────────
@@ -464,7 +590,7 @@ class DenoisingNoiser:
 
         return text
 
-    def _apply_token_noise(self, ids: list[int]) -> list[int]:
+    def _apply_token_noise(self, ids: list[int], weights: list[float]) -> tuple[list[int], list[float]]:
         """토큰 레벨 노이즈 적용 (토크나이징 후)
 
         BART 논문: 3가지 중 하나를 랜덤 선택하여 적용
@@ -481,46 +607,60 @@ class DenoisingNoiser:
         )[0]
 
         if noise_type == "mask":
-            return _apply_token_masking(ids, mask_id, rng, cfg.token_mask_ratio)
+            return _apply_token_masking(ids, weights, mask_id, rng, cfg.token_mask_ratio)
         elif noise_type == "delete":
-            return _apply_token_deletion(ids, rng, cfg.token_delete_ratio)
+            return _apply_token_deletion(ids, weights, rng, cfg.token_delete_ratio)
         else:
             return _apply_text_infilling(
-                ids, mask_id, rng,
+                ids, weights, mask_id, rng,
                 cfg.text_infill_ratio, cfg.infill_poisson_lambda
             )
 
     def __call__(
         self, text: str, lang: str | None = None
-    ) -> tuple[list[int], list[int]]:
-        """원본 텍스트 → (noised_ids, target_ids)
+    ) -> tuple[list[int], list[int], list[float]]:
+        """원본 텍스트 → (noised_ids, target_ids, src_weights)
 
         Args:
             text: 원본 텍스트
             lang: 언어 코드 ("ko", "en", "ja"). None이면 자동 감지.
 
         Returns:
-            (noised_ids, target_ids) — 둘 다 special token (BOS/EOS) 포함
+            noised_ids: 노이즈가 적용된 토큰 목록 (특수 토큰 포함)
+            target_ids: 원본 텍스트 토큰 목록 (특수 토큰 포함)
+            src_weights: noised_ids 각 위치의 노이즈 여부 (0.5 = 변경됨/노이즈, 1.0 = 유지됨)
         """
         if lang is None:
             lang = self._detect_lang(text)
 
-        # 타겟: 원본을 토크나이징
-        target_ids = self.tokenizer.encode(text, add_special=True)
+        # 타겟: 원본을 토크나이징 (BOS/EOS 미포함 후 따로 추가)
+        target_ids_base = self.tokenizer.encode(text, add_special=False)
+        target_ids = [self.tokenizer.bos_id] + target_ids_base + [self.tokenizer.eos_id]
 
-        # 소스: 텍스트 노이즈 → 토크나이징 → 토큰 노이즈
+        # 소스: 텍스트 노이즈 → 토크나이징
         noised_text = self._apply_text_noise(text, lang)
-        noised_ids = self.tokenizer.encode(noised_text, add_special=False)
+        noised_ids_base = self.tokenizer.encode(noised_text, add_special=False)
 
-        # 토큰 레벨 노이즈 (special token 제외 상태에서)
-        noised_ids = self._apply_token_noise(noised_ids)
+        # Difflib을 이용하여 텍스트 노이즈 결과와 원본 간의 일치하는 블록 찾기
+        import difflib
+        matcher = difflib.SequenceMatcher(None, target_ids_base, noised_ids_base)
+        src_weights_base = [0.5] * len(noised_ids_base)
+        
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == 'equal':
+                for j in range(j1, j2):
+                    src_weights_base[j] = 1.0
 
-        # BOS/EOS 추가
+        # 토큰 레벨 노이즈 (특수 토큰 제외 상태에서, 가중치 함께 전달)
+        noised_ids_base, src_weights_base = self._apply_token_noise(noised_ids_base, src_weights_base)
+
+        # BOS/EOS 추가 (BOS/EOS는 노이즈가 아니므로 weight 1.0)
         bos = self.tokenizer.bos_id
         eos = self.tokenizer.eos_id
-        noised_ids = [bos] + noised_ids + [eos]
+        noised_ids = [bos] + noised_ids_base + [eos]
+        src_weights = [1.0] + src_weights_base + [1.0]
 
-        return noised_ids, target_ids
+        return noised_ids, target_ids, src_weights
 
 
 # ── 테스트 ────────────────────────────────────────────────────────────
@@ -551,11 +691,21 @@ if __name__ == "__main__":
         detected = lang or noiser._detect_lang(text)
         print(f"[{detected.upper()}] 원문: {text}")
 
-        noised_ids, target_ids = noiser(text, lang)
+        noised_ids, target_ids, src_weights = noiser(text, lang)
         noised_text = tok.decode(noised_ids, skip_special=True)
 
         print(f"  노이즈: {noised_text}")
         print(f"  src 토큰수: {len(noised_ids)}, tgt 토큰수: {len(target_ids)}")
+        
+        # 가중치 확인 시각화
+        weighted_tokens = []
+        for i, weight in zip(noised_ids, src_weights):
+            ch = tok.id_to_piece(i)
+            if weight == 0.5:
+                weighted_tokens.append(f"*{ch}*")
+            else:
+                weighted_tokens.append(ch)
+        print(f"  Weights: {' '.join(weighted_tokens)}")
 
         mask_count = sum(1 for i in noised_ids if i == tok.mask_id)
         print(f"  [MASK] 수: {mask_count}")
@@ -565,5 +715,5 @@ if __name__ == "__main__":
     print("--- 다양성 테스트 (같은 문장 5회) ---")
     for i in range(5):
         noiser.set_seed(i * 100)
-        noised_ids, _ = noiser("맞춤법을 확인해 주세요.")
+        noised_ids, _, _ = noiser("맞춤법을 확인해 주세요.")
         print(f"  시드 {i * 100}: {tok.decode(noised_ids, skip_special=True)}")

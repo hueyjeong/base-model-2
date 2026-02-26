@@ -47,7 +47,7 @@ class BitMambaSeq2SeqConfig:
 
     # Cross-Attention 파라미터
     n_heads: int = 12
-    n_kv_heads: int | None = None   # GQA KV 헤드 수 (None=MHA, 1=MQA)
+    n_kv_heads: int | None = 1   # GQA KV 헤드 수 (None=MHA, 1=MQA -> Linear Attention에서 MQA 사용 추천)
 
     # 토크나이저/시퀀스
     vocab_size: int = 64000

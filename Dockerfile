@@ -33,6 +33,7 @@ RUN apt-get install -y \
     rclone \
     openssh-server \
     openssl \
+    vim \
     && rm -rf /var/lib/apt/lists/*
 
 # python 및 pip를 최신 버전으로 심볼릭 링크
@@ -44,6 +45,36 @@ RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1 \
 
 # 작업 디렉토리 설정
 WORKDIR /workspace/base-model-2
+
+# 패키지 요구사항만 먼저 복사하여 도커 빌드 캐시 극대화
+COPY requirements.txt .
+
+# 1. 가상환경 생성 (Docker 내부라도 종속성을 확실하게 관리하기 위해 VEnv 사용 가능, 또는 System Python에 바로 설치)
+RUN python3.12 -m venv .venv
+
+# venv를 기본으로 사용하도록 PATH 환경변수를 먼저 설정 (이후 모든 RUN에서 자동으로 venv 적용)
+ENV PATH="/workspace/base-model-2/.venv/bin:$PATH"
+
+RUN pip config --user set global.index-url https://mirror.kakao.com/pypi/simple
+RUN pip config --user set global.trusted-host mirror.kakao.com
+
+RUN echo 'Installing Requirement...' && \
+    pip install -r requirements.txt
+
+RUN echo 'Installing PyTorch...' && \
+    pip install torch --index-url https://download.pytorch.org/whl/cu128
+
+RUN echo 'Installing Core Dependencies...' && \
+    pip install wheel tokenizers transformers sentencepiece einops ninja packaging
+
+RUN echo 'Installing Mamba CUDA Kernels (causal-conv1d)...' && \
+    pip install causal-conv1d
+
+RUN echo 'Installing Mamba CUDA Kernels (mamba_ssm)...' && \
+    pip install mamba_ssm
+
+RUN echo 'Installing Mecab...' && \
+    pip install mecab-python3 mecab-ko-dic gdown
 
 
 # 암호화 및 분할 압축된 corpus 데이터 및 압축 해제 스크립트 복사
@@ -108,33 +139,6 @@ COPY \
     ./corpus/
 COPY unpack_corpus.sh .
 RUN chmod +x unpack_corpus.sh
-
-# 패키지 요구사항만 먼저 복사하여 도커 빌드 캐시 극대화
-COPY requirements.txt .
-
-# 1. 가상환경 생성 (Docker 내부라도 종속성을 확실하게 관리하기 위해 VEnv 사용 가능, 또는 System Python에 바로 설치)
-RUN python3.12 -m venv .venv
-
-# venv를 기본으로 사용하도록 PATH 환경변수를 먼저 설정 (이후 모든 RUN에서 자동으로 venv 적용)
-ENV PATH="/workspace/base-model-2/.venv/bin:$PATH"
-
-RUN echo 'Installing Requirement...' && \
-    pip install -r requirements.txt
-
-RUN echo 'Installing PyTorch...' && \
-    pip install torch --index-url https://download.pytorch.org/whl/cu128
-
-RUN echo 'Installing Core Dependencies...' && \
-    pip install wheel tokenizers transformers sentencepiece einops ninja packaging
-
-RUN echo 'Installing Mamba CUDA Kernels (causal-conv1d)...' && \
-    pip install causal-conv1d
-
-RUN echo 'Installing Mamba CUDA Kernels (mamba_ssm)...' && \
-    pip install mamba_ssm
-
-RUN echo 'Installing Mecab...' && \
-    pip install mecab-python3 mecab-ko-dic
 
 # 의존성 설치가 끝난 후 전체 코드 복사 (소스코드 변경 시 빌드 캐시가 깨지지 않도록)
 COPY . .
