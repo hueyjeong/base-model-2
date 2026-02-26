@@ -118,13 +118,13 @@ MODEL_CONFIGS = {
     "256M": dict(
         d_model=896, d_inner=1792, d_ff=2304,
         n_encoder_layers=9, n_decoder_layers=14,
-        n_heads=14, n_kv_heads=2, dt_rank=56,
+        n_heads=16, n_kv_heads=4, dt_rank=56,
         d_state=16, d_conv=4,
     ),
     "512M": dict(
         d_model=1152, d_inner=2304, d_ff=3072,
         n_encoder_layers=11, n_decoder_layers=17,
-        n_heads=18, n_kv_heads=2, dt_rank=72,
+        n_heads=20, n_kv_heads=4, dt_rank=72,
         d_state=16, d_conv=4,
     ),
     "1B": dict(
