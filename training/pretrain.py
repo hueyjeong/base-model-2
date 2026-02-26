@@ -1045,7 +1045,7 @@ def main():
     )
     # 모델
     parser.add_argument("--size", default="8M",
-                        choices=list(SMALL_CONFIGS.keys()),
+                        choices=list(MODEL_CONFIGS.keys()),
                         help="모델 사이즈 프리셋")
     parser.add_argument("--tokenizer", default="bbpe",
                         choices=list(TOKENIZER_PRESETS.keys()),

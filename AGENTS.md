@@ -140,7 +140,7 @@ Default config (`BitMambaSeq2SeqConfig`):
 - `n_encoder_layers=6`, `n_decoder_layers=10`
 - `n_heads=12`, `d_ff=1280`
 - `vocab_size=64000`, `max_seq_len=512`
-- Target: Ranging from ~8M up to ~128M parameters (excluding embeddings, managed via `SMALL_CONFIGS` in `pretrain.py`)
+- Target: Ranging from ~8M up to ~128M parameters (excluding embeddings, managed via `MODEL_CONFIGS` in `pretrain.py`)
 
 ---
 

@@ -333,5 +333,5 @@ prefix-concat 구조에서 구간 경계를 더 명확히 인코딩한다.
 - Segment embedding: `2*d_model`
 - Layer-wise FiLM: decoder layer마다 `2*d_model*d_model`
 
-사용한 d_model/decoder_layer 값은 `SMALL_CONFIGS` 기준.
+사용한 d_model/decoder_layer 값은 `MODEL_CONFIGS` 기준.
 근거: [training/pretrain.py](../training/pretrain.py#L80-L113)
