@@ -84,7 +84,7 @@ def load_tokenizer(name: str, path: str | None = None):
 
 # ── 모델 사이즈 프리셋 ────────────────────────────────────────────────
 
-SMALL_CONFIGS = {
+MODEL_CONFIGS = {
     "8M": dict(
         d_model=288, d_inner=576, d_ff=544,
         n_encoder_layers=3, n_decoder_layers=5,
@@ -113,6 +113,24 @@ SMALL_CONFIGS = {
         d_model=768, d_inner=1536, d_ff=1280,
         n_encoder_layers=7, n_decoder_layers=12,
         n_heads=12, n_kv_heads=4, dt_rank=48,
+        d_state=16, d_conv=4,
+    ),
+    "256M": dict(
+        d_model=896, d_inner=1792, d_ff=2304,
+        n_encoder_layers=9, n_decoder_layers=14,
+        n_heads=14, n_kv_heads=2, dt_rank=56,
+        d_state=16, d_conv=4,
+    ),
+    "512M": dict(
+        d_model=1152, d_inner=2304, d_ff=3072,
+        n_encoder_layers=11, n_decoder_layers=17,
+        n_heads=18, n_kv_heads=2, dt_rank=72,
+        d_state=16, d_conv=4,
+    ),
+    "1B": dict(
+        d_model=1536, d_inner=3072, d_ff=4096,
+        n_encoder_layers=13, n_decoder_layers=19,
+        n_heads=24, n_kv_heads=4, dt_rank=96,
         d_state=16, d_conv=4,
     ),
 }
@@ -302,12 +320,12 @@ def train(args):
     print(f"토크나이저 로드: {args.tokenizer}, vocab_size={tokenizer.vocab_size}")
 
     # ── 모델 설정 확인 (config만, GPU 할당은 아직) ──
-    if args.size not in SMALL_CONFIGS:
+    if args.size not in MODEL_CONFIGS:
         print(f"❌ 지원하지 않는 사이즈: {args.size}")
-        print(f"   사용 가능: {list(SMALL_CONFIGS.keys())}")
+        print(f"   사용 가능: {list(MODEL_CONFIGS.keys())}")
         return 1
 
-    model_kwargs = dict(SMALL_CONFIGS[args.size])
+    model_kwargs = dict(MODEL_CONFIGS[args.size])
     model_kwargs["vocab_size"] = tokenizer.vocab_size
     model_kwargs["use_copy_gate"] = args.use_copy_gate
     config = BitMambaSeq2SeqConfig(**model_kwargs)
