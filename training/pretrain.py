@@ -16,6 +16,7 @@ import math
 import os
 import sys
 import time
+from dataclasses import asdict, fields
 
 import torch
 import torch.nn as nn
@@ -296,6 +297,101 @@ def get_lr_sgdr(step: int, warmup: int, max_lr: float, cycle_steps: int,
     return min_lr + (cycle_max_lr - min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
 
 
+# ── NoiseConfig 해석 (혼합형: scale + 개별 override) ───────────────────
+
+_NOISE_TEXT_SCALE_FIELDS = [
+    "korean_error_prob",
+    "spacing_noise_prob",
+    "spacing_remove_ratio",
+    "spacing_insert_prob",
+    "spacing_full_remove_prob",
+    "keyboard_typo_prob",
+    "keyboard_typo_ratio",
+    "ngram_shuffle_prob",
+    "word_reorder_prob",
+    "keyboard_shift_typo_prob_alpha",
+    "keyboard_shift_typo_prob_ko_alpha",
+    "keyboard_shift_typo_prob_ko_jamo",
+]
+
+_NOISE_TOKEN_SCALE_FIELDS = [
+    "token_mask_ratio",
+    "token_delete_ratio",
+    "text_infill_ratio",
+]
+
+_NOISE_PROB_LIKE_FIELDS = set(_NOISE_TEXT_SCALE_FIELDS + _NOISE_TOKEN_SCALE_FIELDS)
+
+
+def _clamp_prob_like(v: float) -> float:
+    return max(0.0, min(1.0, float(v)))
+
+
+def _load_noise_config_file(path: str) -> dict:
+    """JSON 노이즈 설정 파일을 로드하고 필드명을 검증한다."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"노이즈 설정 파일이 없습니다: {path}")
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if not isinstance(data, dict):
+        raise ValueError("노이즈 설정 파일 루트는 JSON object여야 합니다.")
+
+    # 편의: {"noise_config": {...}} 포맷도 허용
+    if "noise_config" in data and isinstance(data["noise_config"], dict):
+        data = data["noise_config"]
+
+    # 문서/메모용 키 허용: "_"로 시작하는 키는 무시
+    if isinstance(data, dict):
+        data = {k: v for k, v in data.items() if not str(k).startswith("_")}
+
+    valid_fields = {f.name for f in fields(NoiseConfig)}
+    unknown = sorted(k for k in data.keys() if k not in valid_fields)
+    if unknown:
+        raise ValueError(f"알 수 없는 노이즈 필드: {unknown}")
+
+    return data
+
+
+def resolve_noise_config_from_args(args) -> NoiseConfig:
+    """CLI 인자를 바탕으로 최종 NoiseConfig를 계산.
+
+    우선순위: 기본값 -> 설정 파일 override -> scale 적용
+    """
+    cfg = NoiseConfig()
+    values = asdict(cfg)
+
+    # 1) 설정 파일 override 적용 (없으면 기본값 유지)
+    if args.noise_config:
+        file_values = _load_noise_config_file(args.noise_config)
+        values.update(file_values)
+
+    # 2) 스케일 적용
+    text_scale = max(0.0, float(args.noise_scale_text)) * max(0.0, float(args.noise_scale))
+    token_scale = max(0.0, float(args.noise_scale_token)) * max(0.0, float(args.noise_scale))
+
+    for name in _NOISE_TEXT_SCALE_FIELDS:
+        values[name] = values[name] * text_scale
+    for name in _NOISE_TOKEN_SCALE_FIELDS:
+        values[name] = values[name] * token_scale
+
+    # 3) 유효 범위 정리
+    for name in _NOISE_PROB_LIKE_FIELDS:
+        values[name] = _clamp_prob_like(values[name])
+
+    # 비확률/정수/양수 제약
+    values["korean_error_count"] = max(0, int(values["korean_error_count"]))
+    values["ngram_n"] = max(1, int(values["ngram_n"]))
+    values["word_reorder_swaps"] = max(0, int(values["word_reorder_swaps"]))
+    values["infill_poisson_lambda"] = max(1e-6, float(values["infill_poisson_lambda"]))
+    values["token_noise_mask_weight"] = max(0.0, float(values["token_noise_mask_weight"]))
+    values["token_noise_delete_weight"] = max(0.0, float(values["token_noise_delete_weight"]))
+    values["token_noise_infill_weight"] = max(0.0, float(values["token_noise_infill_weight"]))
+
+    return NoiseConfig(**values)
+
+
 def train(args):
     # DDP 초기화
     is_distributed = int(os.environ.get("WORLD_SIZE", 1)) > 1
@@ -369,8 +465,26 @@ def train(args):
                 print("  ℹ️  data_state 미포함 → 데이터 RNG 복구 시뮬레이션 필요")
 
     # ── 데이터 파이프라인 (CPU only) ──
+    try:
+        resolved_noise_config = resolve_noise_config_from_args(args)
+    except Exception as e:
+        if global_rank == 0:
+            print(f"❌ 노이즈 설정 로드 실패: {e}")
+        return 1
+
+    if global_rank == 0:
+        if args.noise_config:
+            print(f"\n노이즈 설정 파일: {args.noise_config}")
+        else:
+            print("\n노이즈 설정 파일 미지정: NoiseConfig 기본값 사용")
+        print("\n노이즈 설정(resolved):")
+        print(json.dumps(asdict(resolved_noise_config), ensure_ascii=False, indent=2, sort_keys=True))
+
     noiser = DenoisingNoiser(
-        tokenizer, NoiseConfig(), seed=args.seed + global_rank, use_korean_errors=True,
+        tokenizer,
+        resolved_noise_config,
+        seed=args.seed + global_rank,
+        use_korean_errors=args.use_korean_errors,
     )
     dataset = StreamingPackedDataset(
         args.corpus, tokenizer, noiser,
@@ -460,6 +574,8 @@ def train(args):
 
     if _saved_data_state is not None:
         # ── 즉시 복원: 저장된 RNG state로 데이터 파이프라인 복원 ──
+        if global_rank == 0:
+            print("  ℹ️  resume 정책: 노이즈 강도/확률은 현재 CLI 값을 우선 적용합니다.")
         noiser.load_state_dict(_saved_data_state["noiser_state"])
         dataset.load_state_dict(_saved_data_state["dataset_state"])
         if global_rank == 0:
@@ -993,6 +1109,7 @@ def train(args):
                 "optimizer": optimizer.state_dict(),
                 "config": model_kwargs,
                 "args": vars(args),
+                "noise_config": asdict(resolved_noise_config),
                 "data_state": {
                     "version": 2,
                     "noiser_state": noiser.state_dict(),
@@ -1018,6 +1135,8 @@ def train(args):
             "total_chars": int(total_chars),
             "model": raw_model.state_dict(),
             "config": model_kwargs,
+            "args": vars(args),
+            "noise_config": asdict(resolved_noise_config),
             "data_state": {
                 "version": 2,
                 "noiser_state": noiser.state_dict(),
@@ -1101,6 +1220,21 @@ def main():
                         help="DataLoader worker 수 (0=메인 프로세스만)")
     parser.add_argument("--microbatch_size", type=int, default=0,
                         help="forward/backward 마이크로배치 크기 (0이면 비활성, batch_size는 그대로 유지)")
+
+    # 노이즈 (혼합형: 설정파일 + scale)
+    parser.add_argument("--noise_config", default=None,
+                        help="노이즈 설정 JSON 파일 경로 (미지정 시 NoiseConfig 기본값 사용)")
+    parser.add_argument("--noise_scale", type=float, default=1.0,
+                        help="전역 노이즈 스케일 (text/token 공통 배율, 1.0=기본)")
+    parser.add_argument("--noise_scale_text", type=float, default=1.0,
+                        help="텍스트 레벨 노이즈 스케일 배율")
+    parser.add_argument("--noise_scale_token", type=float, default=1.0,
+                        help="토큰 레벨 노이즈 스케일 배율")
+
+    parser.add_argument("--use_korean_errors", action="store_true", default=True,
+                        help="한국어 오류 생성 모듈 사용")
+    parser.add_argument("--no_korean_errors", action="store_false", dest="use_korean_errors",
+                        help="한국어 오류 생성 모듈 비활성화")
 
     # 원문 참조력 실험 (Trial A & B 기본 적용)
     parser.add_argument("--source_bias", type=float, default=0.5,

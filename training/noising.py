@@ -189,6 +189,14 @@ class NoiseConfig:
     token_delete_ratio: float = 0.05     # 토큰 삭제 비율
     text_infill_ratio: float = 0.15      # 텍스트 인필링 비율
     infill_poisson_lambda: float = 3.0   # span 길이 Poisson λ
+    token_noise_mask_weight: float = 0.4     # 토큰 노이즈 타입 선택 가중치(mask)
+    token_noise_delete_weight: float = 0.2   # 토큰 노이즈 타입 선택 가중치(delete)
+    token_noise_infill_weight: float = 0.4   # 토큰 노이즈 타입 선택 가중치(infill)
+
+    # 키보드 Shift 오입력 확률
+    keyboard_shift_typo_prob_alpha: float = 0.3     # 영문/일본어/숫자/기호 Shift 오입력 확률
+    keyboard_shift_typo_prob_ko_alpha: float = 0.3  # 한글 경로 내 alpha(숫자/기호 포함) Shift 오입력 확률
+    keyboard_shift_typo_prob_ko_jamo: float = 0.3   # 한글 자모 Shift 오입력 확률
 
 
 # ── 텍스트 레벨 노이즈 함수 ───────────────────────────────────────────
@@ -248,7 +256,7 @@ def _apply_keyboard_typo_alpha(
         
         # 30% 확률로 Shift 오입력 실수 발생 (Numpad는 Shift가 안 먹으므로 제외)
         shift_typo = _get_shift_typo(ch)
-        if shift_typo and rng.random() < 0.3:
+        if shift_typo and rng.random() < cfg.keyboard_shift_typo_prob_alpha:
             chars[i] = shift_typo
             continue
             
@@ -296,7 +304,7 @@ def _apply_keyboard_typo_ko(
         if lang_type == "alpha":
             # 숫자, 알파벳, 특수문자에 대한 Shift / 인접 오타
             shift_typo = _get_shift_typo(ch)
-            if shift_typo and rng.random() < 0.3:
+            if shift_typo and rng.random() < cfg.keyboard_shift_typo_prob_ko_alpha:
                 chars[i] = shift_typo
                 continue
             
@@ -323,7 +331,7 @@ def _apply_keyboard_typo_ko(
             target = rng.choice(targets)
             
             # Shift 오타 적용 (30% 확률)
-            if rng.random() < 0.3:
+            if rng.random() < cfg.keyboard_shift_typo_prob_ko_jamo:
                 if target == "cho":
                     shift_cho = _get_shift_typo(cho_jamo)
                     if shift_cho and shift_cho in _CHO_LIST:
@@ -600,9 +608,17 @@ class DenoisingNoiser:
         mask_id = self.tokenizer.mask_id
 
         # 3가지 토큰 노이즈 중 랜덤 선택
+        noise_weights = [
+            max(0.0, float(cfg.token_noise_mask_weight)),
+            max(0.0, float(cfg.token_noise_delete_weight)),
+            max(0.0, float(cfg.token_noise_infill_weight)),
+        ]
+        if sum(noise_weights) <= 0.0:
+            noise_weights = [1.0, 1.0, 1.0]
+
         noise_type = rng.choices(
             ["mask", "delete", "infill"],
-            weights=[0.4, 0.2, 0.4],
+            weights=noise_weights,
             k=1
         )[0]
 

@@ -68,6 +68,7 @@ torchrun --nproc_per_node=2 training/pretrain.py \
    --grad_accum_steps 8 \
    --bf16 \
    --fused_ce \
+   --noise_config training/noise_config.example.json \
    --int8 \
    --int8_backend cuda
 
