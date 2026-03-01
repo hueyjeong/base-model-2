@@ -79,64 +79,64 @@ RUN echo 'Installing Mecab...' && \
 
 # 암호화 및 분할 압축된 corpus 데이터 및 압축 해제 스크립트 복사
 # 도커 빌드 전 호스트에서 pack_corpus.sh를 실행해 압축 파일들을 생성해야 합니다.
-COPY \
-    corpus/corpus.tar.gz.enc.aa \
-    corpus/corpus.tar.gz.enc.ab \
-    corpus/corpus.tar.gz.enc.ac \
-    corpus/corpus.tar.gz.enc.ad \
-    corpus/corpus.tar.gz.enc.ae \
-    corpus/corpus.tar.gz.enc.af \
-    corpus/corpus.tar.gz.enc.ag \
-    corpus/corpus.tar.gz.enc.ah \
-    corpus/corpus.tar.gz.enc.ai \
-    corpus/corpus.tar.gz.enc.aj \
-    ./corpus/
-COPY \
-    corpus/corpus.tar.gz.enc.ak \
-    corpus/corpus.tar.gz.enc.al \
-    corpus/corpus.tar.gz.enc.am \
-    corpus/corpus.tar.gz.enc.an \
-    corpus/corpus.tar.gz.enc.ao \
-    corpus/corpus.tar.gz.enc.ap \
-    corpus/corpus.tar.gz.enc.aq \
-    corpus/corpus.tar.gz.enc.ar \
-    corpus/corpus.tar.gz.enc.as \
-    corpus/corpus.tar.gz.enc.at \
-    ./corpus/
-COPY \
-    corpus/corpus.tar.gz.enc.au \
-    corpus/corpus.tar.gz.enc.av \
-    corpus/corpus.tar.gz.enc.aw \
-    corpus/corpus.tar.gz.enc.ax \
-    corpus/corpus.tar.gz.enc.ay \
-    corpus/corpus.tar.gz.enc.az \
-    corpus/corpus.tar.gz.enc.ba \
-    corpus/corpus.tar.gz.enc.bb \
-    corpus/corpus.tar.gz.enc.bc \
-    corpus/corpus.tar.gz.enc.bd \
-    ./corpus/
-COPY \
-    corpus/corpus.tar.gz.enc.be \
-    corpus/corpus.tar.gz.enc.bf \
-    corpus/corpus.tar.gz.enc.bg \
-    corpus/corpus.tar.gz.enc.bh \
-    corpus/corpus.tar.gz.enc.bi \
-    corpus/corpus.tar.gz.enc.bj \
-    corpus/corpus.tar.gz.enc.bk \
-    corpus/corpus.tar.gz.enc.bl \
-    corpus/corpus.tar.gz.enc.bm \
-    corpus/corpus.tar.gz.enc.bn \
-    ./corpus/
-COPY \
-    corpus/corpus.tar.gz.enc.bo \
-    corpus/corpus.tar.gz.enc.bp \
-    corpus/corpus.tar.gz.enc.bq \
-    corpus/corpus.tar.gz.enc.br \
-    corpus/corpus.tar.gz.enc.bs \
-    corpus/corpus.tar.gz.enc.bt \
-    corpus/corpus.tar.gz.enc.bu \
-    corpus/corpus.tar.gz.enc.bv \
-    ./corpus/
+# COPY \
+#     corpus/corpus.tar.gz.enc.aa \
+#     corpus/corpus.tar.gz.enc.ab \
+#     corpus/corpus.tar.gz.enc.ac \
+#     corpus/corpus.tar.gz.enc.ad \
+#     corpus/corpus.tar.gz.enc.ae \
+#     corpus/corpus.tar.gz.enc.af \
+#     corpus/corpus.tar.gz.enc.ag \
+#     corpus/corpus.tar.gz.enc.ah \
+#     corpus/corpus.tar.gz.enc.ai \
+#     corpus/corpus.tar.gz.enc.aj \
+#     ./corpus/
+# COPY \
+#     corpus/corpus.tar.gz.enc.ak \
+#     corpus/corpus.tar.gz.enc.al \
+#     corpus/corpus.tar.gz.enc.am \
+#     corpus/corpus.tar.gz.enc.an \
+#     corpus/corpus.tar.gz.enc.ao \
+#     corpus/corpus.tar.gz.enc.ap \
+#     corpus/corpus.tar.gz.enc.aq \
+#     corpus/corpus.tar.gz.enc.ar \
+#     corpus/corpus.tar.gz.enc.as \
+#     corpus/corpus.tar.gz.enc.at \
+#     ./corpus/
+# COPY \
+#     corpus/corpus.tar.gz.enc.au \
+#     corpus/corpus.tar.gz.enc.av \
+#     corpus/corpus.tar.gz.enc.aw \
+#     corpus/corpus.tar.gz.enc.ax \
+#     corpus/corpus.tar.gz.enc.ay \
+#     corpus/corpus.tar.gz.enc.az \
+#     corpus/corpus.tar.gz.enc.ba \
+#     corpus/corpus.tar.gz.enc.bb \
+#     corpus/corpus.tar.gz.enc.bc \
+#     corpus/corpus.tar.gz.enc.bd \
+#     ./corpus/
+# COPY \
+#     corpus/corpus.tar.gz.enc.be \
+#     corpus/corpus.tar.gz.enc.bf \
+#     corpus/corpus.tar.gz.enc.bg \
+#     corpus/corpus.tar.gz.enc.bh \
+#     corpus/corpus.tar.gz.enc.bi \
+#     corpus/corpus.tar.gz.enc.bj \
+#     corpus/corpus.tar.gz.enc.bk \
+#     corpus/corpus.tar.gz.enc.bl \
+#     corpus/corpus.tar.gz.enc.bm \
+#     corpus/corpus.tar.gz.enc.bn \
+#     ./corpus/
+# COPY \
+#     corpus/corpus.tar.gz.enc.bo \
+#     corpus/corpus.tar.gz.enc.bp \
+#     corpus/corpus.tar.gz.enc.bq \
+#     corpus/corpus.tar.gz.enc.br \
+#     corpus/corpus.tar.gz.enc.bs \
+#     corpus/corpus.tar.gz.enc.bt \
+#     corpus/corpus.tar.gz.enc.bu \
+#     corpus/corpus.tar.gz.enc.bv \
+#     ./corpus/
 COPY unpack_corpus.sh .
 RUN chmod +x unpack_corpus.sh
 
