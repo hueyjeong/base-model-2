@@ -38,3 +38,4 @@ _tmp_*
 # OS
 .DS_Store
 Thumbs.db
+corpus/sample_10g.zip
