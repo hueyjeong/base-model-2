@@ -423,6 +423,7 @@ def train(args):
 
     model_kwargs = dict(MODEL_CONFIGS[args.size])
     model_kwargs["vocab_size"] = tokenizer.vocab_size
+    model_kwargs["bos_id"] = tokenizer.bos_id  # Document isolation: BOS 위치에서 SSM state 리셋
     model_kwargs["use_copy_gate"] = args.use_copy_gate
     config = BitMambaSeq2SeqConfig(**model_kwargs)
 
@@ -489,6 +490,7 @@ def train(args):
     dataset = StreamingPackedDataset(
         args.corpus, tokenizer, noiser,
         pack_size=args.pack_size,
+        d_conv=config.d_conv,  # Document isolation: Conv1d 격리용 PAD gap
         text_key=args.text_key, lang_key=args.lang_key,
         seed=args.seed,
         rank=global_rank,
@@ -502,6 +504,7 @@ def train(args):
         val_dataset = StreamingPackedDataset(
             args.val_corpus, tokenizer, noiser,
             pack_size=args.pack_size,
+            d_conv=config.d_conv,  # Document isolation: Conv1d 격리용 PAD gap
             text_key=args.text_key, lang_key=args.lang_key,
             seed=args.seed + 1,  # 학습과 다른 시드
             rank=global_rank,

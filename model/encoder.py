@@ -79,16 +79,17 @@ class EncoderLayer(nn.Module):
         self.norm2 = RMSNorm(d_model, eps=rms_norm_eps)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, reset_mask: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
             x: (batch, seq_len, d_model)
+            reset_mask: (batch, seq_len) bool — True인 위치에서 SSM state 리셋
         Returns:
             (batch, seq_len, d_model)
         """
         # Mamba + residual
         residual = x
-        x = self.mamba(x)
+        x = self.mamba(x, reset_mask=reset_mask)
         x = self.dropout(x)
         x = self.norm1(residual + x)
 
@@ -132,16 +133,17 @@ class Encoder(nn.Module):
             for _ in range(n_layers)
         ])
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, reset_mask: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
             x: (batch, seq_len, d_model)  — 임베딩 출력
+            reset_mask: (batch, seq_len) bool — True인 위치에서 SSM state 리셋
         Returns:
             (batch, seq_len, d_model)  — 인코더 최종 출력
         """
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
-                x = checkpoint(layer, x, use_reentrant=False)
+                x = checkpoint(layer, x, reset_mask, use_reentrant=False)
             else:
-                x = layer(x)
+                x = layer(x, reset_mask=reset_mask)
         return x

@@ -46,6 +46,7 @@ class StreamingPackedDataset(IterableDataset):
         tokenizer: BaseTokenizer,
         noiser: DenoisingNoiser,
         pack_size: int = 2048,
+        d_conv: int = 4,
         text_key: str | None = None,
         lang_key: str | None = None,
         min_length: int = 10,
@@ -58,6 +59,7 @@ class StreamingPackedDataset(IterableDataset):
         self.tokenizer = tokenizer
         self.noiser = noiser
         self.pack_size = pack_size
+        self.d_conv = d_conv  # Document isolation: Conv1d 격리용 PAD gap 크기
         self.text_key = text_key
         self.lang_key = lang_key
         self.min_length = min_length
@@ -127,14 +129,24 @@ class StreamingPackedDataset(IterableDataset):
         """(noised_ids, target_ids, n_chars, src_weights) 스트림을 pack_size까지 이어붙이기
 
         noised_ids, target_ids, src_weights 모두 이미 [BOS]...[EOS] 등 특수토큰 포함 상태.
-        패킹은 단순 연결: [BOS]s1[EOS][BOS]s2[EOS]...
+        패킹은 단순 연결: [BOS]s1[EOS] [PAD gap] [BOS]s2[EOS]...
+        Document isolation: Conv1d 격리를 위해 문서 사이에 d_conv개의 PAD 삽입.
         """
         src_buf = []
         tgt_buf = []
         weight_buf = []
         char_buf = 0
+        pad_id = self.tokenizer.pad_id
+        gap = [pad_id] * self.d_conv  # Conv1d 커널 크기만큼 PAD 삽입
+        gap_weights = [0.0] * self.d_conv
 
         for noised_ids, target_ids, n_chars, src_weights in noised_pairs:
+            # 이전 문서가 버퍼에 있으면 PAD gap 삽입 (Conv1d 격리)
+            if src_buf:
+                src_buf.extend(gap)
+                tgt_buf.extend(gap)
+                weight_buf.extend(gap_weights)
+
             src_buf.extend(noised_ids)
             tgt_buf.extend(target_ids)
             weight_buf.extend(src_weights)

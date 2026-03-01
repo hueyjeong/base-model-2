@@ -119,6 +119,9 @@ class BitMambaSeq2Seq(nn.Module):
         Returns:
             encoder_out: (B, src_len, d_model)
         """
+        # Document isolation: BOS 위치에서 SSM state 리셋
+        reset_mask = (src_ids == self.config.bos_id)  # (B, src_len)
+
         # 임베딩 (FP16 → FP32 변환)
         x = self.encoder_embedding(src_ids).float() * self.embed_scale
         x = self.embed_dropout(x)
@@ -131,7 +134,7 @@ class BitMambaSeq2Seq(nn.Module):
             x = x * (src_mask.unsqueeze(-1).float() + 1e-5)  # (B, src_len, 1)
 
         # 인코더 스택
-        encoder_out = self.encoder(x)
+        encoder_out = self.encoder(x, reset_mask=reset_mask)
         return encoder_out
 
     def decode(
@@ -162,6 +165,9 @@ class BitMambaSeq2Seq(nn.Module):
         """
         src_len = encoder_out.size(1)
 
+        # Document isolation: BOS 위치에서 SSM state 리셋
+        reset_mask = (tgt_ids == self.config.bos_id)  # (B, tgt_len)
+
         # 타겟 임베딩 (FP16 → FP32 변환)
         tgt_emb = self.decoder_embedding(tgt_ids).float() * self.embed_scale
         tgt_emb = self.embed_dropout(tgt_emb)
@@ -173,7 +179,8 @@ class BitMambaSeq2Seq(nn.Module):
             encoder_out = encoder_out * (encoder_mask.unsqueeze(-1).float() + 1e-5)
 
         # 디코더 스택 (Target Embedding만 Mamba로 들어가고, encoder_out은 Linear Cross-Attention으로 전달됨)
-        x = self.decoder(tgt_emb, encoder_out=encoder_out, encoder_mask=encoder_mask)
+        x = self.decoder(tgt_emb, encoder_out=encoder_out, encoder_mask=encoder_mask,
+                         reset_mask=reset_mask)
 
         # 최종 정규화
         x = self.final_norm(x)

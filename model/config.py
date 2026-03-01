@@ -61,6 +61,7 @@ class BitMambaSeq2SeqConfig:
     tie_embeddings: bool = True
     tie_lm_head: bool = True
     pad_id: int = 0
+    bos_id: int = 1           # Document isolation: BOS 위치에서 SSM state 리셋용
 
     # 원문 참조 (Trial B 기본 활성화)
     use_copy_gate: bool = True

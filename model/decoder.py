@@ -66,20 +66,22 @@ class DecoderLayer(nn.Module):
         self,
         x: torch.Tensor,
         encoder_out: torch.Tensor | None = None,
-        encoder_mask: torch.Tensor | None = None
+        encoder_mask: torch.Tensor | None = None,
+        reset_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
             x: (batch, seq_len, d_model) — encoder_out + tgt가 concat된 시퀀스
             encoder_out: (batch, src_len, d_model) - 인코더 파생 Context
             encoder_mask: (batch, src_len) - 패딩 마스크
+            reset_mask: (batch, seq_len) bool — True인 위치에서 SSM state 리셋
 
         Returns:
             (batch, seq_len, d_model)
         """
         # 1. Mamba + residual
         residual = x
-        x = self.mamba(x)
+        x = self.mamba(x, reset_mask=reset_mask)
         x = self.dropout(x)
         x = self.norm1(residual + x)
 
@@ -134,13 +136,15 @@ class Decoder(nn.Module):
         self,
         x: torch.Tensor,
         encoder_out: torch.Tensor | None = None,
-        encoder_mask: torch.Tensor | None = None
+        encoder_mask: torch.Tensor | None = None,
+        reset_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
             x: (batch, seq_len, d_model) — concat[encoder_out, tgt_emb]
             encoder_out: 인코더 문맥 (B, src_len, d)
             encoder_mask: 인코더 패딩 (B, src_len)
+            reset_mask: (batch, seq_len) bool — True인 위치에서 SSM state 리셋
 
         Returns:
             (batch, seq_len, d_model) — 전체 시퀀스, seq2seq.py에서 tgt 부분만 슬라이스
@@ -148,7 +152,7 @@ class Decoder(nn.Module):
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
                 # use_reentrant=False args must be passed explicitly via kwargs for checkpoint
-                x = checkpoint(layer, x, encoder_out, encoder_mask, use_reentrant=False)
+                x = checkpoint(layer, x, encoder_out, encoder_mask, reset_mask, use_reentrant=False)
             else:
-                x = layer(x, encoder_out=encoder_out, encoder_mask=encoder_mask)
+                x = layer(x, encoder_out=encoder_out, encoder_mask=encoder_mask, reset_mask=reset_mask)
         return x
