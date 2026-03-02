@@ -588,6 +588,7 @@ def train(args):
         num_workers=args.num_workers, pin_memory=torch.cuda.is_available(),
         collate_fn=collate_packed,
         persistent_workers=args.num_workers > 0,
+        prefetch_factor=8 if args.num_workers > 0 else None,
     )
     if args.val_corpus:
         val_loader = DataLoader(
@@ -595,6 +596,7 @@ def train(args):
             num_workers=args.num_workers, pin_memory=torch.cuda.is_available(),
             collate_fn=collate_packed,
             persistent_workers=args.num_workers > 0,
+            prefetch_factor=8 if args.num_workers > 0 else None,
         )
 
     # ── 데이터 복구 시뮬레이션 (GPU 할당 0, CPU only) ──
