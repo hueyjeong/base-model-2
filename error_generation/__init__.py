@@ -144,11 +144,16 @@ class KoreanErrorGenerator:
         seed: 랜덤 시드 (재현성 보장)
     """
 
-    def __init__(self, seed: int = 42):
+    def __init__(self, seed: int = 42, weights_override: dict | None = None):
         self._rng = random.Random(seed)
         self._names = [name for name, _, _ in ERROR_GENERATORS]
         self._fns = [fn for _, fn, _ in ERROR_GENERATORS]
         self._weights = [w for _, _, w in ERROR_GENERATORS]
+        # JSON 설정 파일에서 override된 가중치 적용
+        if weights_override:
+            for i, name in enumerate(self._names):
+                if name in weights_override:
+                    self._weights[i] = float(weights_override[name])
 
     def set_seed(self, seed: int) -> None:
         """랜덤 시드를 재설정. 에포크마다 호출 권장."""

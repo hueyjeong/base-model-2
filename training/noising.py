@@ -198,6 +198,14 @@ class NoiseConfig:
     keyboard_shift_typo_prob_ko_alpha: float = 0.3  # 한글 경로 내 alpha(숫자/기호 포함) Shift 오입력 확률
     keyboard_shift_typo_prob_ko_jamo: float = 0.3   # 한글 자모 Shift 오입력 확률
 
+    # 한국어 error_generation 모듈별 가중치 (0 = 비활성화, 기본값 = 코드 하드코딩 값)
+    # 빈 dict({}) 이면 ERROR_GENERATORS의 기본 가중치를 그대로 사용
+    korean_error_weights: dict = None  # type: ignore
+
+    def __post_init__(self):
+        if self.korean_error_weights is None:
+            self.korean_error_weights = {}
+
 
 # ── 텍스트 레벨 노이즈 함수 ───────────────────────────────────────────
 
@@ -524,7 +532,10 @@ class DenoisingNoiser:
         if use_korean_errors:
             try:
                 from error_generation import KoreanErrorGenerator
-                self._error_gen = KoreanErrorGenerator(seed=seed)
+                self._error_gen = KoreanErrorGenerator(
+                    seed=seed,
+                    weights_override=self.cfg.korean_error_weights or {},
+                )
             except ImportError:
                 pass
 
