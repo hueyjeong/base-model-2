@@ -54,6 +54,8 @@ BATCHIM_CONFUSION: dict[str, list[str]] = {
 }
 
 
+import re
+
 def apply_consonant_error(text: str, rng: random.Random) -> Optional[str]:
     """
     텍스트에 자음/받침 혼동 오류를 적용.
@@ -65,17 +67,19 @@ def apply_consonant_error(text: str, rng: random.Random) -> Optional[str]:
     Returns:
         오류가 적용된 문장. 적용 가능한 패턴이 없으면 None.
     """
-    candidates: list[tuple[str, str]] = []
+    candidates = []
     for correct, wrongs in BATCHIM_CONFUSION.items():
         if correct in text:
-            for wrong in wrongs:
-                candidates.append((correct, wrong))
+            # 원치 않는 형태소 내 문자열 변환 방지를 위해 독립적 단어 시작점만 매칭
+            for m in re.finditer(f"(?<![가-힣]){correct}", text):
+                for wrong in wrongs:
+                    candidates.append((m.start(), m.end(), wrong))
 
     if not candidates:
         return None
 
-    correct, wrong = rng.choice(candidates)
-    return text.replace(correct, wrong, 1)
+    start, end, wrong = rng.choice(candidates)
+    return text[:start] + wrong + text[end:]
 
 
 def get_error_count() -> int:

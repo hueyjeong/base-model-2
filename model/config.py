@@ -18,9 +18,9 @@ class BitMambaSeq2SeqConfig:
         n_encoder_layers: 인코더 레이어 수
         n_decoder_layers: 디코더 레이어 수
         d_inner: Mamba 내부 확장 차원
-        d_state: SSM 상태 차원
+        d_state: SSM 상태 차원 (Mamba-1: 16, Mamba-2: 128)
         d_conv: Mamba 1D conv 커널 크기
-        dt_rank: Δ projection rank
+        dt_rank: Δ projection rank (Mamba-1 전용)
         d_ff: BitNet FFN 중간 차원
         n_heads: Cross-attention 헤드 수
         vocab_size: 토크나이저 어휘 크기
@@ -30,6 +30,10 @@ class BitMambaSeq2SeqConfig:
         tie_lm_head: LM Head와 임베딩 weight tying 여부
         pad_id: 패딩 토큰 ID
         rms_norm_eps: RMSNorm epsilon
+        mamba_version: 1=Mamba-1 (selective scan), 2=Mamba-2 (SSD chunk-parallel)
+        headdim: Mamba-2 head 차원 (기본 64)
+        ngroups: Mamba-2 group 수 (기본 1)
+        chunk_size: Mamba-2 chunk 크기 (기본 256)
     """
     # 모델 차원
     d_model: int = 768
@@ -40,14 +44,20 @@ class BitMambaSeq2SeqConfig:
     d_inner: int = 1536       # 2 × d_model
     d_state: int = 16
     d_conv: int = 4
-    dt_rank: int = 48         # d_model // 16
+    dt_rank: int = 48         # d_model // 16 (Mamba-1 전용)
+
+    # Mamba-2 SSD 전용 파라미터
+    mamba_version: int = 1    # 1=Mamba-1, 2=Mamba-2 SSD
+    headdim: int = 64         # Mamba-2 head 차원
+    ngroups: int = 1          # Mamba-2 group 수
+    chunk_size: int = 256     # Mamba-2 chunk 크기
 
     # BitNet FFN 파라미터
     d_ff: int = 1280
 
     # Cross-Attention 파라미터
     n_heads: int = 12
-    n_kv_heads: int | None = None   # GQA KV 헤드 수 (None=MHA, 1=MQA)
+    n_kv_heads: int | None = 1   # GQA KV 헤드 수 (None=MHA, 1=MQA -> Linear Attention에서 MQA 사용 추천)
 
     # 토크나이저/시퀀스
     vocab_size: int = 64000
@@ -61,6 +71,7 @@ class BitMambaSeq2SeqConfig:
     tie_embeddings: bool = True
     tie_lm_head: bool = True
     pad_id: int = 0
+    bos_id: int = 1           # Document isolation: BOS 위치에서 SSM state 리셋용
 
     # 원문 참조 (Trial B 기본 활성화)
     use_copy_gate: bool = True
@@ -87,3 +98,7 @@ class BitMambaSeq2SeqConfig:
                 f"n_heads({self.n_heads}) must be divisible by n_kv_heads({self.n_kv_heads})"
         assert self.d_inner > 0, "d_inner must be positive"
         assert self.d_state > 0, "d_state must be positive"
+        assert self.mamba_version in (1, 2), f"mamba_version must be 1 or 2, got {self.mamba_version}"
+        if self.mamba_version == 2:
+            assert self.d_inner % self.headdim == 0, \
+                f"d_inner({self.d_inner}) must be divisible by headdim({self.headdim})"

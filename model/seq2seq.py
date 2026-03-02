@@ -57,9 +57,13 @@ class BitMambaSeq2Seq(nn.Module):
             d_ff=config.d_ff,
             dropout=config.dropout,
             rms_norm_eps=config.rms_norm_eps,
+            mamba_version=config.mamba_version,
+            headdim=config.headdim,
+            ngroups=config.ngroups,
+            chunk_size=config.chunk_size,
         )
 
-        # --- 디코더 (Cross-Attention 없음, Mamba concat 방식) ---
+        # --- 디코더 ---
         self.decoder = Decoder(
             n_layers=config.n_decoder_layers,
             d_model=config.d_model,
@@ -70,6 +74,10 @@ class BitMambaSeq2Seq(nn.Module):
             d_ff=config.d_ff,
             dropout=config.dropout,
             rms_norm_eps=config.rms_norm_eps,
+            mamba_version=config.mamba_version,
+            headdim=config.headdim,
+            ngroups=config.ngroups,
+            chunk_size=config.chunk_size,
         )
 
         # --- 최종 정규화 ---
@@ -119,6 +127,9 @@ class BitMambaSeq2Seq(nn.Module):
         Returns:
             encoder_out: (B, src_len, d_model)
         """
+        # Document isolation: BOS 위치에서 SSM state 리셋
+        reset_mask = (src_ids == self.config.bos_id)  # (B, src_len)
+
         # 임베딩 (FP16 → FP32 변환)
         x = self.encoder_embedding(src_ids).float() * self.embed_scale
         x = self.embed_dropout(x)
@@ -131,7 +142,7 @@ class BitMambaSeq2Seq(nn.Module):
             x = x * (src_mask.unsqueeze(-1).float() + 1e-5)  # (B, src_len, 1)
 
         # 인코더 스택
-        encoder_out = self.encoder(x)
+        encoder_out = self.encoder(x, reset_mask=reset_mask)
         return encoder_out
 
     def decode(
@@ -142,6 +153,7 @@ class BitMambaSeq2Seq(nn.Module):
         return_hidden: bool = False,
         src_ids: torch.Tensor | None = None,
         source_bias: float = 0.0,
+        src_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """디코더 forward → logits (또는 hidden states)
 
@@ -161,6 +173,9 @@ class BitMambaSeq2Seq(nn.Module):
         """
         src_len = encoder_out.size(1)
 
+        # Document isolation: BOS 위치에서 SSM state 리셋
+        reset_mask = (tgt_ids == self.config.bos_id)  # (B, tgt_len)
+
         # 타겟 임베딩 (FP16 → FP32 변환)
         tgt_emb = self.decoder_embedding(tgt_ids).float() * self.embed_scale
         tgt_emb = self.embed_dropout(tgt_emb)
@@ -171,15 +186,9 @@ class BitMambaSeq2Seq(nn.Module):
         if encoder_mask is not None:
             encoder_out = encoder_out * (encoder_mask.unsqueeze(-1).float() + 1e-5)
 
-        # Encoder 출력 + Target 임베딩 concat
-        # [encoder_out (B, src_len, d)] ; [tgt_emb (B, tgt_len, d)]
-        x = torch.cat([encoder_out, tgt_emb], dim=1)  # (B, src_len + tgt_len, d)
-
-        # 디코더 스택 (Mamba가 encoder 정보를 state로 축적)
-        x = self.decoder(x)
-
-        # Target 부분만 슬라이스
-        x = x[:, src_len:, :]  # (B, tgt_len, d_model)
+        # 디코더 스택 (Target Embedding만 Mamba로 들어가고, encoder_out은 Linear Cross-Attention으로 전달됨)
+        x = self.decoder(tgt_emb, encoder_out=encoder_out, encoder_mask=encoder_mask,
+                         reset_mask=reset_mask)
 
         # 최종 정규화
         x = self.final_norm(x)
@@ -224,10 +233,16 @@ class BitMambaSeq2Seq(nn.Module):
         if source_bias > 0.0 and src_ids is not None:
             B, V = logits.size(0), logits.size(-1)
             src_mask_vocab = torch.zeros(B, V, dtype=logits.dtype, device=logits.device)
-            src_mask_vocab.scatter_(1, src_ids, 1.0)
+            
+            if src_weights is not None:
+                # src_weights에 기반하여 bias mask 생성 (동일 토큰이 여러 번 등장하면 최대 가중치 유지)
+                src_mask_vocab.scatter_reduce_(1, src_ids, src_weights.to(logits.dtype), reduce="amax", include_self=False)
+            else:
+                src_mask_vocab.scatter_(1, src_ids, 1.0)
+                
             src_mask_vocab[:, self.config.pad_id] = 0.0
             
-            # 원문에 등장한 토큰들(mask=1.0)에게 source_bias 가산
+            # 원문에 등장한 토큰들에게 source_bias 가산 (src_weights 값에 비례)
             logits = logits + src_mask_vocab.unsqueeze(1) * source_bias
 
         return logits
@@ -238,6 +253,7 @@ class BitMambaSeq2Seq(nn.Module):
         tgt_ids: torch.Tensor,
         src_mask: torch.Tensor | None = None,
         source_bias: float = 0.0,
+        src_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """전체 Encoder-Decoder forward
 
@@ -260,6 +276,7 @@ class BitMambaSeq2Seq(nn.Module):
             encoder_mask=src_mask,
             src_ids=src_ids,
             source_bias=source_bias,
+            src_weights=src_weights,
         )
 
         return logits
