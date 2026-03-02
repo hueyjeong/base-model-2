@@ -32,11 +32,13 @@ base-model-2/
 │   ├── encoder.py             # Mamba-based encoder
 │   ├── decoder.py             # Mamba-based decoder
 │   ├── mamba_block.py         # Mamba SSM block
+│   ├── linear_attention.py    # Grouped-Query Linear Attention (O(N) cross-attention)
 │   ├── bitlinear.py           # BitLinear (1.58b weight, 8-bit activation) layer
+│   ├── triton_bitlinear.py    # Triton-based INT8 BitLinear backend
 │   ├── cuda_bitlinear.py      # CUDA INT8 BitLinear backend (custom autograd)
 │   ├── cuda_bitlinear_ext.cpp # CUDA extension C++ binding
 │   ├── cuda_bitlinear_kernel.cu # CUDA kernels (__dp4a, quantize, grad weight)
-│   └── cross_attention.py     # (Deprecated) Cross-attention between encoder/decoder
+│   └── cross_attention.py     # (Deprecated) Original standard cross-attention
 │
 ├── training/                  # Pre-training scripts
 │   ├── pretrain.py            # Main pre-training script (supports AMP, Fused CE, JIT)
@@ -73,6 +75,10 @@ base-model-2/
 │   └── mecab_bbpe.json        # Generated tokenizer JSON (after training)
 │
 ├── error_generation/          # Korean error generation for synthetic training data
+│   ├── chat_style_errors.py   # 채팅/통신체 변형 오류 생성
+│   ├── honorific_errors.py    # 높임말/반말 혼동 오류 생성
+│   ├── jamo_separation.py     # 자모 분리 오류 (ㅋㅋ, ㅎㅎ 등 연관) 생성
+│   ├── punctuation_errors.py  # 온점, 쉼표 등 문장부호 오류 생성
 │   ├── common_misspellings.py # 맞춤법 오류 생성
 │   ├── spacing_errors.py      # 띄어쓰기 오류 생성
 │   ├── vowel_confusion.py     # 모음 혼동 오류 생성
@@ -131,16 +137,38 @@ Tokenizer-specific tokens:
 The model is a **BitNet-Mamba Seq2Seq** (encoder-decoder):
 
 - **Encoder**: Stacked Mamba blocks (SSM-based, no attention)
-- **Decoder**: Stacked Mamba blocks (encoder outputs concatenated ahead of target embeddings, relying purely on Mamba's recurrent state; no cross-attention)
+- **Decoder**: Stacked Mamba blocks with **Linear Cross-Attention**.
+  - 기존의 단순 concat 방식을 대체하여, 각 Decoder 레이어에서 Encoder 문맥을 $O(N)$ 복잡도의 Linear Cross-Attention 매커니즘으로 전달합니다.
+  - 리니어 어텐션을 위한 양수 보장 특징 매핑으로 `phi(x) = elu(x) + 1`을 사용.
 - **BitLinear**: 1.58-bit ternary quantized linear layers (weights are ternary: {-1, 0, +1}, activations are 8-bit)
-- **Embedding**: Optionally shared between encoder/decoder, and optionally tied with the LM head
+- **Embedding**: Optionally shared between encoder/decoder, and optionally tied with the LM head. Additonal experimental modes include:
+  - **Logit Space Copy Gate (Trial B)**: 디코더 출력 로짓과 원문(source) unigram 분포를 logit space에서 `gate`를 활용해 혼합하여 복사(Copy) 능력을 향상시킵니다.
+  - **Source-Aware Logit Bias (Trial A)**: 타겟 로짓에 노이즈 가중치(`src_weights`, 예: 원본 토큰은 1.0, 노이즈 토큰은 0.5)를 근거로 bias를 추가해 원문 단어가 유지되도록 유도합니다.
 
 Default config (`BitMambaSeq2SeqConfig`):
 - `d_model=768`, `d_inner=1536`, `d_state=16`, `d_conv=4`
 - `n_encoder_layers=6`, `n_decoder_layers=10`
 - `n_heads=12`, `d_ff=1280`
 - `vocab_size=64000`, `max_seq_len=512`
-- Target: Ranging from ~8M up to ~128M parameters (excluding embeddings, managed via `SMALL_CONFIGS` in `pretrain.py`)
+- Target: Ranging from ~8M up to **~1B** parameters (including 256M, 512M, 1B presets, managed via `MODEL_CONFIGS` in `pretrain.py`)
+
+---
+
+## Noising Algorithm (BART-style)
+
+The dataset introduces robust perturbations (via `training/noising.py` and `error_generation/`) through two phases before input into the model. Weights are tracked simultaneously, yielding 1.0 for original unnoised tokens and 0.5 for altered/masked tokens:
+
+### 1. Text-Level Noise (Pre-Tokenization)
+- **Korean Error Injection**: Utilizes `error_generation` modules (spacing, spelling, chat style, honorifics, etc.).
+- **Spacing Noise**: Randomly removes, partially removes, or inserts whitespaces.
+- **Keyboard Typos**: Euclidean 2D coordinate-based distance replacements (handles Korean Jamo, QWERTY Shift typos, and Numpad layouts).
+- **N-gram Shuffle & Word Reorder**: Scrambles sequential word components.
+
+### 2. Token-Level Noise (Post-Tokenization)
+- `SequenceMatcher` calculates diff blocks mapping the original sequence against the text-perturbed sequence.
+- **Token Masking**: Replaces ~15% of selected un-modified tokens with `[MASK]`.
+- **Token Deletion**: Removes ~5% of unmodified tokens.
+- **Text Infilling**: Replaces Poisson-distributed spans ($\lambda=3$) with a single `[MASK]`.
 
 ---
 
@@ -185,14 +213,15 @@ Run `python verify_model.py` from the project root to:
 
 ### Pre-training
 The model uses `training/pretrain.py` for training the Seq2Seq BitMamba architecture across a custom corpus.
-- **Metrics**: Uses `Bits Per Character (BPC)` for metric stability, measuring loss against `--max_chars` to compare disparate tokenizer performances fairly.
+- **Metrics**: 
+  - Uses `Bits Per Character (BPC)` for metric stability, measuring loss against `--max_chars` to compare disparate tokenizer performances fairly.
+  - Evaluation logs native unnoised target mappings measuring the `Character Error Rate (CER)` as standard validation.
 - **Optimization Strategy**: 
-  - Requires PyTorch `bfloat16` (`--bf16`) for mixed-precision to avoid BitLinear scaler overflow.
-  - Leverages `liger-kernel` for Fused Cross-Entropy (`--fused_ce`) to completely avoid materializing `logits` matrices in VRAM.
+  - Required PyTorch `bfloat16` (`--bf16`) for mixed-precision to avoid BitLinear scaler overflow.
+  - Uses `liger-kernel` for Fused Cross-Entropy (`--fused_ce`) to circumvent VRAM materialization.
   - Supports `torch.compile` (`--compile`) for non-INT8 eager path speedups.
-  - Provides Gradient Checkpointing (`--grad_ckpt`) and chunked cross-entropy fallback (`--chunk_ce`).
+  - Cosine Decay scheduling is implemented for learning rate convergence over steps.
   - Supports INT8 backend selection: `--int8 --int8_backend {triton,cuda}`.
-  - `--cuda_graph` is experimental-only and should be treated as opt-in benchmarking mode.
 
 #### INT8 CUDA practical guidance (latest)
 - Recommended stack phrase: **non-graph + `gradw_lt` + `fused_quant`**.
@@ -218,7 +247,6 @@ The model uses `training/pretrain.py` for training the Seq2Seq BitMamba architec
 ### Git
 - Large corpus files (`corpus/*.jsonl`) are gitignored
 - Model checkpoints (`*.pt`, `*.pth`, `*.ckpt`, `*.safetensors`, `*.bin`) are gitignored
-- SentencePiece model files (`*.model`, `*.vocab`) are gitignored
 - Generated tokenizer JSON files **are** checked in
 
 ---
@@ -227,8 +255,8 @@ The model uses `training/pretrain.py` for training the Seq2Seq BitMamba architec
 
 1. **Korean text handling is central** — always consider Unicode normalization (NFC vs NFD), Hanja preprocessing, and jamo decomposition when modifying tokenizer code.
 
-2. **Roundtrip correctness is critical** — tokenizer changes must preserve `decode(encode(text)) ≈ text`. The keyboard tokenizer's `<BLANK>` insertion logic is especially sensitive.
+2. **Roundtrip correctness is critical** — tokenizer changes must preserve `decode(encode(text)) ≈ text`. The keyboard tokenizer's `<BLANK>` insertion logic and extended QWERTY/Shift layout bounds are especially sensitive.
 
-3. **`sys.path` manipulation** — some scripts insert the project root into `sys.path` to resolve imports. Always run scripts from the project root (`/workspace/base-model-2/`).
+3. **`sys.path` manipulation** — some scripts insert the project root into `sys.path` to resolve imports. Always run scripts from the project root (`/workspace/base-model-2-enchance-error/`).
 
 4. **The `[PAD]` token is always ID 0** — this is assumed by `BitMambaSeq2SeqConfig.pad_id` default and should remain consistent across tokenizers.

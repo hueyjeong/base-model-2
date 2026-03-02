@@ -84,10 +84,16 @@ class MambaBlock(nn.Module):
         # Output projection: d_inner → d_model — BitLinear
         self.out_proj = BitLinear(d_inner, d_model)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    # Document isolation: BOS 위치에서 SSM state를 완전히 리셋하기 위한 dt 값.
+    # A_log가 학습 중 -5까지 drift하는 최악의 경우에도
+    # exp(-0.0067 × 1e4) = exp(-67) ≈ 0 보장.
+    _RESET_DT = 1e4
+
+    def forward(self, x: torch.Tensor, reset_mask: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
             x: (batch, seq_len, d_model)
+            reset_mask: (batch, seq_len) bool — True인 위치에서 SSM state 리셋
         Returns:
             (batch, seq_len, d_model)
         """
@@ -103,6 +109,14 @@ class MambaBlock(nn.Module):
         x_branch = x_branch.transpose(1, 2)  # (B, L, d_inner)
         x_branch = F.silu(x_branch)
 
+        # ★ Document isolation: BOS 위치에서 SSM 입력 제로링
+        #   x_branch=0 → x_proj 출력(dt,B,C)≈0 → dB×x=0 (입력 기여 제거)
+        #   z=0 → gated output에서 BOS 위치의 SSM 출력도 0
+        if reset_mask is not None:
+            keep = (~reset_mask).unsqueeze(-1).float()  # (B, L, 1)
+            x_branch = x_branch * keep
+            z = z * keep
+
         # 3. SSM 파라미터 계산
         x_dbl = self.x_proj(x_branch)  # (B, L, dt_rank + 2*d_state)
         dt, B, C = x_dbl.split(
@@ -114,6 +128,12 @@ class MambaBlock(nn.Module):
         # Compute softplus in FP32 then clamp to prevent BF16 exponential explosions
         dt_f32 = dt.float()
         dt = F.softplus(dt_f32).clamp(min=1e-5).to(dt.dtype)
+
+        # ★ Document isolation: BOS 위치에서 dt 극대화
+        #   dA = exp(A × dt) where A<0 → exp(negative_large) ≈ 0
+        #   → h[t] = 0 × h[t-1] + 0 = 0 (완벽한 state 리셋)
+        if reset_mask is not None:
+            dt = dt.masked_fill(reset_mask.unsqueeze(-1), self._RESET_DT)
 
         # 4. Selective scan (CUDA 가능 시 자동 사용)
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state) FP32

@@ -4,7 +4,7 @@ FROM nvidia/cuda:12.8.0-devel-ubuntu24.04
 # 컨테이너 내 상호작용 프롬프트 무시
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
-ENV PIP_NO_CACHE_DIR=1
+# ENV PIP_NO_CACHE_DIR=1
 
 # CUDA 12.8 경로 설정
 ENV PATH=/usr/local/cuda-12.8/bin${PATH:+:${PATH}}
@@ -33,6 +33,7 @@ RUN apt-get install -y \
     rclone \
     openssh-server \
     openssl \
+    vim \
     && rm -rf /var/lib/apt/lists/*
 
 # python 및 pip를 최신 버전으로 심볼릭 링크
@@ -45,70 +46,6 @@ RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1 \
 # 작업 디렉토리 설정
 WORKDIR /workspace/base-model-2
 
-
-# 암호화 및 분할 압축된 corpus 데이터 및 압축 해제 스크립트 복사
-# 도커 빌드 전 호스트에서 pack_corpus.sh를 실행해 압축 파일들을 생성해야 합니다.
-COPY \
-    corpus/corpus.tar.gz.enc.aa \
-    corpus/corpus.tar.gz.enc.ab \
-    corpus/corpus.tar.gz.enc.ac \
-    corpus/corpus.tar.gz.enc.ad \
-    corpus/corpus.tar.gz.enc.ae \
-    corpus/corpus.tar.gz.enc.af \
-    corpus/corpus.tar.gz.enc.ag \
-    corpus/corpus.tar.gz.enc.ah \
-    corpus/corpus.tar.gz.enc.ai \
-    corpus/corpus.tar.gz.enc.aj \
-    ./corpus/
-COPY \
-    corpus/corpus.tar.gz.enc.ak \
-    corpus/corpus.tar.gz.enc.al \
-    corpus/corpus.tar.gz.enc.am \
-    corpus/corpus.tar.gz.enc.an \
-    corpus/corpus.tar.gz.enc.ao \
-    corpus/corpus.tar.gz.enc.ap \
-    corpus/corpus.tar.gz.enc.aq \
-    corpus/corpus.tar.gz.enc.ar \
-    corpus/corpus.tar.gz.enc.as \
-    corpus/corpus.tar.gz.enc.at \
-    ./corpus/
-COPY \
-    corpus/corpus.tar.gz.enc.au \
-    corpus/corpus.tar.gz.enc.av \
-    corpus/corpus.tar.gz.enc.aw \
-    corpus/corpus.tar.gz.enc.ax \
-    corpus/corpus.tar.gz.enc.ay \
-    corpus/corpus.tar.gz.enc.az \
-    corpus/corpus.tar.gz.enc.ba \
-    corpus/corpus.tar.gz.enc.bb \
-    corpus/corpus.tar.gz.enc.bc \
-    corpus/corpus.tar.gz.enc.bd \
-    ./corpus/
-COPY \
-    corpus/corpus.tar.gz.enc.be \
-    corpus/corpus.tar.gz.enc.bf \
-    corpus/corpus.tar.gz.enc.bg \
-    corpus/corpus.tar.gz.enc.bh \
-    corpus/corpus.tar.gz.enc.bi \
-    corpus/corpus.tar.gz.enc.bj \
-    corpus/corpus.tar.gz.enc.bk \
-    corpus/corpus.tar.gz.enc.bl \
-    corpus/corpus.tar.gz.enc.bm \
-    corpus/corpus.tar.gz.enc.bn \
-    ./corpus/
-COPY \
-    corpus/corpus.tar.gz.enc.bo \
-    corpus/corpus.tar.gz.enc.bp \
-    corpus/corpus.tar.gz.enc.bq \
-    corpus/corpus.tar.gz.enc.br \
-    corpus/corpus.tar.gz.enc.bs \
-    corpus/corpus.tar.gz.enc.bt \
-    corpus/corpus.tar.gz.enc.bu \
-    corpus/corpus.tar.gz.enc.bv \
-    ./corpus/
-COPY unpack_corpus.sh .
-RUN chmod +x unpack_corpus.sh
-
 # 패키지 요구사항만 먼저 복사하여 도커 빌드 캐시 극대화
 COPY requirements.txt .
 
@@ -118,23 +55,96 @@ RUN python3.12 -m venv .venv
 # venv를 기본으로 사용하도록 PATH 환경변수를 먼저 설정 (이후 모든 RUN에서 자동으로 venv 적용)
 ENV PATH="/workspace/base-model-2/.venv/bin:$PATH"
 
-RUN echo 'Installing Requirement...' && \
+RUN pip config --user set global.index-url https://mirror.kakao.com/pypi/simple
+RUN pip config --user set global.trusted-host mirror.kakao.com
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    echo 'Installing Requirement...' && \
     pip install -r requirements.txt
 
-RUN echo 'Installing PyTorch...' && \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    echo 'Installing PyTorch...' && \
     pip install torch --index-url https://download.pytorch.org/whl/cu128
 
-RUN echo 'Installing Core Dependencies...' && \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    echo 'Installing Core Dependencies...' && \
     pip install wheel tokenizers transformers sentencepiece einops ninja packaging
 
-RUN echo 'Installing Mamba CUDA Kernels (causal-conv1d)...' && \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    echo 'Installing Mamba CUDA Kernels (causal-conv1d)...' && \
     pip install causal-conv1d
 
-RUN echo 'Installing Mamba CUDA Kernels (mamba_ssm)...' && \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    echo 'Installing Mamba CUDA Kernels (mamba_ssm)...' && \
     pip install mamba_ssm
 
-RUN echo 'Installing Mecab...' && \
-    pip install mecab-python3 mecab-ko-dic
+RUN --mount=type=cache,target=/root/.cache/pip \
+    echo 'Installing Mecab...' && \
+    pip install mecab-python3 mecab-ko-dic gdown
+
+
+# 암호화 및 분할 압축된 corpus 데이터 및 압축 해제 스크립트 복사
+# 도커 빌드 전 호스트에서 pack_corpus.sh를 실행해 압축 파일들을 생성해야 합니다.
+# COPY \
+#     corpus/corpus.tar.gz.enc.aa \
+#     corpus/corpus.tar.gz.enc.ab \
+#     corpus/corpus.tar.gz.enc.ac \
+#     corpus/corpus.tar.gz.enc.ad \
+#     corpus/corpus.tar.gz.enc.ae \
+#     corpus/corpus.tar.gz.enc.af \
+#     corpus/corpus.tar.gz.enc.ag \
+#     corpus/corpus.tar.gz.enc.ah \
+#     corpus/corpus.tar.gz.enc.ai \
+#     corpus/corpus.tar.gz.enc.aj \
+#     ./corpus/
+# COPY \
+#     corpus/corpus.tar.gz.enc.ak \
+#     corpus/corpus.tar.gz.enc.al \
+#     corpus/corpus.tar.gz.enc.am \
+#     corpus/corpus.tar.gz.enc.an \
+#     corpus/corpus.tar.gz.enc.ao \
+#     corpus/corpus.tar.gz.enc.ap \
+#     corpus/corpus.tar.gz.enc.aq \
+#     corpus/corpus.tar.gz.enc.ar \
+#     corpus/corpus.tar.gz.enc.as \
+#     corpus/corpus.tar.gz.enc.at \
+#     ./corpus/
+# COPY \
+#     corpus/corpus.tar.gz.enc.au \
+#     corpus/corpus.tar.gz.enc.av \
+#     corpus/corpus.tar.gz.enc.aw \
+#     corpus/corpus.tar.gz.enc.ax \
+#     corpus/corpus.tar.gz.enc.ay \
+#     corpus/corpus.tar.gz.enc.az \
+#     corpus/corpus.tar.gz.enc.ba \
+#     corpus/corpus.tar.gz.enc.bb \
+#     corpus/corpus.tar.gz.enc.bc \
+#     corpus/corpus.tar.gz.enc.bd \
+#     ./corpus/
+# COPY \
+#     corpus/corpus.tar.gz.enc.be \
+#     corpus/corpus.tar.gz.enc.bf \
+#     corpus/corpus.tar.gz.enc.bg \
+#     corpus/corpus.tar.gz.enc.bh \
+#     corpus/corpus.tar.gz.enc.bi \
+#     corpus/corpus.tar.gz.enc.bj \
+#     corpus/corpus.tar.gz.enc.bk \
+#     corpus/corpus.tar.gz.enc.bl \
+#     corpus/corpus.tar.gz.enc.bm \
+#     corpus/corpus.tar.gz.enc.bn \
+#     ./corpus/
+# COPY \
+#     corpus/corpus.tar.gz.enc.bo \
+#     corpus/corpus.tar.gz.enc.bp \
+#     corpus/corpus.tar.gz.enc.bq \
+#     corpus/corpus.tar.gz.enc.br \
+#     corpus/corpus.tar.gz.enc.bs \
+#     corpus/corpus.tar.gz.enc.bt \
+#     corpus/corpus.tar.gz.enc.bu \
+#     corpus/corpus.tar.gz.enc.bv \
+#     ./corpus/
+COPY unpack_corpus.sh .
+RUN chmod +x unpack_corpus.sh
 
 # 의존성 설치가 끝난 후 전체 코드 복사 (소스코드 변경 시 빌드 캐시가 깨지지 않도록)
 COPY . .

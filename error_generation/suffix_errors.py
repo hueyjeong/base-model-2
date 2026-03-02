@@ -86,6 +86,8 @@ TTURIDA_MAP: dict[str, list[str]] = {
 }
 
 
+import re
+
 def apply_suffix_error(text: str, rng: random.Random) -> Optional[str]:
     """
     텍스트에 접미사 오류를 적용.
@@ -103,18 +105,19 @@ def apply_suffix_error(text: str, rng: random.Random) -> Optional[str]:
         GEOL_GE_MAP, TTURIDA_MAP,
     ]
 
-    candidates: list[tuple[str, str]] = []
+    candidates = []
     for m in all_maps:
         for correct, wrongs in m.items():
             if correct in text:
-                for wrong in wrongs:
-                    candidates.append((correct, wrong))
+                for match in re.finditer(f"(?<![가-힣]){correct}", text):
+                    for wrong in wrongs:
+                        candidates.append((match.start(), match.end(), wrong))
 
     if not candidates:
         return None
 
-    correct, wrong = rng.choice(candidates)
-    return text.replace(correct, wrong, 1)
+    start, end, wrong = rng.choice(candidates)
+    return text[:start] + wrong + text[end:]
 
 
 def get_error_count() -> int:

@@ -34,6 +34,14 @@ from error_generation.chat_style_errors import apply_chat_style
 from error_generation.jamo_separation import apply_jamo_separation
 from error_generation.punctuation_errors import apply_punctuation_error
 from error_generation.honorific_errors import apply_honorific_error
+from error_generation.number_errors import apply_number_error
+from error_generation.grammar_structure_errors import apply_remove_error, apply_addition_error
+from error_generation.typing_language_errors import apply_typing_language_error
+from error_generation.foreign_word_errors import apply_foreign_word_error
+from error_generation.phoneme_errors import apply_phoneme_error
+from error_generation.word_order_errors import apply_word_order_error
+from error_generation.tense_errors import apply_tense_error
+from error_generation.semantic_errors import apply_semantic_error
 
 from error_generation import common_misspellings
 from error_generation import spacing_errors
@@ -51,29 +59,65 @@ from error_generation import chat_style_errors
 from error_generation import jamo_separation
 from error_generation import punctuation_errors
 from error_generation import honorific_errors
+from error_generation import number_errors
+from error_generation import grammar_structure_errors
+from error_generation import typing_language_errors
+from error_generation import foreign_word_errors
+from error_generation import phoneme_errors
+from error_generation import word_order_errors
+from error_generation import tense_errors
+from error_generation import semantic_errors
 
 
 # 오류 생성 함수 목록과 가중치
-# 가중치는 실제 사용 빈도/중요도를 반영한 상대적 확률
+# 가중치는 NOISE_RESEARCH.md 에 기반하여 설정
 ErrorFn = Callable[[str, random.Random], Optional[str]]
 
 ERROR_GENERATORS: list[tuple[str, ErrorFn, float]] = [
-    ("common_misspellings",  apply_misspelling,        3.0),
-    ("spacing_errors",       apply_spacing_error,      2.0),
-    ("vowel_confusion",      apply_vowel_confusion,    2.0),
-    ("consonant_errors",     apply_consonant_error,    1.5),
-    ("conjugation_errors",   apply_conjugation_error,  2.5),
-    ("suffix_errors",        apply_suffix_error,       2.0),
-    ("particle_errors",      apply_particle_error,     1.5),
-    ("word_substitution",    apply_word_substitution,  1.5),
-    ("saisiot_errors",       apply_saisiot_error,      1.0),
-    ("double_expression",    apply_double_expression,  1.0),
+    # A. 띄어쓰기 오류 (20%)
+    ("spacing_errors",       apply_spacing_error,      4.0),
+    
+    # B. 구두점 오류 (10%)
+    ("punctuation_errors",   apply_punctuation_error,  2.0),
+    
+    # C. 수치 오류 (5%)
+    ("number_errors",        apply_number_error,       1.0),
+    
+    # D-1. 삭제/첨가 오류 (10%)
+    ("grammar_remove",       apply_remove_error,       1.0),
+    ("grammar_addition",     apply_addition_error,     1.0),
+    
+    # D-2. 대치/분리/자모 오류 (15%)
+    ("common_misspellings",  apply_misspelling,        1.0),
+    ("vowel_confusion",      apply_vowel_confusion,    0.5),
+    ("consonant_errors",     apply_consonant_error,    0.5),
+    ("word_substitution",    apply_word_substitution,  0.5),
+    ("jamo_separation",      apply_jamo_separation,    0.5),
+    
+    # D-3. 발음/외래어 오류 (10%)
+    ("phoneme_errors",       apply_phoneme_error,      1.0),
+    ("foreign_word_errors",  apply_foreign_word_error, 1.0),
+    
+    # D-4. 타이핑 언어 오류 (5%)
+    ("typing_language_errors", apply_typing_language_error, 1.0),
+    
+    # D-5. 구문론적 오류 (어순/시제) (10%)
+    ("word_order_errors",    apply_word_order_error,   1.0),
+    ("tense_errors",         apply_tense_error,        1.0),
+    
+    # D-6. 의미론적 오류 (10%)
+    ("semantic_errors",      apply_semantic_error,     2.0),
+    
+    # 그 외 보조 오류 (나머지 비중 분산)
+    ("conjugation_errors",   apply_conjugation_error,  0.5),
+    ("suffix_errors",        apply_suffix_error,       0.5),
+    ("particle_errors",      apply_particle_error,     0.5),
+    ("saisiot_errors",       apply_saisiot_error,      0.5),
+    ("double_expression",    apply_double_expression,  0.5),
     ("foreign_style",        apply_foreign_style,      0.5),
-    ("misc_errors",          apply_misc_error,         1.0),
-    ("chat_style_errors",    apply_chat_style,         1.5),
-    ("jamo_separation",      apply_jamo_separation,    1.0),
-    ("punctuation_errors",   apply_punctuation_error,  1.0),
-    ("honorific_errors",     apply_honorific_error,    1.0),
+    ("misc_errors",          apply_misc_error,         0.5),
+    ("chat_style_errors",    apply_chat_style,         0.5),
+    ("honorific_errors",     apply_honorific_error,    0.5),
 ]
 
 # 모든 모듈 목록 (패턴 수 집계용)
@@ -83,7 +127,9 @@ ALL_MODULES = [
     particle_errors, word_substitution, saisiot_errors,
     double_expression, foreign_style, misc_errors,
     chat_style_errors, jamo_separation, punctuation_errors,
-    honorific_errors,
+    honorific_errors, number_errors, grammar_structure_errors,
+    typing_language_errors, foreign_word_errors, phoneme_errors,
+    word_order_errors, tense_errors, semantic_errors
 ]
 
 
@@ -98,11 +144,16 @@ class KoreanErrorGenerator:
         seed: 랜덤 시드 (재현성 보장)
     """
 
-    def __init__(self, seed: int = 42):
+    def __init__(self, seed: int = 42, weights_override: dict | None = None):
         self._rng = random.Random(seed)
         self._names = [name for name, _, _ in ERROR_GENERATORS]
         self._fns = [fn for _, fn, _ in ERROR_GENERATORS]
         self._weights = [w for _, _, w in ERROR_GENERATORS]
+        # JSON 설정 파일에서 override된 가중치 적용
+        if weights_override:
+            for i, name in enumerate(self._names):
+                if name in weights_override:
+                    self._weights[i] = float(weights_override[name])
 
     def set_seed(self, seed: int) -> None:
         """랜덤 시드를 재설정. 에포크마다 호출 권장."""

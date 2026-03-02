@@ -24,7 +24,7 @@ from bbpe_tokenizer.bbpe_wrapper import BBPETokenizer
 
 
 # ── 소형 모델 Config 프리셋 ──────────────────────────────────
-SMALL_CONFIGS = {
+MODEL_CONFIGS = {
     "8M": dict(
         d_model=256, d_inner=512, d_ff=448,
         n_encoder_layers=3, n_decoder_layers=5,
@@ -180,7 +180,7 @@ def main():
     print(f"\n  bbpe_tokenizer 로드 완료 (vocab_size={tokenizer.vocab_size})")
 
     results = {}
-    for label, kwargs in SMALL_CONFIGS.items():
+    for label, kwargs in MODEL_CONFIGS.items():
         try:
             passed = verify_one(label, dict(kwargs), tokenizer)
             results[label] = passed
@@ -196,7 +196,7 @@ def main():
     for label, passed in results.items():
         target = int(label.replace("M", "")) * 1_000_000
         status = "✅ PASS" if passed else "❌ FAIL"
-        cfg = SMALL_CONFIGS[label]
+        cfg = MODEL_CONFIGS[label]
         print(f"  {label:>4s}  {status}  (d_model={cfg['d_model']}, "
               f"enc={cfg['n_encoder_layers']}, dec={cfg['n_decoder_layers']})")
         if not passed:

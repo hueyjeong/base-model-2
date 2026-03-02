@@ -2,6 +2,10 @@
 
 인코더 구조 (per layer):
     x → Mamba → (+residual) → RMSNorm → BitNet FFN → (+residual) → RMSNorm
+
+Mamba 버전 선택:
+    mamba_version=1: Mamba-1 (selective scan, d_state=16)
+    mamba_version=2: Mamba-2 SSD (chunk-parallel, d_state=128)
 """
 import torch
 import torch.nn as nn
@@ -65,30 +69,47 @@ class EncoderLayer(nn.Module):
         d_ff: int,
         dropout: float = 0.1,
         rms_norm_eps: float = 1e-6,
+        mamba_version: int = 1,
+        headdim: int = 64,
+        ngroups: int = 1,
+        chunk_size: int = 256,
     ):
         super().__init__()
-        self.mamba = MambaBlock(
-            d_model=d_model,
-            d_inner=d_inner,
-            d_state=d_state,
-            d_conv=d_conv,
-            dt_rank=dt_rank,
-        )
+        if mamba_version == 2:
+            from model.mamba2_block import Mamba2Block
+            self.mamba = Mamba2Block(
+                d_model=d_model,
+                d_inner=d_inner,
+                d_state=d_state,
+                d_conv=d_conv,
+                headdim=headdim,
+                ngroups=ngroups,
+                chunk_size=chunk_size,
+            )
+        else:
+            self.mamba = MambaBlock(
+                d_model=d_model,
+                d_inner=d_inner,
+                d_state=d_state,
+                d_conv=d_conv,
+                dt_rank=dt_rank,
+            )
         self.norm1 = RMSNorm(d_model, eps=rms_norm_eps)
         self.ffn = BitNetFFN(d_model, d_ff, dropout=dropout)
         self.norm2 = RMSNorm(d_model, eps=rms_norm_eps)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, reset_mask: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
             x: (batch, seq_len, d_model)
+            reset_mask: (batch, seq_len) bool — True인 위치에서 SSM state 리셋
         Returns:
             (batch, seq_len, d_model)
         """
         # Mamba + residual
         residual = x
-        x = self.mamba(x)
+        x = self.mamba(x, reset_mask=reset_mask)
         x = self.dropout(x)
         x = self.norm1(residual + x)
 
@@ -115,6 +136,10 @@ class Encoder(nn.Module):
         d_ff: int,
         dropout: float = 0.1,
         rms_norm_eps: float = 1e-6,
+        mamba_version: int = 1,
+        headdim: int = 64,
+        ngroups: int = 1,
+        chunk_size: int = 256,
     ):
         super().__init__()
         self.gradient_checkpointing = False
@@ -128,20 +153,25 @@ class Encoder(nn.Module):
                 d_ff=d_ff,
                 dropout=dropout,
                 rms_norm_eps=rms_norm_eps,
+                mamba_version=mamba_version,
+                headdim=headdim,
+                ngroups=ngroups,
+                chunk_size=chunk_size,
             )
             for _ in range(n_layers)
         ])
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, reset_mask: torch.Tensor | None = None) -> torch.Tensor:
         """
         Args:
             x: (batch, seq_len, d_model)  — 임베딩 출력
+            reset_mask: (batch, seq_len) bool — True인 위치에서 SSM state 리셋
         Returns:
             (batch, seq_len, d_model)  — 인코더 최종 출력
         """
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
-                x = checkpoint(layer, x, use_reentrant=False)
+                x = checkpoint(layer, x, reset_mask, use_reentrant=False)
             else:
-                x = layer(x)
+                x = layer(x, reset_mask=reset_mask)
         return x

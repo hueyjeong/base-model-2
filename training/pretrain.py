@@ -16,6 +16,7 @@ import math
 import os
 import sys
 import time
+from dataclasses import asdict, fields
 
 import torch
 import torch.nn as nn
@@ -84,7 +85,7 @@ def load_tokenizer(name: str, path: str | None = None):
 
 # ── 모델 사이즈 프리셋 ────────────────────────────────────────────────
 
-SMALL_CONFIGS = {
+MODEL_CONFIGS = {
     "8M": dict(
         d_model=288, d_inner=576, d_ff=544,
         n_encoder_layers=3, n_decoder_layers=5,
@@ -113,6 +114,24 @@ SMALL_CONFIGS = {
         d_model=768, d_inner=1536, d_ff=1280,
         n_encoder_layers=7, n_decoder_layers=12,
         n_heads=12, n_kv_heads=4, dt_rank=48,
+        d_state=16, d_conv=4,
+    ),
+    "256M": dict(
+        d_model=896, d_inner=1792, d_ff=2304,
+        n_encoder_layers=9, n_decoder_layers=14,
+        n_heads=16, n_kv_heads=4, dt_rank=56,
+        d_state=16, d_conv=4,
+    ),
+    "512M": dict(
+        d_model=1152, d_inner=2304, d_ff=3072,
+        n_encoder_layers=11, n_decoder_layers=17,
+        n_heads=20, n_kv_heads=4, dt_rank=72,
+        d_state=16, d_conv=4,
+    ),
+    "1B": dict(
+        d_model=1536, d_inner=3072, d_ff=4096,
+        n_encoder_layers=13, n_decoder_layers=19,
+        n_heads=24, n_kv_heads=4, dt_rank=96,
         d_state=16, d_conv=4,
     ),
 }
@@ -278,6 +297,136 @@ def get_lr_sgdr(step: int, warmup: int, max_lr: float, cycle_steps: int,
     return min_lr + (cycle_max_lr - min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
 
 
+# ── NoiseConfig 해석 (혼합형: scale + 개별 override) ───────────────────
+
+_NOISE_TEXT_SCALE_FIELDS = [
+    "korean_error_prob",
+    "spacing_noise_prob",
+    "spacing_remove_ratio",
+    "spacing_insert_prob",
+    "spacing_full_remove_prob",
+    "keyboard_typo_prob",
+    "keyboard_typo_ratio",
+    "ngram_shuffle_prob",
+    "word_reorder_prob",
+    "keyboard_shift_typo_prob_alpha",
+    "keyboard_shift_typo_prob_ko_alpha",
+    "keyboard_shift_typo_prob_ko_jamo",
+]
+
+_NOISE_TOKEN_SCALE_FIELDS = [
+    "token_mask_ratio",
+    "token_delete_ratio",
+    "text_infill_ratio",
+]
+
+_NOISE_PROB_LIKE_FIELDS = set(_NOISE_TEXT_SCALE_FIELDS + _NOISE_TOKEN_SCALE_FIELDS)
+
+
+def _clamp_prob_like(v: float) -> float:
+    return max(0.0, min(1.0, float(v)))
+
+
+def _load_noise_config_file(path: str) -> dict:
+    """JSON 노이즈 설정 파일을 로드하고 필드명을 검증한다."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"노이즈 설정 파일이 없습니다: {path}")
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if not isinstance(data, dict):
+        raise ValueError("노이즈 설정 파일 루트는 JSON object여야 합니다.")
+
+    # 편의: {"noise_config": {...}} 포맷도 허용
+    if "noise_config" in data and isinstance(data["noise_config"], dict):
+        data = data["noise_config"]
+
+    # 문서/메모용 키 허용: "_"로 시작하는 키는 무시
+    if isinstance(data, dict):
+        data = {k: v for k, v in data.items() if not str(k).startswith("_")}
+
+    valid_fields = {f.name for f in fields(NoiseConfig)}
+    unknown = sorted(k for k in data.keys() if k not in valid_fields)
+    if unknown:
+        raise ValueError(f"알 수 없는 노이즈 필드: {unknown}")
+
+    return data
+
+
+def resolve_noise_config_from_args(args) -> NoiseConfig:
+    """CLI 인자를 바탕으로 최종 NoiseConfig를 계산.
+
+    우선순위: 기본값 -> 설정 파일 override -> scale 적용
+    """
+    cfg = NoiseConfig()
+    values = asdict(cfg)
+
+    # 1) 설정 파일 override 적용 (없으면 기본값 유지)
+    if args.noise_config:
+        file_values = _load_noise_config_file(args.noise_config)
+        values.update(file_values)
+
+    # 2) 스케일 적용
+    text_scale = max(0.0, float(args.noise_scale_text)) * max(0.0, float(args.noise_scale))
+    token_scale = max(0.0, float(args.noise_scale_token)) * max(0.0, float(args.noise_scale))
+
+    for name in _NOISE_TEXT_SCALE_FIELDS:
+        values[name] = values[name] * text_scale
+    for name in _NOISE_TOKEN_SCALE_FIELDS:
+        values[name] = values[name] * token_scale
+
+    # 3) 유효 범위 정리
+    for name in _NOISE_PROB_LIKE_FIELDS:
+        values[name] = _clamp_prob_like(values[name])
+
+    # 비확률/정수/양수 제약
+    values["korean_error_count"] = max(0, int(values["korean_error_count"]))
+    values["ngram_n"] = max(1, int(values["ngram_n"]))
+    values["word_reorder_swaps"] = max(0, int(values["word_reorder_swaps"]))
+    values["infill_poisson_lambda"] = max(1e-6, float(values["infill_poisson_lambda"]))
+    values["token_noise_mask_weight"] = max(0.0, float(values["token_noise_mask_weight"]))
+    values["token_noise_delete_weight"] = max(0.0, float(values["token_noise_delete_weight"]))
+    values["token_noise_infill_weight"] = max(0.0, float(values["token_noise_infill_weight"]))
+
+    return NoiseConfig(**values)
+
+
+class CUDAPrefetcher:
+    """별도 CUDA stream에서 다음 배치를 미리 GPU로 전송하여 연산/전송 오버랩.
+
+    사용법:
+        prefetcher = CUDAPrefetcher(device, next_batch_fn)
+        for step in range(max_steps):
+            batch = prefetcher.next()  # GPU 텐서, 이미 전송 완료
+    """
+
+    def __init__(self, device: torch.device, next_batch_fn):
+        self.device = device
+        self.stream = torch.cuda.Stream()
+        self.next_batch_fn = next_batch_fn
+        self.next_data: dict | None = None
+
+    def preload(self):
+        """다음 배치를 별도 stream에서 GPU로 비동기 전송 시작."""
+        batch = self.next_batch_fn()
+        with torch.cuda.stream(self.stream):
+            gpu_batch = {}
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    gpu_batch[k] = v.to(self.device, non_blocking=True)
+                else:
+                    gpu_batch[k] = v
+            self.next_data = gpu_batch
+
+    def next(self) -> dict:
+        """프리로드된 배치 반환 + 즉시 다음 배치 프리로드 시작."""
+        torch.cuda.current_stream().wait_stream(self.stream)
+        data = self.next_data
+        self.preload()
+        return data
+
+
 def train(args):
     # DDP 초기화
     is_distributed = int(os.environ.get("WORLD_SIZE", 1)) > 1
@@ -302,20 +451,38 @@ def train(args):
     print(f"토크나이저 로드: {args.tokenizer}, vocab_size={tokenizer.vocab_size}")
 
     # ── 모델 설정 확인 (config만, GPU 할당은 아직) ──
-    if args.size not in SMALL_CONFIGS:
+    if args.size not in MODEL_CONFIGS:
         print(f"❌ 지원하지 않는 사이즈: {args.size}")
-        print(f"   사용 가능: {list(SMALL_CONFIGS.keys())}")
+        print(f"   사용 가능: {list(MODEL_CONFIGS.keys())}")
         return 1
 
-    model_kwargs = dict(SMALL_CONFIGS[args.size])
+    model_kwargs = dict(MODEL_CONFIGS[args.size])
     model_kwargs["vocab_size"] = tokenizer.vocab_size
+    model_kwargs["bos_id"] = tokenizer.bos_id  # Document isolation: BOS 위치에서 SSM state 리셋
     model_kwargs["use_copy_gate"] = args.use_copy_gate
+
+    # Mamba 버전 선택
+    model_kwargs["mamba_version"] = args.mamba_version
+    if args.mamba_version == 2:
+        # Mamba-2 SSD 기본값 적용 (MODEL_CONFIGS에서 명시적으로 지정하지 않은 경우)
+        model_kwargs.setdefault("d_state", 128)
+        model_kwargs.setdefault("headdim", 64)
+        model_kwargs.setdefault("ngroups", 1)
+        model_kwargs.setdefault("chunk_size", 256)
+        # Mamba-2에서 d_state 기본값이 16이면 128로 변경
+        if model_kwargs["d_state"] == 16:
+            model_kwargs["d_state"] = 128
+
     config = BitMambaSeq2SeqConfig(**model_kwargs)
 
     if global_rank == 0:
-        print(f"\n모델 설정: {args.size}")
+        mamba_label = "Mamba-2 SSD" if config.mamba_version == 2 else "Mamba-1"
+        print(f"\n모델 설정: {args.size} ({mamba_label})")
         print(f"  d_model={config.d_model}, enc={config.n_encoder_layers}, "
               f"dec={config.n_decoder_layers}")
+        if config.mamba_version == 2:
+            print(f"  Mamba-2: d_state={config.d_state}, headdim={config.headdim}, "
+                  f"ngroups={config.ngroups}, chunk_size={config.chunk_size}")
 
     # ── 체크포인트 메타 선행 로드 (CPU, GPU 할당 없음) ──
     start_step = 0
@@ -351,12 +518,31 @@ def train(args):
                 print("  ℹ️  data_state 미포함 → 데이터 RNG 복구 시뮬레이션 필요")
 
     # ── 데이터 파이프라인 (CPU only) ──
+    try:
+        resolved_noise_config = resolve_noise_config_from_args(args)
+    except Exception as e:
+        if global_rank == 0:
+            print(f"❌ 노이즈 설정 로드 실패: {e}")
+        return 1
+
+    if global_rank == 0:
+        if args.noise_config:
+            print(f"\n노이즈 설정 파일: {args.noise_config}")
+        else:
+            print("\n노이즈 설정 파일 미지정: NoiseConfig 기본값 사용")
+        print("\n노이즈 설정(resolved):")
+        print(json.dumps(asdict(resolved_noise_config), ensure_ascii=False, indent=2, sort_keys=True))
+
     noiser = DenoisingNoiser(
-        tokenizer, NoiseConfig(), seed=args.seed + global_rank, use_korean_errors=True,
+        tokenizer,
+        resolved_noise_config,
+        seed=args.seed + global_rank,
+        use_korean_errors=args.use_korean_errors,
     )
     dataset = StreamingPackedDataset(
         args.corpus, tokenizer, noiser,
         pack_size=args.pack_size,
+        d_conv=0 if config.mamba_version == 2 else config.d_conv,  # Mamba-2: seq_idx 네이티브, gap 불필요
         text_key=args.text_key, lang_key=args.lang_key,
         seed=args.seed,
         rank=global_rank,
@@ -370,6 +556,7 @@ def train(args):
         val_dataset = StreamingPackedDataset(
             args.val_corpus, tokenizer, noiser,
             pack_size=args.pack_size,
+            d_conv=0 if config.mamba_version == 2 else config.d_conv,  # Mamba-2: seq_idx 네이티브, gap 불필요
             text_key=args.text_key, lang_key=args.lang_key,
             seed=args.seed + 1,  # 학습과 다른 시드
             rank=global_rank,
@@ -383,12 +570,18 @@ def train(args):
         from torch.nn.utils.rnn import pad_sequence
         src_list = [b["src_ids"] for b in batch]
         tgt_list = [b["tgt_ids"] for b in batch]
-        n_chars = sum(b["n_chars"] for b in batch)
+        # src_weights 추출 (이전 생성 데이터 등 하위 호환을 위해 get 사용)
+        weight_list = [b.get("src_weights", torch.ones_like(b["src_ids"], dtype=torch.float)) for b in batch]
+        
+        n_chars = sum(b.get("n_chars", 0) for b in batch)
+        
         src_ids = pad_sequence(src_list, batch_first=True, padding_value=0)
         tgt_ids = pad_sequence(tgt_list, batch_first=True, padding_value=0)
+        src_weights = pad_sequence(weight_list, batch_first=True, padding_value=0.0)
+        
         src_mask = src_ids != 0
         return {"src_ids": src_ids, "tgt_ids": tgt_ids, "src_mask": src_mask,
-                "n_chars": n_chars}
+                "src_weights": src_weights, "n_chars": n_chars}
 
     loader = DataLoader(
         dataset, batch_size=args.batch_size,
@@ -436,6 +629,8 @@ def train(args):
 
     if _saved_data_state is not None:
         # ── 즉시 복원: 저장된 RNG state로 데이터 파이프라인 복원 ──
+        if global_rank == 0:
+            print("  ℹ️  resume 정책: 노이즈 강도/확률은 현재 CLI 값을 우선 적용합니다.")
         noiser.load_state_dict(_saved_data_state["noiser_state"])
         dataset.load_state_dict(_saved_data_state["dataset_state"])
         if global_rank == 0:
@@ -700,16 +895,31 @@ def train(args):
             "shape": (tuple(warm_src.shape), tuple(warm_tgt.shape), tuple(warm_mask.shape)),
         }
 
+    # ── CUDA Prefetcher: 데이터 전송과 연산 오버랩 ──
+    if torch.cuda.is_available():
+        prefetcher = CUDAPrefetcher(device, _next_batch)
+        prefetcher.preload()  # 첫 배치 프리로드
+        if global_rank == 0:
+            print("🚀 CUDA Prefetcher 활성화 (non_blocking + stream 오버랩)")
+    else:
+        prefetcher = None
+
     while global_step < args.max_steps and not training_done:
         # gradient accumulation 루프
         for accum_i in range(args.grad_accum_steps):
-            batch = _next_batch()
+            if prefetcher is not None:
+                batch = prefetcher.next()  # 이미 GPU 텐서
+            else:
+                batch = _next_batch()
 
-            src_ids = batch["src_ids"].to(device)  # (B, src_len)
-            tgt_ids = batch["tgt_ids"].to(device)  # (B, tgt_len)
-            src_mask = batch["src_mask"].to(device)  # (B, src_len)
+            src_ids = batch["src_ids"] if prefetcher else batch["src_ids"].to(device)  # (B, src_len)
+            tgt_ids = batch["tgt_ids"] if prefetcher else batch["tgt_ids"].to(device)  # (B, tgt_len)
+            src_mask = batch["src_mask"] if prefetcher else batch["src_mask"].to(device)  # (B, src_len)
+            src_weights = batch.get("src_weights")
+            if src_weights is not None and not prefetcher:
+                src_weights = src_weights.to(device)
             batch_chars = batch["n_chars"]
-            del batch  # CPU 텐서 참조 제거
+            del batch  # 텐서 참조 제거
 
             # Teacher forcing: 디코더 입력은 tgt_ids[:-1], 타겟은 tgt_ids[1:]
             tgt_input = tgt_ids[:, :-1]
@@ -748,6 +958,7 @@ def train(args):
                     mb_tgt_input = tgt_input[mb_start:mb_end]
                     mb_tgt_target = tgt_target[mb_start:mb_end]
                     mb_src_mask = src_mask[mb_start:mb_end]
+                    mb_src_weights = src_weights[mb_start:mb_end] if src_weights is not None else None
 
                     mb_tokens = int((mb_tgt_target != config.pad_id).sum().item())
                     if mb_tokens == 0:
@@ -765,6 +976,7 @@ def train(args):
                                     return_hidden=True,
                                     src_ids=mb_src_ids,
                                     source_bias=args.source_bias,
+                                    src_weights=mb_src_weights,
                                 )
                                 mb_loss = fused_ce_loss(
                                     raw_model.lm_head.weight.float(),
@@ -780,6 +992,7 @@ def train(args):
                                 return_hidden=True,
                                 src_ids=mb_src_ids,
                                 source_bias=args.source_bias,
+                                src_weights=mb_src_weights,
                             )
                             mb_loss = fused_ce_loss(
                                 raw_model.lm_head.weight.float(),
@@ -789,13 +1002,13 @@ def train(args):
                     else:
                         if use_amp:
                             with torch.amp.autocast("cuda", dtype=amp_dtype):
-                                mb_logits = model(mb_src_ids, mb_tgt_input, mb_src_mask, source_bias=args.source_bias)
+                                mb_logits = model(mb_src_ids, mb_tgt_input, mb_src_mask, source_bias=args.source_bias, src_weights=mb_src_weights)
                                 mb_loss = criterion(
                                     mb_logits.view(-1, config.vocab_size),
                                     mb_tgt_target.reshape(-1),
                                 )
                         else:
-                            mb_logits = model(mb_src_ids, mb_tgt_input, mb_src_mask, source_bias=args.source_bias)
+                            mb_logits = model(mb_src_ids, mb_tgt_input, mb_src_mask, source_bias=args.source_bias, src_weights=mb_src_weights)
                             mb_loss = criterion(
                                 mb_logits.view(-1, config.vocab_size),
                                 mb_tgt_target.reshape(-1),
@@ -820,7 +1033,7 @@ def train(args):
                     with torch.amp.autocast("cuda", dtype=amp_dtype):
                         encoder_out = raw_model.encode(src_ids, src_mask)
                         hidden = raw_model.decode(tgt_input, encoder_out,
-                                              src_mask, return_hidden=True, src_ids=src_ids, source_bias=args.source_bias)
+                                              src_mask, return_hidden=True, src_ids=src_ids, source_bias=args.source_bias, src_weights=src_weights)
                         loss = fused_ce_loss(
                             raw_model.lm_head.weight.float(),
                             hidden.view(-1, hidden.size(-1)).float(),
@@ -834,7 +1047,7 @@ def train(args):
                 else:
                     encoder_out = raw_model.encode(src_ids, src_mask)
                     hidden = raw_model.decode(tgt_input, encoder_out,
-                                          src_mask, return_hidden=True, src_ids=src_ids, source_bias=args.source_bias)
+                                          src_mask, return_hidden=True, src_ids=src_ids, source_bias=args.source_bias, src_weights=src_weights)
                     loss = fused_ce_loss(
                         raw_model.lm_head.weight.float(),
                         hidden.view(-1, hidden.size(-1)).float(),
@@ -846,7 +1059,7 @@ def train(args):
                 # ── 기존 방식 ──
                 if use_amp:
                     with torch.amp.autocast("cuda", dtype=amp_dtype):
-                        logits = model(src_ids, tgt_input, src_mask, source_bias=args.source_bias)
+                        logits = model(src_ids, tgt_input, src_mask, source_bias=args.source_bias, src_weights=src_weights)
                         loss = criterion(
                             logits.view(-1, config.vocab_size),
                             tgt_target.reshape(-1),
@@ -857,7 +1070,7 @@ def train(args):
                     else:
                         loss.backward()
                 else:
-                    logits = model(src_ids, tgt_input, src_mask, source_bias=args.source_bias)
+                    logits = model(src_ids, tgt_input, src_mask, source_bias=args.source_bias, src_weights=src_weights)
                     loss = criterion(
                         logits.view(-1, config.vocab_size),
                         tgt_target.reshape(-1),
@@ -963,6 +1176,7 @@ def train(args):
                 "optimizer": optimizer.state_dict(),
                 "config": model_kwargs,
                 "args": vars(args),
+                "noise_config": asdict(resolved_noise_config),
                 "data_state": {
                     "version": 2,
                     "noiser_state": noiser.state_dict(),
@@ -988,6 +1202,8 @@ def train(args):
             "total_chars": int(total_chars),
             "model": raw_model.state_dict(),
             "config": model_kwargs,
+            "args": vars(args),
+            "noise_config": asdict(resolved_noise_config),
             "data_state": {
                 "version": 2,
                 "noiser_state": noiser.state_dict(),
@@ -1015,7 +1231,7 @@ def main():
     )
     # 모델
     parser.add_argument("--size", default="8M",
-                        choices=list(SMALL_CONFIGS.keys()),
+                        choices=list(MODEL_CONFIGS.keys()),
                         help="모델 사이즈 프리셋")
     parser.add_argument("--tokenizer", default="bbpe",
                         choices=list(TOKENIZER_PRESETS.keys()),
@@ -1067,10 +1283,27 @@ def main():
     parser.add_argument("--int8_backend", default="triton", choices=["triton", "cuda"],
                         help="INT8 BitLinear backend 선택")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--mamba_version", type=int, default=1, choices=[1, 2],
+                        help="Mamba 버전 (1=Mamba-1 selective scan, 2=Mamba-2 SSD chunk-parallel)")
     parser.add_argument("--num_workers", type=int, default=4,
                         help="DataLoader worker 수 (0=메인 프로세스만)")
     parser.add_argument("--microbatch_size", type=int, default=0,
                         help="forward/backward 마이크로배치 크기 (0이면 비활성, batch_size는 그대로 유지)")
+
+    # 노이즈 (혼합형: 설정파일 + scale)
+    parser.add_argument("--noise_config", default=None,
+                        help="노이즈 설정 JSON 파일 경로 (미지정 시 NoiseConfig 기본값 사용)")
+    parser.add_argument("--noise_scale", type=float, default=1.0,
+                        help="전역 노이즈 스케일 (text/token 공통 배율, 1.0=기본)")
+    parser.add_argument("--noise_scale_text", type=float, default=1.0,
+                        help="텍스트 레벨 노이즈 스케일 배율")
+    parser.add_argument("--noise_scale_token", type=float, default=1.0,
+                        help="토큰 레벨 노이즈 스케일 배율")
+
+    parser.add_argument("--use_korean_errors", action="store_true", default=True,
+                        help="한국어 오류 생성 모듈 사용")
+    parser.add_argument("--no_korean_errors", action="store_false", dest="use_korean_errors",
+                        help="한국어 오류 생성 모듈 비활성화")
 
     # 원문 참조력 실험 (Trial A & B 기본 적용)
     parser.add_argument("--source_bias", type=float, default=0.5,

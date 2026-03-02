@@ -128,6 +128,8 @@ MISSPELLING_MAP: dict[str, list[str]] = {
 }
 
 
+import re
+
 def apply_misspelling(text: str, rng: random.Random) -> Optional[str]:
     """
     텍스트에서 올바른 표현을 찾아 잘못된 표현으로 치환.
@@ -139,18 +141,18 @@ def apply_misspelling(text: str, rng: random.Random) -> Optional[str]:
     Returns:
         오류가 적용된 문장. 적용 가능한 패턴이 없으면 None.
     """
-    candidates: list[tuple[str, list[str]]] = []
+    candidates = []
     for correct, wrongs in MISSPELLING_MAP.items():
         if correct in text:
-            candidates.append((correct, wrongs))
+            for match in re.finditer(f"(?<![가-힣]){correct}", text):
+                for wrong in wrongs:
+                    candidates.append((match.start(), match.end(), wrong))
 
     if not candidates:
         return None
 
-    correct, wrongs = rng.choice(candidates)
-    wrong = rng.choice(wrongs)
-    # 첫 번째 등장만 치환 (같은 문장에 여러 번 나올 경우 하나만)
-    return text.replace(correct, wrong, 1)
+    start, end, wrong = rng.choice(candidates)
+    return text[:start] + wrong + text[end:]
 
 
 def get_error_count() -> int:
