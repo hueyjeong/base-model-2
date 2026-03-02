@@ -5,6 +5,7 @@
 """
 
 import random
+import re
 from typing import Optional
 
 
@@ -117,9 +118,16 @@ def apply_vowel_confusion(text: str, rng: random.Random) -> Optional[str]:
     strategy = rng.choice(strategies)
 
     if strategy == "word":
-        correct, wrong = rng.choice([(c, w) for c, ws in all_maps.items()
-                                      if c in text for w in ws])
-        return text.replace(correct, wrong, 1)
+        candidates = []
+        for c, ws in all_maps.items():
+            if c in text:
+                for m in re.finditer(f"(?<![가-힣]){c}", text):
+                    for w in ws:
+                        candidates.append((m.start(), m.end(), w))
+        if not candidates:
+            return None
+        start, end, wrong = rng.choice(candidates)
+        return text[:start] + wrong + text[end:]
     else:
         idx = rng.choice(char_candidates)
         chars = list(text)
