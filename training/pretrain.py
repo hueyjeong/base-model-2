@@ -1121,7 +1121,7 @@ def train(args):
             scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             # Skip step if grad_norm is severely blown up (loss spike detection)
-            if math.isnan(grad_norm.item()) or grad_norm.item() > args.grad_clip * 5.0:
+            if math.isnan(grad_norm.item()) or grad_norm.item() > args.grad_clip * 100.0:
                 if global_rank == 0:
                     print(f"  ⚠️ Warning: Loss spike detected (grad_norm={grad_norm.item():.2f}). Skipping step {global_step}.")
                 optimizer.zero_grad(set_to_none=True)
@@ -1131,7 +1131,7 @@ def train(args):
                 scaler.update()
         else:
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            if math.isnan(grad_norm.item()) or grad_norm.item() > args.grad_clip * 5.0:
+            if math.isnan(grad_norm.item()) or grad_norm.item() > args.grad_clip * 100.0:
                 if global_rank == 0:
                     print(f"  ⚠️ Warning: Loss spike detected (grad_norm={grad_norm.item():.2f}). Skipping step {global_step}.")
             else:
