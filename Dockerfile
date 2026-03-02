@@ -4,7 +4,7 @@ FROM nvidia/cuda:12.8.0-devel-ubuntu24.04
 # 컨테이너 내 상호작용 프롬프트 무시
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
-ENV PIP_NO_CACHE_DIR=1
+# ENV PIP_NO_CACHE_DIR=1
 
 # CUDA 12.8 경로 설정
 ENV PATH=/usr/local/cuda-12.8/bin${PATH:+:${PATH}}
@@ -58,22 +58,28 @@ ENV PATH="/workspace/base-model-2/.venv/bin:$PATH"
 RUN pip config --user set global.index-url https://mirror.kakao.com/pypi/simple
 RUN pip config --user set global.trusted-host mirror.kakao.com
 
-RUN echo 'Installing Requirement...' && \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    echo 'Installing Requirement...' && \
     pip install -r requirements.txt
 
-RUN echo 'Installing PyTorch...' && \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    echo 'Installing PyTorch...' && \
     pip install torch --index-url https://download.pytorch.org/whl/cu128
 
-RUN echo 'Installing Core Dependencies...' && \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    echo 'Installing Core Dependencies...' && \
     pip install wheel tokenizers transformers sentencepiece einops ninja packaging
 
-RUN echo 'Installing Mamba CUDA Kernels (causal-conv1d)...' && \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    echo 'Installing Mamba CUDA Kernels (causal-conv1d)...' && \
     pip install causal-conv1d
 
-RUN echo 'Installing Mamba CUDA Kernels (mamba_ssm)...' && \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    echo 'Installing Mamba CUDA Kernels (mamba_ssm)...' && \
     pip install mamba_ssm
 
-RUN echo 'Installing Mecab...' && \
+RUN --mount=type=cache,target=/root/.cache/pip \
+    echo 'Installing Mecab...' && \
     pip install mecab-python3 mecab-ko-dic gdown
 
 
