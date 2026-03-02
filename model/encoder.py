@@ -2,6 +2,10 @@
 
 인코더 구조 (per layer):
     x → Mamba → (+residual) → RMSNorm → BitNet FFN → (+residual) → RMSNorm
+
+Mamba 버전 선택:
+    mamba_version=1: Mamba-1 (selective scan, d_state=16)
+    mamba_version=2: Mamba-2 SSD (chunk-parallel, d_state=128)
 """
 import torch
 import torch.nn as nn
@@ -65,15 +69,31 @@ class EncoderLayer(nn.Module):
         d_ff: int,
         dropout: float = 0.1,
         rms_norm_eps: float = 1e-6,
+        mamba_version: int = 1,
+        headdim: int = 64,
+        ngroups: int = 1,
+        chunk_size: int = 256,
     ):
         super().__init__()
-        self.mamba = MambaBlock(
-            d_model=d_model,
-            d_inner=d_inner,
-            d_state=d_state,
-            d_conv=d_conv,
-            dt_rank=dt_rank,
-        )
+        if mamba_version == 2:
+            from model.mamba2_block import Mamba2Block
+            self.mamba = Mamba2Block(
+                d_model=d_model,
+                d_inner=d_inner,
+                d_state=d_state,
+                d_conv=d_conv,
+                headdim=headdim,
+                ngroups=ngroups,
+                chunk_size=chunk_size,
+            )
+        else:
+            self.mamba = MambaBlock(
+                d_model=d_model,
+                d_inner=d_inner,
+                d_state=d_state,
+                d_conv=d_conv,
+                dt_rank=dt_rank,
+            )
         self.norm1 = RMSNorm(d_model, eps=rms_norm_eps)
         self.ffn = BitNetFFN(d_model, d_ff, dropout=dropout)
         self.norm2 = RMSNorm(d_model, eps=rms_norm_eps)
@@ -116,6 +136,10 @@ class Encoder(nn.Module):
         d_ff: int,
         dropout: float = 0.1,
         rms_norm_eps: float = 1e-6,
+        mamba_version: int = 1,
+        headdim: int = 64,
+        ngroups: int = 1,
+        chunk_size: int = 256,
     ):
         super().__init__()
         self.gradient_checkpointing = False
@@ -129,6 +153,10 @@ class Encoder(nn.Module):
                 d_ff=d_ff,
                 dropout=dropout,
                 rms_norm_eps=rms_norm_eps,
+                mamba_version=mamba_version,
+                headdim=headdim,
+                ngroups=ngroups,
+                chunk_size=chunk_size,
             )
             for _ in range(n_layers)
         ])

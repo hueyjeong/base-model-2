@@ -57,9 +57,13 @@ class BitMambaSeq2Seq(nn.Module):
             d_ff=config.d_ff,
             dropout=config.dropout,
             rms_norm_eps=config.rms_norm_eps,
+            mamba_version=config.mamba_version,
+            headdim=config.headdim,
+            ngroups=config.ngroups,
+            chunk_size=config.chunk_size,
         )
 
-        # --- 디코더 (Cross-Attention 없음, Mamba concat 방식) ---
+        # --- 디코더 ---
         self.decoder = Decoder(
             n_layers=config.n_decoder_layers,
             d_model=config.d_model,
@@ -70,6 +74,10 @@ class BitMambaSeq2Seq(nn.Module):
             d_ff=config.d_ff,
             dropout=config.dropout,
             rms_norm_eps=config.rms_norm_eps,
+            mamba_version=config.mamba_version,
+            headdim=config.headdim,
+            ngroups=config.ngroups,
+            chunk_size=config.chunk_size,
         )
 
         # --- 최종 정규화 ---

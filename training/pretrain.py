@@ -392,6 +392,41 @@ def resolve_noise_config_from_args(args) -> NoiseConfig:
     return NoiseConfig(**values)
 
 
+class CUDAPrefetcher:
+    """별도 CUDA stream에서 다음 배치를 미리 GPU로 전송하여 연산/전송 오버랩.
+
+    사용법:
+        prefetcher = CUDAPrefetcher(device, next_batch_fn)
+        for step in range(max_steps):
+            batch = prefetcher.next()  # GPU 텐서, 이미 전송 완료
+    """
+
+    def __init__(self, device: torch.device, next_batch_fn):
+        self.device = device
+        self.stream = torch.cuda.Stream()
+        self.next_batch_fn = next_batch_fn
+        self.next_data: dict | None = None
+
+    def preload(self):
+        """다음 배치를 별도 stream에서 GPU로 비동기 전송 시작."""
+        batch = self.next_batch_fn()
+        with torch.cuda.stream(self.stream):
+            gpu_batch = {}
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    gpu_batch[k] = v.to(self.device, non_blocking=True)
+                else:
+                    gpu_batch[k] = v
+            self.next_data = gpu_batch
+
+    def next(self) -> dict:
+        """프리로드된 배치 반환 + 즉시 다음 배치 프리로드 시작."""
+        torch.cuda.current_stream().wait_stream(self.stream)
+        data = self.next_data
+        self.preload()
+        return data
+
+
 def train(args):
     # DDP 초기화
     is_distributed = int(os.environ.get("WORLD_SIZE", 1)) > 1
@@ -425,12 +460,29 @@ def train(args):
     model_kwargs["vocab_size"] = tokenizer.vocab_size
     model_kwargs["bos_id"] = tokenizer.bos_id  # Document isolation: BOS 위치에서 SSM state 리셋
     model_kwargs["use_copy_gate"] = args.use_copy_gate
+
+    # Mamba 버전 선택
+    model_kwargs["mamba_version"] = args.mamba_version
+    if args.mamba_version == 2:
+        # Mamba-2 SSD 기본값 적용 (MODEL_CONFIGS에서 명시적으로 지정하지 않은 경우)
+        model_kwargs.setdefault("d_state", 128)
+        model_kwargs.setdefault("headdim", 64)
+        model_kwargs.setdefault("ngroups", 1)
+        model_kwargs.setdefault("chunk_size", 256)
+        # Mamba-2에서 d_state 기본값이 16이면 128로 변경
+        if model_kwargs["d_state"] == 16:
+            model_kwargs["d_state"] = 128
+
     config = BitMambaSeq2SeqConfig(**model_kwargs)
 
     if global_rank == 0:
-        print(f"\n모델 설정: {args.size}")
+        mamba_label = "Mamba-2 SSD" if config.mamba_version == 2 else "Mamba-1"
+        print(f"\n모델 설정: {args.size} ({mamba_label})")
         print(f"  d_model={config.d_model}, enc={config.n_encoder_layers}, "
               f"dec={config.n_decoder_layers}")
+        if config.mamba_version == 2:
+            print(f"  Mamba-2: d_state={config.d_state}, headdim={config.headdim}, "
+                  f"ngroups={config.ngroups}, chunk_size={config.chunk_size}")
 
     # ── 체크포인트 메타 선행 로드 (CPU, GPU 할당 없음) ──
     start_step = 0
@@ -843,19 +895,31 @@ def train(args):
             "shape": (tuple(warm_src.shape), tuple(warm_tgt.shape), tuple(warm_mask.shape)),
         }
 
+    # ── CUDA Prefetcher: 데이터 전송과 연산 오버랩 ──
+    if torch.cuda.is_available():
+        prefetcher = CUDAPrefetcher(device, _next_batch)
+        prefetcher.preload()  # 첫 배치 프리로드
+        if global_rank == 0:
+            print("🚀 CUDA Prefetcher 활성화 (non_blocking + stream 오버랩)")
+    else:
+        prefetcher = None
+
     while global_step < args.max_steps and not training_done:
         # gradient accumulation 루프
         for accum_i in range(args.grad_accum_steps):
-            batch = _next_batch()
+            if prefetcher is not None:
+                batch = prefetcher.next()  # 이미 GPU 텐서
+            else:
+                batch = _next_batch()
 
-            src_ids = batch["src_ids"].to(device)  # (B, src_len)
-            tgt_ids = batch["tgt_ids"].to(device)  # (B, tgt_len)
-            src_mask = batch["src_mask"].to(device)  # (B, src_len)
+            src_ids = batch["src_ids"] if prefetcher else batch["src_ids"].to(device)  # (B, src_len)
+            tgt_ids = batch["tgt_ids"] if prefetcher else batch["tgt_ids"].to(device)  # (B, tgt_len)
+            src_mask = batch["src_mask"] if prefetcher else batch["src_mask"].to(device)  # (B, src_len)
             src_weights = batch.get("src_weights")
-            if src_weights is not None:
+            if src_weights is not None and not prefetcher:
                 src_weights = src_weights.to(device)
             batch_chars = batch["n_chars"]
-            del batch  # CPU 텐서 참조 제거
+            del batch  # 텐서 참조 제거
 
             # Teacher forcing: 디코더 입력은 tgt_ids[:-1], 타겟은 tgt_ids[1:]
             tgt_input = tgt_ids[:, :-1]
@@ -1219,6 +1283,8 @@ def main():
     parser.add_argument("--int8_backend", default="triton", choices=["triton", "cuda"],
                         help="INT8 BitLinear backend 선택")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--mamba_version", type=int, default=1, choices=[1, 2],
+                        help="Mamba 버전 (1=Mamba-1 selective scan, 2=Mamba-2 SSD chunk-parallel)")
     parser.add_argument("--num_workers", type=int, default=4,
                         help="DataLoader worker 수 (0=메인 프로세스만)")
     parser.add_argument("--microbatch_size", type=int, default=0,

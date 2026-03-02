@@ -1,12 +1,13 @@
-"""Decoder — Mamba SSM + BitNet FFN 디코더 (Cross-Attention 없음)
+"""Decoder — Mamba SSM + BitNet FFN 디코더 (Linear Cross-Attention)
 
 디코더 구조 (per layer):
     x → Mamba → (+residual) → RMSNorm
+      → Linear Cross-Attention → (+residual) → RMSNorm
       → BitNet FFN → (+residual) → RMSNorm
 
-Cross-Attention 대신 encoder 출력을 decoder 입력에 concat하여
-Mamba의 recurrent state를 통해 encoder 정보를 전달.
-seq2seq.py에서 concat/slice 처리.
+Mamba 버전 선택:
+    mamba_version=1: Mamba-1 (selective scan, d_state=16)
+    mamba_version=2: Mamba-2 SSD (chunk-parallel, d_state=128)
 """
 import torch
 import torch.nn as nn
@@ -29,16 +30,32 @@ class DecoderLayer(nn.Module):
         d_ff: int,
         dropout: float = 0.1,
         rms_norm_eps: float = 1e-6,
+        mamba_version: int = 1,
+        headdim: int = 64,
+        ngroups: int = 1,
+        chunk_size: int = 256,
     ):
         super().__init__()
         # Mamba SSM
-        self.mamba = MambaBlock(
-            d_model=d_model,
-            d_inner=d_inner,
-            d_state=d_state,
-            d_conv=d_conv,
-            dt_rank=dt_rank,
-        )
+        if mamba_version == 2:
+            from model.mamba2_block import Mamba2Block
+            self.mamba = Mamba2Block(
+                d_model=d_model,
+                d_inner=d_inner,
+                d_state=d_state,
+                d_conv=d_conv,
+                headdim=headdim,
+                ngroups=ngroups,
+                chunk_size=chunk_size,
+            )
+        else:
+            self.mamba = MambaBlock(
+                d_model=d_model,
+                d_inner=d_inner,
+                d_state=d_state,
+                d_conv=d_conv,
+                dt_rank=dt_rank,
+            )
         self.norm1 = RMSNorm(d_model, eps=rms_norm_eps)
 
         # BitNet FFN
@@ -115,6 +132,10 @@ class Decoder(nn.Module):
         d_ff: int,
         dropout: float = 0.1,
         rms_norm_eps: float = 1e-6,
+        mamba_version: int = 1,
+        headdim: int = 64,
+        ngroups: int = 1,
+        chunk_size: int = 256,
     ):
         super().__init__()
         self.gradient_checkpointing = False
@@ -128,6 +149,10 @@ class Decoder(nn.Module):
                 d_ff=d_ff,
                 dropout=dropout,
                 rms_norm_eps=rms_norm_eps,
+                mamba_version=mamba_version,
+                headdim=headdim,
+                ngroups=ngroups,
+                chunk_size=chunk_size,
             )
             for _ in range(n_layers)
         ])
