@@ -542,7 +542,7 @@ def train(args):
     dataset = StreamingPackedDataset(
         args.corpus, tokenizer, noiser,
         pack_size=args.pack_size,
-        d_conv=config.d_conv,  # Document isolation: Conv1d 격리용 PAD gap
+        d_conv=0 if config.mamba_version == 2 else config.d_conv,  # Mamba-2: seq_idx 네이티브, gap 불필요
         text_key=args.text_key, lang_key=args.lang_key,
         seed=args.seed,
         rank=global_rank,
@@ -556,7 +556,7 @@ def train(args):
         val_dataset = StreamingPackedDataset(
             args.val_corpus, tokenizer, noiser,
             pack_size=args.pack_size,
-            d_conv=config.d_conv,  # Document isolation: Conv1d 격리용 PAD gap
+            d_conv=0 if config.mamba_version == 2 else config.d_conv,  # Mamba-2: seq_idx 네이티브, gap 불필요
             text_key=args.text_key, lang_key=args.lang_key,
             seed=args.seed + 1,  # 학습과 다른 시드
             rank=global_rank,

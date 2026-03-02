@@ -129,20 +129,24 @@ class StreamingPackedDataset(IterableDataset):
         """(noised_ids, target_ids, n_chars, src_weights) 스트림을 pack_size까지 이어붙이기
 
         noised_ids, target_ids, src_weights 모두 이미 [BOS]...[EOS] 등 특수토큰 포함 상태.
-        패킹은 단순 연결: [BOS]s1[EOS] [PAD gap] [BOS]s2[EOS]...
-        Document isolation: Conv1d 격리를 위해 문서 사이에 d_conv개의 PAD 삽입.
+        패킹은 단순 연결: [BOS]s1[EOS] [BOS]s2[EOS]...
+
+        Document isolation:
+          - Mamba-1 (d_conv > 0): Conv1d 격리를 위해 문서 사이에 d_conv개의 PAD 삽입
+          - Mamba-2 (d_conv = 0): seq_idx가 conv1d + SSM 경계를 네이티브 처리, gap 불필요
         """
         src_buf = []
         tgt_buf = []
         weight_buf = []
         char_buf = 0
         pad_id = self.tokenizer.pad_id
-        gap = [pad_id] * self.d_conv  # Conv1d 커널 크기만큼 PAD 삽입
-        gap_weights = [0.0] * self.d_conv
+        use_gap = self.d_conv > 0
+        gap = [pad_id] * self.d_conv if use_gap else []
+        gap_weights = [0.0] * self.d_conv if use_gap else []
 
         for noised_ids, target_ids, n_chars, src_weights in noised_pairs:
-            # 이전 문서가 버퍼에 있으면 PAD gap 삽입 (Conv1d 격리)
-            if src_buf:
+            # 이전 문서가 버퍼에 있고 Mamba-1이면 PAD gap 삽입 (Conv1d 격리)
+            if src_buf and use_gap:
                 src_buf.extend(gap)
                 tgt_buf.extend(gap)
                 weight_buf.extend(gap_weights)
