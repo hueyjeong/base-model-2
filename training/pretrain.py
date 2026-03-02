@@ -431,8 +431,8 @@ def train(args):
     # DDP 초기화
     is_distributed = int(os.environ.get("WORLD_SIZE", 1)) > 1
     if is_distributed:
-        dist.init_process_group(backend="nccl")
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        dist.init_process_group(backend="nccl", device_id=torch.device("cuda", local_rank))
         global_rank = dist.get_rank()
         world_size = dist.get_world_size()
         torch.cuda.set_device(local_rank)
