@@ -1150,8 +1150,10 @@ def train(args):
                 print(f"\n  ✅ 문자 예산 도달: {format_chars(total_chars)} >= {format_chars(max_chars)}")
             training_done = True
 
-        # 검증
-        if val_loader is not None and args.val_every and global_step % args.val_every == 0:
+        # 검증 (warmup 이후 val_every 주기마다: warmup_steps + val_every * i)
+        _val_after_warmup = global_step >= args.warmup_steps
+        _val_on_tick = (global_step - args.warmup_steps) % args.val_every == 0
+        if val_loader is not None and args.val_every and _val_after_warmup and _val_on_tick:
             # TODO: 다중 GPU 환경에서 검증셋을 분산/수집하는 방법이 있지만, 우선 메인 프로세스에서만 검증
             if global_rank == 0:
                 val_loss, val_bpc, val_cer = validate(
