@@ -1165,8 +1165,10 @@ def train(args):
             if is_distributed:
                 dist.barrier()
 
-        # 체크포인트 저장
-        if args.save_dir and global_step % args.save_every == 0 and global_rank == 0:
+        # 체크포인트 저장 (warmup 이후 save_every 주기마다: warmup_steps + save_every * i)
+        _after_warmup = global_step >= args.warmup_steps
+        _on_save_tick = (global_step - args.warmup_steps) % args.save_every == 0
+        if args.save_dir and _after_warmup and _on_save_tick and global_rank == 0:
             os.makedirs(args.save_dir, exist_ok=True)
             ckpt_path = os.path.join(args.save_dir, f"step_{global_step}.pt")
             ckpt = {
