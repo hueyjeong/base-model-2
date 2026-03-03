@@ -85,16 +85,17 @@ class DecoderLayer(nn.Module):
         encoder_out: torch.Tensor | None = None,
         encoder_mask: torch.Tensor | None = None,
         reset_mask: torch.Tensor | None = None,
+        src_doc_ids: torch.Tensor | None = None,
+        tgt_doc_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
-            x: (batch, seq_len, d_model) — encoder_out + tgt가 concat된 시퀀스
-            encoder_out: (batch, src_len, d_model) - 인코더 파생 Context
+            x: (batch, seq_len, d_model)
+            encoder_out: (batch, src_len, d_model) - 인코더 Context
             encoder_mask: (batch, src_len) - 패딩 마스크
             reset_mask: (batch, seq_len) bool — True인 위치에서 SSM state 리셋
-
-        Returns:
-            (batch, seq_len, d_model)
+            src_doc_ids: (batch, src_len) int — 소스 문서 ID (cross-attn 문서 격리)
+            tgt_doc_ids: (batch, tgt_len) int — 타겟 문서 ID (cross-attn 문서 격리)
         """
         # 1. Mamba + residual
         residual = x
@@ -105,7 +106,8 @@ class DecoderLayer(nn.Module):
         # 2. Linear Cross Attention + residual
         if encoder_out is not None:
             residual = x
-            x = self.cross_attn(x, encoder_out, encoder_mask)
+            x = self.cross_attn(x, encoder_out, encoder_mask,
+                                src_doc_ids=src_doc_ids, tgt_doc_ids=tgt_doc_ids)
             x = self.dropout(x)
             x = self.norm_cross(residual + x)
 
@@ -163,21 +165,24 @@ class Decoder(nn.Module):
         encoder_out: torch.Tensor | None = None,
         encoder_mask: torch.Tensor | None = None,
         reset_mask: torch.Tensor | None = None,
+        src_doc_ids: torch.Tensor | None = None,
+        tgt_doc_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
-            x: (batch, seq_len, d_model) — concat[encoder_out, tgt_emb]
+            x: (batch, seq_len, d_model)
             encoder_out: 인코더 문맥 (B, src_len, d)
             encoder_mask: 인코더 패딩 (B, src_len)
             reset_mask: (batch, seq_len) bool — True인 위치에서 SSM state 리셋
-
-        Returns:
-            (batch, seq_len, d_model) — 전체 시퀀스, seq2seq.py에서 tgt 부분만 슬라이스
+            src_doc_ids: (batch, src_len) int — 소스 문서 ID
+            tgt_doc_ids: (batch, tgt_len) int — 타겟 문서 ID
         """
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
-                # use_reentrant=False args must be passed explicitly via kwargs for checkpoint
-                x = checkpoint(layer, x, encoder_out, encoder_mask, reset_mask, use_reentrant=False)
+                x = checkpoint(layer, x, encoder_out, encoder_mask, reset_mask,
+                               src_doc_ids, tgt_doc_ids, use_reentrant=False)
             else:
-                x = layer(x, encoder_out=encoder_out, encoder_mask=encoder_mask, reset_mask=reset_mask)
+                x = layer(x, encoder_out=encoder_out, encoder_mask=encoder_mask,
+                          reset_mask=reset_mask, src_doc_ids=src_doc_ids,
+                          tgt_doc_ids=tgt_doc_ids)
         return x

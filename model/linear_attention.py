@@ -197,12 +197,16 @@ class LinearCrossAttention(nn.Module):
         x: torch.Tensor,
         encoder_out: torch.Tensor,
         encoder_mask: torch.Tensor | None = None,
+        src_doc_ids: torch.Tensor | None = None,
+        tgt_doc_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
             x: 디코더 hidden state (B, tgt_len, d_model)
             encoder_out: 인코더 출력 (B, src_len, d_model)
             encoder_mask: 인코더 마스크 (B, src_len) - True가 유효 데이터
+            src_doc_ids: (B, src_len) int — 소스 문서 ID (BOS cumsum 기반)
+            tgt_doc_ids: (B, tgt_len) int — 타겟 문서 ID (BOS cumsum 기반)
         """
         B, tgt_len, _ = x.shape
         _, src_len, _ = encoder_out.shape
@@ -226,29 +230,16 @@ class LinearCrossAttention(nn.Module):
         q = elu_feature_map(q)
         k = elu_feature_map(k)
 
-        # 3. Apply Mask to K and V
-        mask_tensor = torch.empty(0, device=q.device, dtype=torch.bool)
+        # 3. Apply Mask to K and V (PAD masking)
         if encoder_mask is not None:
-            # (B, src_len) -> (B, 1, src_len, 1)
             mask_4d = encoder_mask.view(B, 1, src_len, 1).to(k.dtype)
             k = k * mask_4d
             v = v * mask_4d
-            mask_tensor = encoder_mask  # (B, src_len)
 
-        # 4. CUDA fused path or PyTorch fallback
-        use_cuda = (
-            HAS_CUDA_LINEAR_ATTN
-            and q.is_cuda
-            and self.d_head <= 64
-            and _env_flag("LINEAR_ATTN_CUDA", "0")  # PyTorch cuBLAS가 d_head≤64에서 더 빠름
-        )
-
-        if use_cuda:
-            try:
-                out = cuda_linear_cross_attn(q, k, v, mask_tensor, self.eps)
-            except Exception:
-                # Fallback to PyTorch
-                out = self._pytorch_forward(q, k, v, self.eps)
+        # 4. Compute attention
+        if src_doc_ids is not None and tgt_doc_ids is not None:
+            # Per-document isolation: 각 문서의 context matrix를 따로 계산
+            out = self._doc_isolated_forward(q, k, v, src_doc_ids, tgt_doc_ids, self.eps)
         else:
             out = self._pytorch_forward(q, k, v, self.eps)
 
@@ -261,14 +252,44 @@ class LinearCrossAttention(nn.Module):
 
     @staticmethod
     def _pytorch_forward(q, k, v, eps):
-        """PyTorch fallback (CUDA 미지원/비활성 시)"""
-        # context = K^T V  (B, h, d, d)
+        """전체 소스를 하나의 context로 사용 (문서 격리 없음)"""
         kv = torch.matmul(k.transpose(-1, -2), v)
-        # z = sum(K)  (B, h, d)
         z = k.sum(dim=-2)
-        # num = Q @ context  (B, h, tgt, d)
         num = torch.matmul(q, kv)
-        # den = Q · z  (B, h, tgt)
         den = torch.einsum("bhld,bhd->bhl", q, z)
-        # output
         return num / (den.unsqueeze(-1) + eps)
+
+    @staticmethod
+    def _doc_isolated_forward(q, k, v, src_doc_ids, tgt_doc_ids, eps):
+        """Per-document linear cross-attention
+
+        각 문서별로 context = K_d^T @ V_d를 따로 계산하여
+        decoder의 문서 d 위치는 encoder의 문서 d 정보만 참조.
+
+        Context matrix가 d_head × d_head (64×64 = 16KB)로 매우 작아
+        문서 수만큼 루프해도 오버헤드 최소.
+        """
+        out = torch.zeros_like(q)
+        max_doc = max(src_doc_ids.max().item(), tgt_doc_ids.max().item()) + 1
+
+        for d in range(int(max_doc)):
+            # Source positions for doc d
+            src_mask_d = (src_doc_ids == d).unsqueeze(1).unsqueeze(-1).to(k.dtype)
+            k_d = k * src_mask_d
+            v_d = v * src_mask_d
+
+            # Context for doc d
+            context_d = torch.matmul(k_d.transpose(-1, -2), v_d)  # (B, H, D, D)
+            z_d = k_d.sum(dim=-2)  # (B, H, D)
+
+            # Output using doc d's context
+            num_d = torch.matmul(q, context_d)
+            den_d = torch.einsum("bhld,bhd->bhl", q, z_d)
+            out_d = num_d / (den_d.unsqueeze(-1) + eps)
+
+            # Apply only to tgt positions belonging to doc d
+            tgt_mask_d = (tgt_doc_ids == d).unsqueeze(1).unsqueeze(-1).to(out_d.dtype)
+            out = out + out_d * tgt_mask_d
+
+        return out
+

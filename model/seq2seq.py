@@ -176,6 +176,10 @@ class BitMambaSeq2Seq(nn.Module):
         # Document isolation: BOS 위치에서 SSM state 리셋
         reset_mask = (tgt_ids == self.config.bos_id)  # (B, tgt_len)
 
+        # Cross-attention 문서 격리: 각 문서별로 context matrix 분리
+        src_doc_ids = (src_ids == self.config.bos_id).int().cumsum(dim=1) - 1  # (B, src_len)
+        tgt_doc_ids = reset_mask.int().cumsum(dim=1) - 1  # (B, tgt_len)
+
         # 타겟 임베딩 (FP16 → FP32 변환)
         tgt_emb = self.decoder_embedding(tgt_ids).float() * self.embed_scale
         tgt_emb = self.embed_dropout(tgt_emb)
@@ -188,7 +192,8 @@ class BitMambaSeq2Seq(nn.Module):
 
         # 디코더 스택 (Target Embedding만 Mamba로 들어가고, encoder_out은 Linear Cross-Attention으로 전달됨)
         x = self.decoder(tgt_emb, encoder_out=encoder_out, encoder_mask=encoder_mask,
-                         reset_mask=reset_mask)
+                         reset_mask=reset_mask, src_doc_ids=src_doc_ids,
+                         tgt_doc_ids=tgt_doc_ids)
 
         # 최종 정규화
         x = self.final_norm(x)
