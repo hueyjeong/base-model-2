@@ -7,7 +7,13 @@ memory/compute bottleneck of standard Softmax attention.
 Features:
 - Feature map phi(x) = elu(x) + 1 implementation for positive keys/queries
 - Custom CUDA fused kernel for K^T V + Q(K^T V) + normalization
+- Document-isolated CUDA kernel for per-doc context (scatter/gather 구조)
 - PyTorch exact fallback when CUDA kernel unavailable
+
+Doc-Isolated CUDA 커널 (cuda_doc_linear_attn_kernel.cu):
+  Phase 1 (scatter): context[d,i,j] += k[s,i]*v[s,j]  (블록 독점 → atomic 불필요)
+  Phase 2 (gather):  out[t,j] = q[t]·ctx[d_t,:,j] / (q[t]·z[d_t]+eps)
+  → Python D-loop 없음, full-seq 중간 텐서 없음, O(seq_len) 메모리
 """
 import os
 import math
@@ -16,7 +22,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # =========================================================================
-# CUDA fused kernel (JIT compile on first use)
+# CUDA fused kernel (non-doc-isolated: JIT compile on first use)
 # =========================================================================
 _CUDA_LINEAR_ATTN = None
 
@@ -40,6 +46,34 @@ def _load_cuda_linear_attn():
         verbose=False,
     )
     return _CUDA_LINEAR_ATTN
+
+
+# =========================================================================
+# CUDA doc-isolated kernel (JIT compile on first use)
+# =========================================================================
+_CUDA_DOC_LINEAR_ATTN = None
+
+
+def _load_cuda_doc_linear_attn():
+    """doc-isolated scatter/gather CUDA 커널 로드"""
+    global _CUDA_DOC_LINEAR_ATTN
+    if _CUDA_DOC_LINEAR_ATTN is not None:
+        return _CUDA_DOC_LINEAR_ATTN
+
+    from torch.utils.cpp_extension import load
+
+    this_dir = os.path.dirname(__file__)
+    cpp_src = os.path.join(this_dir, "cuda_doc_linear_attn_ext.cpp")
+    cu_src  = os.path.join(this_dir, "cuda_doc_linear_attn_kernel.cu")
+
+    _CUDA_DOC_LINEAR_ATTN = load(
+        name="doc_linear_attn_cuda_ext",
+        sources=[cpp_src, cu_src],
+        extra_cflags=["-O3"],
+        extra_cuda_cflags=["-O3", "--use_fast_math"],
+        verbose=False,
+    )
+    return _CUDA_DOC_LINEAR_ATTN
 
 
 def _env_flag(name: str, default: str = "1") -> bool:
@@ -141,6 +175,104 @@ def cuda_linear_cross_attn(q, k, v, mask, eps=1e-5):
 
 
 # =========================================================================
+# Doc-Isolated Linear Cross-Attention — CUDA scatter/gather autograd Function
+# =========================================================================
+
+class _DocLinearAttnFn(torch.autograd.Function):
+    """Document-isolated linear cross-attention with CUDA forward + backward.
+
+    Forward:
+      Phase 1 (scatter): context[b,h,d,i,j] = Σ_{s: doc==d} k[s,i]*v[s,j]
+                         z[b,h,d,i]         = Σ_{s: doc==d} k[s,i]
+      Phase 2 (gather):  out[b,h,t,j] = q[t]·ctx[d_t,:,j] / (q[t]·z[d_t,:]+eps)
+
+      Python loop 없음. 중간에 full (B,H,T,d) 텐서 D개 생성 안 함.
+
+    Backward:
+      grad_context = scatter(q/den, grad_out, tgt_ids)
+      grad_z       = -scatter_sum((alpha/den)*q, tgt_ids)
+      grad_k, grad_v from grad_context, grad_z (CUDA kernel)
+      grad_q                                   (CUDA kernel)
+    """
+
+    @staticmethod
+    def forward(ctx, q, k, v, src_doc_ids, tgt_doc_ids, max_docs, eps):
+        """
+        q: (B, H, tgt_len, d) — float32, phi(Q) 적용 후
+        k: (B, H, src_len, d) — float32, phi(K) + mask 적용 후
+        v: (B, H, src_len, d) — float32
+        src_doc_ids: (B, src_len) int32
+        tgt_doc_ids: (B, tgt_len) int32
+        """
+        ext = _load_cuda_doc_linear_attn()
+
+        # Phase 1: context, z 구성
+        context, z = ext.doc_scatter_kv_fwd(k, v, src_doc_ids, max_docs)
+        # context: (B*H, max_docs, d, d),  z: (B*H, max_docs, d)
+
+        # Phase 2: 출력 및 denominator 계산
+        out, den = ext.doc_gather_query_fwd(q, context, z, tgt_doc_ids, eps)
+        # out: (B, H, tgt_len, d),  den: (B, H, tgt_len)
+
+        ctx.save_for_backward(q, k, v, context, z, out, den)
+        ctx.src_doc_ids = src_doc_ids
+        ctx.tgt_doc_ids = tgt_doc_ids
+        ctx.max_docs    = max_docs
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        q, k, v, context, z, out, den = ctx.saved_tensors
+        src_doc_ids = ctx.src_doc_ids
+        tgt_doc_ids = ctx.tgt_doc_ids
+        max_docs    = ctx.max_docs
+        ext = _load_cuda_doc_linear_attn()
+
+        # ─── grad_context, grad_z 구성 ────────────────────────────────────
+        # grad_context[b,h,d,i,j] = Σ_{t: d_t==d} (q[t,i]/den[t]) * go[t,j]
+        # = scatter( q/den[t], go, tgt_doc_ids )  -- Phase 1 시그니처 재활용
+        den_exp = den.unsqueeze(-1)                       # (B,H,tgt_len,1)
+        q_den   = (q / den_exp).contiguous()
+        grad_out_c = grad_out.contiguous()
+
+        grad_ctx, _ = ext.doc_scatter_kv_fwd(q_den, grad_out_c, tgt_doc_ids, max_docs)
+        # _ 은 z와 같은 시그니처이지만 grad_z 계산에는 별도 필요
+
+        # grad_z[b,h,d,i] = -Σ_{t: d_t==d} (alpha[t]/den[t]) * q[t,i]
+        # alpha[t] = Σ_j go[t,j]*out[t,j]
+        alpha   = (grad_out * out).sum(dim=-1, keepdim=True)  # (B,H,tgt_len,1)
+        q_den_alpha = (alpha / den_exp * q).contiguous()       # (B,H,tgt_len,d)
+
+        # scatter sum: z 대신 z-형태 텐서로 scatter_sum 필요
+        # → doc_scatter_kv_fwd(q_den_alpha, ones) 하면 context_part는 불필요 행렬곱이므로
+        #   순수 PyTorch scatter_add로 grad_z를 직접 계산
+        B, H, tgt_len, d_head = q.shape
+        BH = B * H
+        grad_z = torch.zeros(BH, max_docs, d_head,
+                             dtype=q.dtype, device=q.device)
+        # tgt_doc_ids: (B, tgt_len) → expand to (B*H, tgt_len)
+        doc_exp = tgt_doc_ids.unsqueeze(1).expand(B, H, tgt_len).reshape(BH, tgt_len)
+        doc_exp_d = doc_exp.unsqueeze(-1).expand(BH, tgt_len, d_head)  # (BH,T,d)
+        grad_z.scatter_add_(1,                                          # dim=docs
+                            doc_exp_d.long(),
+                            -q_den_alpha.reshape(BH, tgt_len, d_head))
+
+        # ─── grad_k, grad_v ────────────────────────────────────────────────
+        grad_k, grad_v = ext.doc_backward_kv(k, v, grad_ctx, grad_z, src_doc_ids)
+
+        # ─── grad_q ────────────────────────────────────────────────────────
+        grad_q = ext.doc_backward_q(q, context, z, out, den,
+                                    grad_out_c, tgt_doc_ids)
+
+        return grad_q, grad_k, grad_v, None, None, None, None
+
+
+def cuda_doc_linear_attn(q, k, v, src_doc_ids, tgt_doc_ids, max_docs, eps=1e-5):
+    """Document-isolated linear cross-attention (CUDA scatter/gather, autograd 지원)"""
+    return _DocLinearAttnFn.apply(q, k, v, src_doc_ids, tgt_doc_ids, max_docs, eps)
+
+
+# =========================================================================
 # Module
 # =========================================================================
 
@@ -238,8 +370,28 @@ class LinearCrossAttention(nn.Module):
 
         # 4. Compute attention
         if src_doc_ids is not None and tgt_doc_ids is not None:
-            # Per-document isolation: 각 문서의 context matrix를 따로 계산
-            out = self._doc_isolated_forward(q, k, v, src_doc_ids, tgt_doc_ids, self.eps)
+            # CUDA doc-isolated scatter/gather 경로 (float32 필수)
+            q_f = q.float()
+            k_f = k.float()
+            v_f = v.float()
+            src_ids = src_doc_ids.to(torch.int32)
+            tgt_ids = tgt_doc_ids.to(torch.int32)
+            max_docs = int(max(src_ids.max().item(), tgt_ids.max().item())) + 1
+
+            if q_f.is_cuda:
+                try:
+                    out = cuda_doc_linear_attn(
+                        q_f, k_f, v_f, src_ids, tgt_ids, max_docs, self.eps
+                    ).to(q.dtype)
+                except Exception:
+                    # CUDA 커널 미빌드 시 PyTorch fallback
+                    out = self._doc_isolated_forward_pytorch(
+                        q_f, k_f, v_f, src_doc_ids, tgt_doc_ids, self.eps
+                    ).to(q.dtype)
+            else:
+                out = self._doc_isolated_forward_pytorch(
+                    q_f, k_f, v_f, src_doc_ids, tgt_doc_ids, self.eps
+                ).to(q.dtype)
         else:
             out = self._pytorch_forward(q, k, v, self.eps)
 
@@ -260,34 +412,27 @@ class LinearCrossAttention(nn.Module):
         return num / (den.unsqueeze(-1) + eps)
 
     @staticmethod
-    def _doc_isolated_forward(q, k, v, src_doc_ids, tgt_doc_ids, eps):
-        """Per-document linear cross-attention
+    def _doc_isolated_forward_pytorch(q, k, v, src_doc_ids, tgt_doc_ids, eps):
+        """CPU / CUDA 커널 미빌드 시 fallback — Python loop 기반.
 
-        각 문서별로 context = K_d^T @ V_d를 따로 계산하여
-        decoder의 문서 d 위치는 encoder의 문서 d 정보만 참조.
-
-        Context matrix가 d_head × d_head (64×64 = 16KB)로 매우 작아
-        문서 수만큼 루프해도 오버헤드 최소.
+        CUDA 커널과 동일한 결과를 내지만 Python loop(D회)를 사용하므로
+        배치 규모가 크면 느림. 정확도 검증 및 CPU 환경용.
         """
         out = torch.zeros_like(q)
-        max_doc = max(src_doc_ids.max().item(), tgt_doc_ids.max().item()) + 1
+        max_doc = int(max(src_doc_ids.max().item(), tgt_doc_ids.max().item())) + 1
 
-        for d in range(int(max_doc)):
-            # Source positions for doc d
+        for d in range(max_doc):
             src_mask_d = (src_doc_ids == d).unsqueeze(1).unsqueeze(-1).to(k.dtype)
             k_d = k * src_mask_d
             v_d = v * src_mask_d
 
-            # Context for doc d
-            context_d = torch.matmul(k_d.transpose(-1, -2), v_d)  # (B, H, D, D)
-            z_d = k_d.sum(dim=-2)  # (B, H, D)
+            context_d = torch.matmul(k_d.transpose(-1, -2), v_d)
+            z_d = k_d.sum(dim=-2)
 
-            # Output using doc d's context
             num_d = torch.matmul(q, context_d)
             den_d = torch.einsum("bhld,bhd->bhl", q, z_d)
             out_d = num_d / (den_d.unsqueeze(-1) + eps)
 
-            # Apply only to tgt positions belonging to doc d
             tgt_mask_d = (tgt_doc_ids == d).unsqueeze(1).unsqueeze(-1).to(out_d.dtype)
             out = out + out_d * tgt_mask_d
 
