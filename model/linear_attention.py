@@ -52,27 +52,81 @@ def _load_cuda_linear_attn():
 # CUDA doc-isolated kernel (JIT compile on first use)
 # =========================================================================
 _CUDA_DOC_LINEAR_ATTN = None
+_FALLBACK_WARNED = False
+
+# 커널 버전 — 바뀌면 JIT 캐시 강제 무효화
+_KERNEL_VERSION = "v3_fused"
 
 
 def _load_cuda_doc_linear_attn():
-    """doc-isolated scatter/gather CUDA 커널 로드"""
+    """doc-isolated scatter/gather CUDA 커널 로드
+
+    - DDP 멀티프로세스: rank-0이 먼저 빌드 후 barrier, 나머지 rank는 로드만
+    - 버전 불일치 시 자동 재빌드 (stale cache 방지)
+    """
     global _CUDA_DOC_LINEAR_ATTN
     if _CUDA_DOC_LINEAR_ATTN is not None:
         return _CUDA_DOC_LINEAR_ATTN
 
+    import hashlib
     from torch.utils.cpp_extension import load
 
     this_dir = os.path.dirname(__file__)
     cpp_src = os.path.join(this_dir, "cuda_doc_linear_attn_ext.cpp")
     cu_src  = os.path.join(this_dir, "cuda_doc_linear_attn_kernel.cu")
 
-    _CUDA_DOC_LINEAR_ATTN = load(
-        name="doc_linear_attn_cuda_ext",
-        sources=[cpp_src, cu_src],
-        extra_cflags=["-O3"],
-        extra_cuda_cflags=["-O3", "--use_fast_math"],
-        verbose=False,
-    )
+    # DDP rank 결정
+    rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+    world = int(os.environ.get("LOCAL_WORLD_SIZE", os.environ.get("WORLD_SIZE", "1")))
+
+    # 소스 해시 기반 이름 — 소스가 바뀌면 자동 재빌드
+    src_hash = ""
+    for p in [cpp_src, cu_src]:
+        if os.path.exists(p):
+            with open(p, 'rb') as fh:
+                src_hash += hashlib.md5(fh.read()).hexdigest()
+    ext_name = f"doc_linear_attn_cuda_{hashlib.md5(src_hash.encode()).hexdigest()[:8]}"
+
+    if world > 1 and torch.distributed.is_initialized():
+        # rank 0이 먼저 빌드, 나머지는 대기
+        if rank == 0:
+            _CUDA_DOC_LINEAR_ATTN = load(
+                name=ext_name,
+                sources=[cpp_src, cu_src],
+                extra_cflags=["-O3"],
+                extra_cuda_cflags=["-O3", "--use_fast_math"],
+                verbose=False,
+            )
+        torch.distributed.barrier()
+        if rank != 0:
+            _CUDA_DOC_LINEAR_ATTN = load(
+                name=ext_name,
+                sources=[cpp_src, cu_src],
+                extra_cflags=["-O3"],
+                extra_cuda_cflags=["-O3", "--use_fast_math"],
+                verbose=False,
+            )
+    else:
+        _CUDA_DOC_LINEAR_ATTN = load(
+            name=ext_name,
+            sources=[cpp_src, cu_src],
+            extra_cflags=["-O3"],
+            extra_cuda_cflags=["-O3", "--use_fast_math"],
+            verbose=False,
+        )
+
+    # fused 커널 존재 여부 검증
+    if not hasattr(_CUDA_DOC_LINEAR_ATTN, 'doc_fused_forward'):
+        import warnings
+        warnings.warn(
+            f"CUDA doc-linear-attn extension '{ext_name}' "
+            f"lacks doc_fused_forward — stale cache? "
+            f"Run: rm -rf ~/.cache/torch_extensions/ and retry.",
+            RuntimeWarning,
+        )
+        _CUDA_DOC_LINEAR_ATTN = None
+        raise RuntimeError("Stale CUDA extension cache")
+
     return _CUDA_DOC_LINEAR_ATTN
 
 
@@ -327,8 +381,17 @@ class LinearCrossAttention(nn.Module):
                     out = cuda_doc_linear_attn(
                         q_f, k_f, v_f, src_ids, tgt_ids, max_docs, self.eps
                     ).to(q.dtype)
-                except Exception:
-                    # CUDA 커널 미빌드 시 PyTorch fallback
+                except Exception as e:
+                    # CUDA 커널 미빌드 시 PyTorch fallback — 경고 1회
+                    global _FALLBACK_WARNED
+                    if not _FALLBACK_WARNED:
+                        import warnings
+                        warnings.warn(
+                            f"CUDA doc-linear-attn 커널 실패, PyTorch loop fallback "
+                            f"사용 (느림). 오류: {e}",
+                            RuntimeWarning,
+                        )
+                        _FALLBACK_WARNED = True
                     out = self._doc_isolated_forward_pytorch(
                         q_f, k_f, v_f, src_doc_ids, tgt_doc_ids, self.eps
                     ).to(q.dtype)
