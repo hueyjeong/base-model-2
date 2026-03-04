@@ -1,6 +1,6 @@
 {
     "_comment": "noise_config 필드만 유지하세요. pretrain 우선순위: 기본값 -> 이 파일 override -> noise_scale 적용",
-    "korean_error_prob": 0.5,
+    "korean_error_prob": 0.3,
     "korean_error_count": 2,
     "spacing_noise_prob": 0.3,
     "spacing_remove_ratio": 0.3,
@@ -30,8 +30,8 @@
         "number_errors": 1.0,
         "grammar_remove": 1.0,
         "grammar_addition": 1.0,
-        "common_misspellings": 2.0,
-        "vowel_confusion": 1.0,
+        "common_misspellings": 1.0,
+        "vowel_confusion": 0.5,
         "consonant_errors": 0.5,
         "word_substitution": 0.5,
         "jamo_separation": 0.5,
