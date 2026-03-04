@@ -8,8 +8,9 @@ Doc-Isolated Linear Cross-Attention 전후 비교 벤치마크
   4. Peak GPU 메모리 (MB)
 
 실행:
-  /workspace/base-model-2/.venv/bin/python3 bench_doc_linear_attn.py
-  /workspace/base-model-2/.venv/bin/python3 bench_doc_linear_attn.py --B 2 --src 2048 --tgt 2048 --docs 40
+  source .venv/bin/activate
+  python bench_doc_linear_attn.py
+  python bench_doc_linear_attn.py --B 2 --src 2048 --tgt 2048 --docs 40
 """
 import argparse
 import time
@@ -86,16 +87,24 @@ def pytorch_loop(q, k, v, src_doc_ids, tgt_doc_ids, eps=1e-5):
     return out
 
 
-# ── CUDA scatter/gather 구현 (신규) ───────────────────────────────────
+# ── CUDA scatter/gather 구현 (v2 separate + v3 fused) ─────────────────
 cuda_fn = None
+cuda_fn_v2 = None   # v2 separate kernels (for comparison)
 if device.type == "cuda":
     try:
         import sys, os
         sys.path.insert(0, os.path.dirname(__file__))
         from model.linear_attention import cuda_doc_linear_attn, _load_cuda_doc_linear_attn
-        _load_cuda_doc_linear_attn()   # JIT compile
-        cuda_fn = cuda_doc_linear_attn
-        print("✔  CUDA doc-isolated 커널 로드 완료\n")
+        ext = _load_cuda_doc_linear_attn()   # JIT compile
+        cuda_fn = cuda_doc_linear_attn       # v3 fused (default)
+
+        # v2 separate kernels 래퍼 (비교용)
+        def _v2_separate_fn(q, k, v, src_ids, tgt_ids, max_docs=D, eps=1e-5):
+            ctx, z = ext.doc_scatter_kv_fwd(k, v, src_ids, max_docs)
+            out, den = ext.doc_gather_query_fwd(q, ctx, z, tgt_ids, eps)
+            return out
+        cuda_fn_v2 = _v2_separate_fn
+        print("✔  CUDA doc-isolated 커널 로드 완료 (v2 separate + v3 fused)\n")
     except Exception as e:
         print(f"⚠️  CUDA 커널 로드 실패: {e}")
         print("   PyTorch loop 방식만 측정합니다.\n")
@@ -172,9 +181,16 @@ if cuda_fn is not None and device.type == "cuda":
     ms_cu, mem_cu = measure(cuda_wrapper, args.warmup, args.iters, backward=(not args.no_bwd))
     speedup  = ms_pt / ms_cu
     mem_save = mem_pt - mem_cu
-    print(f"  [신규]  CUDA scatter/gather: {ms_cu:8.2f} ms  peak GPU: {mem_cu:7.1f} MB")
+    print(f"  [v3]    CUDA fused      : {ms_cu:8.2f} ms  peak GPU: {mem_cu:7.1f} MB")
     print()
-    print(f"  → 속도 {speedup:.2f}x  |  메모리 절감 {mem_save:+.1f} MB")
+    print(f"  → v3 속도 {speedup:.2f}x  |  메모리 절감 {mem_save:+.1f} MB")
+
+if cuda_fn_v2 is not None and device.type == "cuda":
+    def v2_wrapper(q, k, v, src_ids, tgt_ids):
+        return cuda_fn_v2(q, k, v, src_ids, tgt_ids)
+
+    ms_v2, mem_v2 = measure(v2_wrapper, args.warmup, args.iters, backward=False)
+    print(f"  [v2]    CUDA separate   : {ms_v2:8.2f} ms  peak GPU: {mem_v2:7.1f} MB  (fwd only, no autograd)")
 
 print()
 
@@ -187,6 +203,6 @@ if not args.no_bwd:
     if cuda_fn is not None and device.type == "cuda":
         ms_cu_f,  _ = measure(cuda_wrapper, args.warmup, args.iters, backward=False)
         speedup_f = ms_pt_f / ms_cu_f
-        print(f"  [신규]  CUDA scatter/gather: {ms_cu_f:8.2f} ms")
+        print(f"  [v3]    CUDA fused      : {ms_cu_f:8.2f} ms")
         print(f"  → Forward 속도 {speedup_f:.2f}x")
     print()

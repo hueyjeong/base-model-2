@@ -179,42 +179,21 @@ def cuda_linear_cross_attn(q, k, v, mask, eps=1e-5):
 # =========================================================================
 
 class _DocLinearAttnFn(torch.autograd.Function):
-    """Document-isolated linear cross-attention with CUDA forward + backward.
+    """Document-isolated linear cross-attention — Fused CUDA kernel.
 
-    Forward:
-      Phase 1 (scatter): context[b,h,d,i,j] = Σ_{s: doc==d} k[s,i]*v[s,j]
-                         z[b,h,d,i]         = Σ_{s: doc==d} k[s,i]
-      Phase 2 (gather):  out[b,h,t,j] = q[t]·ctx[d_t,:,j] / (q[t]·z[d_t,:]+eps)
-
-      Python loop 없음. 중간에 full (B,H,T,d) 텐서 D개 생성 안 함.
-
-    Backward:
-      grad_context = scatter(q/den, grad_out, tgt_ids)
-      grad_z       = -scatter_sum((alpha/den)*q, tgt_ids)
-      grad_k, grad_v from grad_context, grad_z (CUDA kernel)
-      grad_q                                   (CUDA kernel)
+    Grid = (B*H*max_docs,) 로 문서별 블록을 할당하여:
+      1. 블록 수 30x 증가 → GPU SM 점유율 대폭 상승
+      2. context가 smem에만 존재 → 글로벌 메모리 트래픽 제거
+      3. 단일 backward 커널: context 재계산 + grad 전부 smem 내 처리
+      4. autograd 저장 텐서: context/z 제거 → 11.5MB/layer 절약
     """
 
     @staticmethod
     def forward(ctx, q, k, v, src_doc_ids, tgt_doc_ids, max_docs, eps):
-        """
-        q: (B, H, tgt_len, d) — float32, phi(Q) 적용 후
-        k: (B, H, src_len, d) — float32, phi(K) + mask 적용 후
-        v: (B, H, src_len, d) — float32
-        src_doc_ids: (B, src_len) int32
-        tgt_doc_ids: (B, tgt_len) int32
-        """
         ext = _load_cuda_doc_linear_attn()
+        out, den = ext.doc_fused_forward(q, k, v, src_doc_ids, tgt_doc_ids, max_docs, eps)
 
-        # Phase 1: context, z 구성
-        context, z = ext.doc_scatter_kv_fwd(k, v, src_doc_ids, max_docs)
-        # context: (B*H, max_docs, d, d),  z: (B*H, max_docs, d)
-
-        # Phase 2: 출력 및 denominator 계산
-        out, den = ext.doc_gather_query_fwd(q, context, z, tgt_doc_ids, eps)
-        # out: (B, H, tgt_len, d),  den: (B, H, tgt_len)
-
-        ctx.save_for_backward(q, k, v, context, z, out, den)
+        ctx.save_for_backward(q, k, v, out, den)
         ctx.src_doc_ids = src_doc_ids
         ctx.tgt_doc_ids = tgt_doc_ids
         ctx.max_docs    = max_docs
@@ -222,53 +201,18 @@ class _DocLinearAttnFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        q, k, v, context, z, out, den = ctx.saved_tensors
-        src_doc_ids = ctx.src_doc_ids
-        tgt_doc_ids = ctx.tgt_doc_ids
-        max_docs    = ctx.max_docs
+        q, k, v, out, den = ctx.saved_tensors
         ext = _load_cuda_doc_linear_attn()
 
-        # ─── grad_context, grad_z 구성 ────────────────────────────────────
-        # grad_context[b,h,d,i,j] = Σ_{t: d_t==d} (q[t,i]/den[t]) * go[t,j]
-        # = scatter( q/den[t], go, tgt_doc_ids )  -- Phase 1 시그니처 재활용
-        den_exp = den.unsqueeze(-1)                       # (B,H,tgt_len,1)
-        q_den   = (q / den_exp).contiguous()
-        grad_out_c = grad_out.contiguous()
-
-        grad_ctx, _ = ext.doc_scatter_kv_fwd(q_den, grad_out_c, tgt_doc_ids, max_docs)
-        # _ 은 z와 같은 시그니처이지만 grad_z 계산에는 별도 필요
-
-        # grad_z[b,h,d,i] = -Σ_{t: d_t==d} (alpha[t]/den[t]) * q[t,i]
-        # alpha[t] = Σ_j go[t,j]*out[t,j]
-        alpha   = (grad_out * out).sum(dim=-1, keepdim=True)  # (B,H,tgt_len,1)
-        q_den_alpha = (alpha / den_exp * q).contiguous()       # (B,H,tgt_len,d)
-
-        # scatter sum: z 대신 z-형태 텐서로 scatter_sum 필요
-        # → doc_scatter_kv_fwd(q_den_alpha, ones) 하면 context_part는 불필요 행렬곱이므로
-        #   순수 PyTorch scatter_add로 grad_z를 직접 계산
-        B, H, tgt_len, d_head = q.shape
-        BH = B * H
-        grad_z = torch.zeros(BH, max_docs, d_head,
-                             dtype=q.dtype, device=q.device)
-        # tgt_doc_ids: (B, tgt_len) → expand to (B*H, tgt_len)
-        doc_exp = tgt_doc_ids.unsqueeze(1).expand(B, H, tgt_len).reshape(BH, tgt_len)
-        doc_exp_d = doc_exp.unsqueeze(-1).expand(BH, tgt_len, d_head)  # (BH,T,d)
-        grad_z.scatter_add_(1,                                          # dim=docs
-                            doc_exp_d.long(),
-                            -q_den_alpha.reshape(BH, tgt_len, d_head))
-
-        # ─── grad_k, grad_v ────────────────────────────────────────────────
-        grad_k, grad_v = ext.doc_backward_kv(k, v, grad_ctx, grad_z, src_doc_ids)
-
-        # ─── grad_q ────────────────────────────────────────────────────────
-        grad_q = ext.doc_backward_q(q, context, z, out, den,
-                                    grad_out_c, tgt_doc_ids)
-
-        return grad_q, grad_k, grad_v, None, None, None, None
+        grads = ext.doc_fused_backward(
+            q, k, v, out, den, grad_out.contiguous(),
+            ctx.src_doc_ids, ctx.tgt_doc_ids, ctx.max_docs
+        )
+        return grads[0], grads[1], grads[2], None, None, None, None
 
 
 def cuda_doc_linear_attn(q, k, v, src_doc_ids, tgt_doc_ids, max_docs, eps=1e-5):
-    """Document-isolated linear cross-attention (CUDA scatter/gather, autograd 지원)"""
+    """Document-isolated linear cross-attention (CUDA fused, autograd 지원)"""
     return _DocLinearAttnFn.apply(q, k, v, src_doc_ids, tgt_doc_ids, max_docs, eps)
 
 
