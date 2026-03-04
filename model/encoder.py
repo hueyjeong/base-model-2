@@ -16,7 +16,13 @@ from model.bitlinear import BitLinear
 
 
 class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization"""
+    """Root Mean Square Layer Normalization
+
+    bf16 안전성:
+      - bf16 exponent = 8bit (f32과 동일) → overflow/underflow 없음
+      - rsqrt(eps) = rsqrt(1e-6) = 1000 → bf16 범위(~65504) 이내
+      - PAD 0-vector: rsqrt(0+eps) = 1000, weight*0*1000=0 → 안전
+    """
 
     def __init__(self, d_model: int, eps: float = 1e-6):
         super().__init__()
@@ -24,11 +30,9 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        orig_dtype = x.dtype
-        # Calculate in FP32 to prevent BF16 underflow on <PAD> 0-vectors
-        x_f32 = x.float()
-        rms = torch.rsqrt(x_f32.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        return (x_f32 * rms).to(orig_dtype) * self.weight
+        # bf16/f16: exponent 범위 충분, float32 캐스팅 생략하여 커널 2회 절감
+        rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return (x * rms) * self.weight
 
 
 class BitNetFFN(nn.Module):

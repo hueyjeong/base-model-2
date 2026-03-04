@@ -180,6 +180,9 @@ class BitMambaSeq2Seq(nn.Module):
         src_doc_ids = (src_ids == self.config.bos_id).int().cumsum(dim=1) - 1  # (B, src_len)
         tgt_doc_ids = reset_mask.int().cumsum(dim=1) - 1  # (B, tgt_len)
 
+        # max_docs를 여기서 1회만 계산 (기존: 레이어당 2회 .item() sync × 12레이어 = 24회 sync → 1회로 감소)
+        max_docs = int(torch.max(src_doc_ids.max(), tgt_doc_ids.max()).item()) + 1
+
         # 타겟 임베딩 (FP16 → FP32 변환)
         tgt_emb = self.decoder_embedding(tgt_ids).float() * self.embed_scale
         tgt_emb = self.embed_dropout(tgt_emb)
@@ -193,7 +196,7 @@ class BitMambaSeq2Seq(nn.Module):
         # 디코더 스택 (Target Embedding만 Mamba로 들어가고, encoder_out은 Linear Cross-Attention으로 전달됨)
         x = self.decoder(tgt_emb, encoder_out=encoder_out, encoder_mask=encoder_mask,
                          reset_mask=reset_mask, src_doc_ids=src_doc_ids,
-                         tgt_doc_ids=tgt_doc_ids)
+                         tgt_doc_ids=tgt_doc_ids, max_docs=max_docs)
 
         # 최종 정규화
         x = self.final_norm(x)

@@ -88,8 +88,12 @@ class StreamingPackedDataset(IterableDataset):
         # 저장된 파일 순서가 있으면 복원 시 재사용 (re-shuffle 방지)
         self._resume_file_order = state.get("file_order") or None
 
-    def _iter_lines(self):
-        """파일에서 (text, lang) 한 줄씩 스트리밍"""
+    def _iter_lines(self, skip_worker_id: int | None = None, skip_total: int | None = None):
+        """파일에서 (text, lang) 한 줄씩 스트리밍
+        
+        skip_worker_id/skip_total 지정 시: json.loads를 할당된 라인에만 수행하여
+        worker 수 × 파싱 비용 절감. 지정하지 않으면 모든 라인 반환.
+        """
         if self._resume_file_order is not None:
             # 복원 모드: 저장된 순서 사용 (re-shuffle 금지)
             files = self._resume_file_order
@@ -100,6 +104,7 @@ class StreamingPackedDataset(IterableDataset):
                 self.rng.shuffle(files)
         self._last_file_order = list(files)  # state_dict 용 기록
 
+        line_idx = 0  # 유효 라인 카운터 (min_length 필터 이후)
         for fpath in files:
             is_jsonl = fpath.endswith(".jsonl") or fpath.endswith(".json")
             with open(fpath, "r", encoding="utf-8") as f:
@@ -108,11 +113,17 @@ class StreamingPackedDataset(IterableDataset):
                     if len(line) < self.min_length:
                         continue
 
+                    # Worker 분배: 할당되지 않은 라인은 json.loads 없이 건너뜀
+                    if skip_total is not None and line_idx % skip_total != skip_worker_id:
+                        line_idx += 1
+                        continue
+
                     lang = None
                     if is_jsonl:
                         try:
                             obj = json.loads(line)
                         except json.JSONDecodeError:
+                            line_idx += 1
                             continue
                         text = obj.get(self.text_key, line) if self.text_key else line
                         if self.lang_key:
@@ -121,9 +132,11 @@ class StreamingPackedDataset(IterableDataset):
                         text = line
 
                     if len(text) < self.min_length:
+                        line_idx += 1
                         continue
 
                     yield text, lang
+                    line_idx += 1
 
     def _pack_sequences(self, noised_pairs):
         """(noised_ids, target_ids, n_chars, src_weights) 스트림을 pack_size까지 이어붙이기
@@ -194,6 +207,9 @@ class StreamingPackedDataset(IterableDataset):
         
         DDP(world_size > 1)일 경우 전체 GPU가 데이터를 나눠서 처리하고,
         num_workers > 0일 때 각 worker가 또 다시 할당된 줄을 처리하도록 분할.
+        
+        Worker 분배가 _iter_lines() 내부에서 수행되어 json.loads 호출이
+        할당된 라인에만 발생 → worker 수 × 파싱 비용 절감.
         """
         worker_info = torch.utils.data.get_worker_info()
         worker_id = worker_info.id if worker_info else 0
@@ -209,12 +225,12 @@ class StreamingPackedDataset(IterableDataset):
             resume_line = self._resume_line
             if resume_line > 0:
                 self._resume_line = 0  # 다음 에폭에서는 정상 동작
-            for i, (text, lang) in enumerate(self._iter_lines()):
-                self._line_counter = i + 1
-                if i < resume_line:
+            for i, (text, lang) in enumerate(self._iter_lines(
+                    skip_worker_id=global_worker_id, skip_total=total_workers)):
+                abs_line = i * total_workers + global_worker_id  # 원래 라인 번호 복원
+                self._line_counter = abs_line + 1
+                if abs_line < resume_line:
                     continue  # fast-forward: 파일만 읽고 noiser/pack은 건너뜀
-                if i % total_workers != global_worker_id:
-                    continue
                 noised_ids, target_ids, src_weights = self.noiser(text, lang)
                 yield noised_ids, target_ids, len(text), src_weights
 

@@ -87,6 +87,7 @@ class DecoderLayer(nn.Module):
         reset_mask: torch.Tensor | None = None,
         src_doc_ids: torch.Tensor | None = None,
         tgt_doc_ids: torch.Tensor | None = None,
+        max_docs: int | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -96,6 +97,7 @@ class DecoderLayer(nn.Module):
             reset_mask: (batch, seq_len) bool — True인 위치에서 SSM state 리셋
             src_doc_ids: (batch, src_len) int — 소스 문서 ID (cross-attn 문서 격리)
             tgt_doc_ids: (batch, tgt_len) int — 타겟 문서 ID (cross-attn 문서 격리)
+            max_docs: int — 최대 문서 수 (pre-computed, .item() sync 제거)
         """
         # 1. Mamba + residual
         residual = x
@@ -107,7 +109,8 @@ class DecoderLayer(nn.Module):
         if encoder_out is not None:
             residual = x
             x = self.cross_attn(x, encoder_out, encoder_mask,
-                                src_doc_ids=src_doc_ids, tgt_doc_ids=tgt_doc_ids)
+                                src_doc_ids=src_doc_ids, tgt_doc_ids=tgt_doc_ids,
+                                max_docs=max_docs)
             x = self.dropout(x)
             x = self.norm_cross(residual + x)
 
@@ -169,6 +172,7 @@ class Decoder(nn.Module):
         reset_mask: torch.Tensor | None = None,
         src_doc_ids: torch.Tensor | None = None,
         tgt_doc_ids: torch.Tensor | None = None,
+        max_docs: int | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -178,13 +182,14 @@ class Decoder(nn.Module):
             reset_mask: (batch, seq_len) bool — True인 위치에서 SSM state 리셋
             src_doc_ids: (batch, src_len) int — 소스 문서 ID
             tgt_doc_ids: (batch, tgt_len) int — 타겟 문서 ID
+            max_docs: int — 최대 문서 수 (pre-computed)
         """
         for i, layer in enumerate(self.layers):
             if self.gradient_checkpointing and self.training and (i % self.gradient_checkpointing_every == 0):
                 x = checkpoint(layer, x, encoder_out, encoder_mask, reset_mask,
-                               src_doc_ids, tgt_doc_ids, use_reentrant=False)
+                               src_doc_ids, tgt_doc_ids, max_docs, use_reentrant=False)
             else:
                 x = layer(x, encoder_out=encoder_out, encoder_mask=encoder_mask,
                           reset_mask=reset_mask, src_doc_ids=src_doc_ids,
-                          tgt_doc_ids=tgt_doc_ids)
+                          tgt_doc_ids=tgt_doc_ids, max_docs=max_docs)
         return x

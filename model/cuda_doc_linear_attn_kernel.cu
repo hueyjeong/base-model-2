@@ -30,6 +30,10 @@
 // V-tile 크기: 한 sync 사이클에 처리하는 src 위치 수
 #define SCATTER_TILE 4
 
+// Tgt-tile: Phase 2 backward 에서 한 번에 처리하는 tgt 위치 수
+// smem 추가: (TGT_TILE-1)*d*2 floats. TGT_TILE=4 → 추가 1.5KB (총 35KB, <48KB)
+#define TGT_TILE 4
+
 // warp-level reduce sum (single warp, 32 lanes)
 __device__ __forceinline__ float warp_reduce_sum(float v) {
     v += __shfl_down_sync(0xffffffff, v, 16);
@@ -650,9 +654,10 @@ __global__ void doc_fused_fwd_kernel(
 //   Grid:  (B * H * max_docs,)
 //   Block: (d,)
 //   Phase 1: re-scatter K,V → smem ctx/z
-//   Phase 2: tgt 위치 순회 — grad_q 계산 + gctx/gz 누적
+//   Phase 2: tgt 위치 TGT_TILE개씩 일괄 처리 ─ grad_q 계산 + gctx/gz 누적
+//            → __syncthreads 횟수: 2*ceil(N/TGT_TILE) (기존: 2*N)
 //   Phase 3: src 위치 순회 — grad_k, grad_v 계산
-//   smem: 2*d*d + 4*d + n_warps floats (≈34 KB for d=64)
+//   smem: 2*d*d + (2+TGT_TILE*2)*d + TGT_TILE + n_warps*TGT_TILE floats
 // =========================================================================
 __global__ void doc_fused_bwd_kernel(
     const float* __restrict__ Q,           // [B*H, tgt_len, d]
@@ -687,16 +692,19 @@ __global__ void doc_fused_bwd_kernel(
     if (src_s >= src_e && tgt_s >= tgt_e) return;
 
     // smem layout:
-    //   ctx_sm [d*d]  | z_sm [d]  | gctx_sm [d*d] | gz_sm [d] | buf_a [d] | buf_b [d] | warp_buf [n_warps]
+    //   ctx_sm [d*d]  | z_sm [d]  | gctx_sm [d*d] | gz_sm [d]
+    //   | go_tile [TGT_TILE*d] | out_tile [TGT_TILE*d]
+    //   | alpha_buf [TGT_TILE] | warp_buf [n_warps*TGT_TILE]
     const int n_warps = (d + 31) / 32;
     extern __shared__ float smem_bwd[];
-    float* ctx_sm  = smem_bwd;
-    float* z_sm    = smem_bwd + d * d;
-    float* gctx_sm = smem_bwd + d * d + d;
-    float* gz_sm   = smem_bwd + 2 * d * d + d;
-    float* buf_a   = smem_bwd + 2 * d * d + 2 * d;      // go_sm / k_sm
-    float* buf_b   = smem_bwd + 2 * d * d + 3 * d;      // out_sm / v_sm
-    float* warp_buf = smem_bwd + 2 * d * d + 4 * d;
+    float* ctx_sm    = smem_bwd;
+    float* z_sm      = smem_bwd + d * d;
+    float* gctx_sm   = smem_bwd + d * d + d;
+    float* gz_sm     = smem_bwd + 2 * d * d + d;
+    float* go_tile   = smem_bwd + 2 * d * d + 2 * d;
+    float* out_tile  = smem_bwd + 2 * d * d + 2 * d + TGT_TILE * d;
+    float* alpha_buf = smem_bwd + 2 * d * d + 2 * d + 2 * TGT_TILE * d;
+    float* warp_buf  = smem_bwd + 2 * d * d + 2 * d + 2 * TGT_TILE * d + TGT_TILE;
 
     const float* K_bh  = K   + (long)bh * src_len * d;
     const float* V_bh  = V   + (long)bh * src_len * d;
@@ -729,7 +737,7 @@ __global__ void doc_fused_bwd_kernel(
         __syncthreads();
     }
 
-    // ═══════════ Phase 2: grad_q + accumulate gctx, gz ════════════════
+    // ═══════════ Phase 2: grad_q + accumulate gctx, gz (TGT_TILE tiling) ═
     #pragma unroll 4
     for (int j = 0; j < d; j++) gctx_sm[i * d + j] = 0.0f;
     gz_sm[i] = 0.0f;
@@ -741,43 +749,56 @@ __global__ void doc_fused_bwd_kernel(
     const float* go_bh  = grad_out + (long)bh * tgt_len * d;
     float*       gq_bh  = grad_q   + (long)bh * tgt_len * d;
 
-    for (int t = tgt_s; t < tgt_e; t++) {
-        buf_a[i] = __ldg(&go_bh[(long)t * d + i]);    // go_sm
-        buf_b[i] = __ldg(&out_bh[(long)t * d + i]);   // out_sm
+    for (int t = tgt_s; t < tgt_e; t += TGT_TILE) {
+        const int tile_end = min(t + TGT_TILE, tgt_e);
+        const int tile_sz  = tile_end - t;
+
+        // ── Load TGT_TILE go and out vectors into smem ──
+        for (int tt = 0; tt < tile_sz; tt++) {
+            go_tile[tt * d + i]  = __ldg(&go_bh[(long)(t + tt) * d + i]);
+            out_tile[tt * d + i] = __ldg(&out_bh[(long)(t + tt) * d + i]);
+        }
         __syncthreads();
 
-        float inv_den = 1.0f / __ldg(&den_bh[t]);
-        float q_i     = __ldg(&Q_bh[(long)t * d + i]);
+        // ── Process each tgt position in the tile (no sync between positions) ──
+        for (int tt = 0; tt < tile_sz; tt++) {
+            float inv_den = 1.0f / __ldg(&den_bh[t + tt]);
+            float q_i     = __ldg(&Q_bh[(long)(t + tt) * d + i]);
 
-        // alpha = Σ_j go[j]*out[j] via warp reduce
-        float alpha_part = buf_a[i] * buf_b[i];
-        float alpha_warp = warp_reduce_sum(alpha_part);
-        int warp_id = i >> 5;
-        int lane_id = i & 31;
-        if (lane_id == 0) warp_buf[warp_id] = alpha_warp;
+            // alpha = Σ_j go[j]*out[j] via warp reduce
+            float alpha_part = go_tile[tt * d + i] * out_tile[tt * d + i];
+            float alpha_warp = warp_reduce_sum(alpha_part);
+            int warp_id = i >> 5;
+            int lane_id = i & 31;
+            if (lane_id == 0) warp_buf[tt * n_warps + warp_id] = alpha_warp;
+        }
         __syncthreads();
 
-        float alpha = 0.0f;
-        for (int w = 0; w < n_warps; w++) alpha += warp_buf[w];
+        for (int tt = 0; tt < tile_sz; tt++) {
+            float alpha = 0.0f;
+            for (int w = 0; w < n_warps; w++) alpha += warp_buf[tt * n_warps + w];
 
-        // grad_q[t, i]
-        float ctx_go = 0.0f;
-        const float* ctx_row = ctx_sm + i * d;
-        #pragma unroll 4
-        for (int j = 0; j < d; j++)
-            ctx_go += ctx_row[j] * buf_a[j];
-        gq_bh[(long)t * d + i] = inv_den * (ctx_go - alpha * z_sm[i]);
+            float inv_den = 1.0f / __ldg(&den_bh[t + tt]);
+            float q_i     = __ldg(&Q_bh[(long)(t + tt) * d + i]);
 
-        // gctx[i,j] += q_bar_i * go[j]
-        float q_bar_i = q_i * inv_den;
-        float* gctx_row = gctx_sm + i * d;
-        #pragma unroll 4
-        for (int j = 0; j < d; j++)
-            gctx_row[j] += q_bar_i * buf_a[j];
+            // grad_q[t+tt, i]
+            float ctx_go = 0.0f;
+            const float* ctx_row = ctx_sm + i * d;
+            #pragma unroll 4
+            for (int j = 0; j < d; j++)
+                ctx_go += ctx_row[j] * go_tile[tt * d + j];
+            gq_bh[(long)(t + tt) * d + i] = inv_den * (ctx_go - alpha * z_sm[i]);
 
-        // gz[i] += -q_bar_i * alpha
-        gz_sm[i] += -q_bar_i * alpha;
+            // gctx[i,j] += q_bar_i * go[j]
+            float q_bar_i = q_i * inv_den;
+            float* gctx_row = gctx_sm + i * d;
+            #pragma unroll 4
+            for (int j = 0; j < d; j++)
+                gctx_row[j] += q_bar_i * go_tile[tt * d + j];
 
+            // gz[i] += -q_bar_i * alpha
+            gz_sm[i] += -q_bar_i * alpha;
+        }
         __syncthreads();
     }
 
@@ -825,16 +846,15 @@ __global__ void doc_fused_bwd_kernel(
 // =========================================================================
 
 std::pair<torch::Tensor, torch::Tensor> doc_fused_forward(
-    torch::Tensor Q,            // [B, H, tgt_len, d]
-    torch::Tensor K,            // [B, H, src_len, d]
-    torch::Tensor V,            // [B, H, src_len, d]
+    torch::Tensor Q,            // [B, H, tgt_len, d]  (any float dtype)
+    torch::Tensor K,            // [B, H, src_len, d]  (any float dtype)
+    torch::Tensor V,            // [B, H, src_len, d]  (any float dtype)
     torch::Tensor src_doc_ids,  // [B, src_len] int32
     torch::Tensor tgt_doc_ids,  // [B, tgt_len] int32
     int max_docs,
     float eps
 ) {
     TORCH_CHECK(Q.is_cuda(), "Q must be on CUDA");
-    TORCH_CHECK(Q.dtype() == torch::kFloat32, "Q must be float32");
 
     const int B       = Q.size(0);
     const int H       = Q.size(1);
@@ -843,9 +863,10 @@ std::pair<torch::Tensor, torch::Tensor> doc_fused_forward(
     const int src_len = K.size(2);
     const int BH      = B * H;
 
-    auto Q_ = Q.contiguous().view({BH, tgt_len, d});
-    auto K_ = K.contiguous().view({BH, src_len, d});
-    auto V_ = V.contiguous().view({BH, src_len, d});
+    // 내부 float32 변환 — Python 측 .float() 제거, autograd에 원본 dtype 저장 허용
+    auto Q_ = Q.to(torch::kFloat32).contiguous().view({BH, tgt_len, d});
+    auto K_ = K.to(torch::kFloat32).contiguous().view({BH, src_len, d});
+    auto V_ = V.to(torch::kFloat32).contiguous().view({BH, src_len, d});
     auto src_doc = src_doc_ids.contiguous().to(torch::kInt32);
     auto tgt_doc = tgt_doc_ids.contiguous().to(torch::kInt32);
 
@@ -871,9 +892,9 @@ std::pair<torch::Tensor, torch::Tensor> doc_fused_forward(
 
 
 std::vector<torch::Tensor> doc_fused_backward(
-    torch::Tensor Q,            // [B, H, tgt_len, d]
-    torch::Tensor K,            // [B, H, src_len, d]
-    torch::Tensor V,            // [B, H, src_len, d]
+    torch::Tensor Q,            // [B, H, tgt_len, d]  (any float dtype)
+    torch::Tensor K,            // [B, H, src_len, d]  (any float dtype)
+    torch::Tensor V,            // [B, H, src_len, d]  (any float dtype)
     torch::Tensor fwd_out,      // [B, H, tgt_len, d]
     torch::Tensor fwd_den,      // [B, H, tgt_len]
     torch::Tensor grad_out_t,   // [B, H, tgt_len, d]
@@ -888,12 +909,13 @@ std::vector<torch::Tensor> doc_fused_backward(
     const int src_len = K.size(2);
     const int BH      = B * H;
 
-    auto Q_   = Q.contiguous().view({BH, tgt_len, d});
-    auto K_   = K.contiguous().view({BH, src_len, d});
-    auto V_   = V.contiguous().view({BH, src_len, d});
-    auto out_ = fwd_out.contiguous().view({BH, tgt_len, d});
-    auto den_ = fwd_den.contiguous().view({BH, tgt_len});
-    auto go_  = grad_out_t.contiguous().view({BH, tgt_len, d});
+    // 내부 float32 변환 — backward에서도 bf16 입력 허용
+    auto Q_   = Q.to(torch::kFloat32).contiguous().view({BH, tgt_len, d});
+    auto K_   = K.to(torch::kFloat32).contiguous().view({BH, src_len, d});
+    auto V_   = V.to(torch::kFloat32).contiguous().view({BH, src_len, d});
+    auto out_ = fwd_out.to(torch::kFloat32).contiguous().view({BH, tgt_len, d});
+    auto den_ = fwd_den.to(torch::kFloat32).contiguous().view({BH, tgt_len});
+    auto go_  = grad_out_t.to(torch::kFloat32).contiguous().view({BH, tgt_len, d});
     auto src_doc = src_doc_ids.contiguous().to(torch::kInt32);
     auto tgt_doc = tgt_doc_ids.contiguous().to(torch::kInt32);
 
@@ -905,8 +927,8 @@ std::vector<torch::Tensor> doc_fused_backward(
     const int n_warps = (d + 31) / 32;
     dim3 grid(num_blocks);
     dim3 block(d);
-    // ctx[d*d] + z[d] + gctx[d*d] + gz[d] + buf_a[d] + buf_b[d] + warp_buf[n_warps]
-    size_t smem = ((size_t)2 * d * d + 4 * d + n_warps) * sizeof(float);
+    // ctx[d*d] + z[d] + gctx[d*d] + gz[d] + go_tile[TGT_TILE*d] + out_tile[TGT_TILE*d] + alpha_buf[TGT_TILE] + warp_buf[n_warps*TGT_TILE]
+    size_t smem = ((size_t)2 * d * d + 2 * d + 2 * TGT_TILE * d + TGT_TILE + n_warps * TGT_TILE) * sizeof(float);
 
     doc_fused_bwd_kernel<<<grid, block, smem>>>(
         Q_.data_ptr<float>(), K_.data_ptr<float>(), V_.data_ptr<float>(),

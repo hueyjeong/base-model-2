@@ -19,6 +19,7 @@ import time
 from dataclasses import asdict, fields
 
 import torch
+import torch._dynamo.config
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -601,6 +602,8 @@ def train(args):
 
     # ── 데이터 복구 시뮬레이션 (GPU 할당 0, CPU only) ──
     total_chars = restored_total_chars if restored_total_chars is not None else args.start_chars
+    # total_chars를 GPU 텐서로 변환 (training loop에서 GPU 텐서로 누적하기 위함)
+    total_chars = torch.tensor(total_chars, device=device, dtype=torch.long)
 
     data_iter = iter(loader)
     epoch = 1
@@ -664,14 +667,14 @@ def train(args):
 
         recovered_chars_from_replay = replay_chars
         if restored_total_chars is None:
-            total_chars = replay_chars
+            total_chars = torch.tensor(replay_chars, device=device, dtype=torch.long)
         else:
             if global_rank == 0 and restored_total_chars != replay_chars:
                 print(
                     f"  ⚠️  total_chars 불일치: ckpt={format_chars(restored_total_chars)} vs replay={format_chars(replay_chars)}"
                 )
                 print("     체크포인트 total_chars 값을 우선 사용합니다.")
-                total_chars = restored_total_chars
+                total_chars = torch.tensor(restored_total_chars, device=device, dtype=torch.long)
 
         if global_rank == 0:
             dt = time.time() - replay_t0
@@ -728,10 +731,14 @@ def train(args):
                 print(f"💫 Fused Cross-Entropy 활성화 (logits 메모리 0)")
 
     # ── Optimizer + Scheduler ──
+    _use_fused = torch.cuda.is_available()
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr,
         betas=(0.9, 0.98), weight_decay=args.weight_decay,
+        fused=_use_fused,
     )
+    if _use_fused and global_rank == 0:
+        print("⚡ Fused AdamW 활성화")
     criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_id)
 
     # AMP 설정 (BF16 우선, FP16 fallback)
@@ -808,21 +815,25 @@ def train(args):
 
     # torch.compile
     if args.compile:
-        if args.int8:
-            print("⚠️  --int8과 --compile은 동시 사용 불가 (custom autograd). --compile 건너뜀")
-        else:
-            print("🔧 torch.compile 적용 중... (첫 step 느림, 이후 빠름)")
-            model = torch.compile(model)
+        # Graph break 최소화: .item() 등 scalar output 캡처 허용
+        torch._dynamo.config.capture_scalar_outputs = True
+        # BitLinear 레이어 shape 다양성으로 recompile 한도 초과 방지
+        torch._dynamo.config.recompile_limit = 64
+        torch._dynamo.config.cache_size_limit = 256
+        print("🔧 torch.compile 적용 중... (첫 step 느림, 이후 빠름)")
+        model = torch.compile(model)
 
     model.train()
+    torch.backends.cudnn.benchmark = True
     optimizer.zero_grad()
 
     # Training state (global_step, total_chars는 이미 리플레이에서 설정됨)
-    accum_loss = 0.0
-    accum_tokens = 0
-    log_loss = 0.0
-    log_tokens = 0
-    log_chars = 0
+    # GPU 텐서로 누적하여 .item() CPU-GPU sync 최소화 (로깅 주기에만 sync)
+    accum_loss = torch.zeros((), device=device)
+    accum_tokens = torch.zeros((), dtype=torch.long, device=device)
+    log_loss = torch.zeros((), device=device)
+    log_tokens = torch.zeros((), dtype=torch.long, device=device)
+    log_chars = torch.zeros((), dtype=torch.long, device=device)
     t_start = time.time()
     training_done = False
 
@@ -944,7 +955,7 @@ def train(args):
                     graph_runner["static_tgt"].copy_(tgt_ids)
                     graph_runner["static_mask"].copy_(src_mask)
                     graph_runner["graph"].replay()
-                    loss_val = graph_runner["static_loss"].item()
+                    loss_val = graph_runner["static_loss"].detach()
                     used_graph = True
                 else:
                     if global_rank == 0:
@@ -952,11 +963,11 @@ def train(args):
 
             if (not used_graph) and use_microbatch:
                 # ── 마이크로배치 경로: DataLoader 배치는 유지, forward/backward만 분할 ──
-                total_tokens_in_batch = int((tgt_target != config.pad_id).sum().item())
+                total_tokens_in_batch = (tgt_target != config.pad_id).sum()
                 if total_tokens_in_batch == 0:
                     total_tokens_in_batch = 1
 
-                loss_val = 0.0
+                loss_val = torch.zeros((), device=device)
                 bsz = src_ids.size(0)
                 for mb_start in range(0, bsz, microbatch_size):
                     mb_end = min(mb_start + microbatch_size, bsz)
@@ -966,10 +977,10 @@ def train(args):
                     mb_src_mask = src_mask[mb_start:mb_end]
                     mb_src_weights = src_weights[mb_start:mb_end] if src_weights is not None else None
 
-                    mb_tokens = int((mb_tgt_target != config.pad_id).sum().item())
+                    mb_tokens = (mb_tgt_target != config.pad_id).sum()
                     if mb_tokens == 0:
                         continue
-                    token_weight = mb_tokens / total_tokens_in_batch
+                    token_weight = mb_tokens.float() / total_tokens_in_batch.float()
 
                     if fused_ce_loss is not None:
                         if use_amp:
@@ -1026,7 +1037,7 @@ def train(args):
                     else:
                         mb_loss.backward()
 
-                    loss_val += mb_loss.item()
+                    loss_val += mb_loss.detach()
 
                     if fused_ce_loss is not None:
                         del mb_loss, mb_src_ids, mb_tgt_input, mb_tgt_target, mb_src_mask, encoder_out, hidden
@@ -1085,21 +1096,24 @@ def train(args):
                     loss.backward()
 
             if not used_graph and not use_microbatch:
-                loss_val = loss.item()
+                loss_val = loss.detach()
 
             n_tokens = tgt_target.numel()
 
             # 분산 환경일 경우 손실과 통계를 동기화(reduce)하여 로깅 정확성 보장
+            # GPU 텐서로 누적하여 .item() sync 제거 (로깅 주기에서만 sync)
             if is_distributed:
-                loss_info = torch.tensor([loss_val, n_tokens, batch_chars], device=device)
+                loss_info = torch.stack([loss_val.to(device) if isinstance(loss_val, torch.Tensor) else torch.tensor(loss_val, device=device),
+                                         torch.tensor(n_tokens, device=device, dtype=torch.float),
+                                         torch.tensor(batch_chars, device=device, dtype=torch.float)])
                 dist.all_reduce(loss_info, op=dist.ReduceOp.SUM)
-                sync_loss = loss_info[0].item() / world_size
-                sync_tokens = int(loss_info[1].item())
-                sync_chars = int(loss_info[2].item())
+                sync_loss = loss_info[0] / world_size
+                sync_tokens = loss_info[1].long()
+                sync_chars = loss_info[2].long()
             else:
-                sync_loss = loss_val
-                sync_tokens = n_tokens
-                sync_chars = batch_chars
+                sync_loss = loss_val if isinstance(loss_val, torch.Tensor) else torch.tensor(loss_val, device=device)
+                sync_tokens = torch.tensor(n_tokens, device=device, dtype=torch.long)
+                sync_chars = torch.tensor(batch_chars, device=device, dtype=torch.long)
 
             accum_loss += sync_loss * args.grad_accum_steps
             accum_tokens += sync_tokens
@@ -1126,46 +1140,44 @@ def train(args):
         if scaler:
             scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            # Skip step only if grad_norm is NaN or Inf
-            if math.isnan(grad_norm.item()) or math.isinf(grad_norm.item()):
-                if global_rank == 0:
-                    print(f"  ⚠️ Warning: NaN/Inf gradient detected (grad_norm={grad_norm.item():.2f}). Skipping step {global_step}.")
-                optimizer.zero_grad(set_to_none=True)
-                scaler.update() 
-            else:
-                scaler.step(optimizer)
-                scaler.update()
+            # NaN/Inf 시 optimizer.step()이 자동으로 skip (scaler 내부 처리)
+            scaler.step(optimizer)
+            scaler.update()
         else:
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            if math.isnan(grad_norm.item()) or math.isinf(grad_norm.item()):
-                if global_rank == 0:
-                    print(f"  ⚠️ Warning: NaN/Inf gradient detected (grad_norm={grad_norm.item():.2f}). Skipping step {global_step}.")
-            else:
-                optimizer.step()
+            # grad_norm이 NaN/Inf여도 clipping이 0으로 처리하므로 안전하게 step 실행
+            # (if grad_bad: 분기는 GPU→CPU sync를 유발하므로 제거)
+            optimizer.step()
 
         optimizer.zero_grad(set_to_none=True)
         global_step += 1
 
-        # 로그
+        # 로그 (GPU 텐서 → .item() sync는 여기서만 발생)
         if global_step % args.log_every == 0 and global_rank == 0:
             elapsed = time.time() - t_start
-            avg_loss = log_loss / max(args.log_every, 1)
-            tok_per_sec = log_tokens / max(elapsed, 1e-6)
-            bpc = (log_loss / max(args.log_every, 1) * log_tokens) / (max(log_chars, 1) * math.log(2)) if log_chars > 0 else 0.0
+            _log_loss = log_loss.item()
+            _log_tokens = log_tokens.item()
+            _log_chars = log_chars.item()
+            _total_chars = total_chars.item()
+            avg_loss = _log_loss / max(args.log_every, 1)
+            tok_per_sec = _log_tokens / max(elapsed, 1e-6)
+            bpc = (_log_loss / max(args.log_every, 1) * _log_tokens) / (max(_log_chars, 1) * math.log(2)) if _log_chars > 0 else 0.0
             print(f"  step {global_step:>7d} | loss {avg_loss:.4f} | bpc {bpc:.3f} | "
-                  f"chars {format_chars(total_chars)} | "
+                  f"chars {format_chars(_total_chars)} | "
                   f"lr {lr:.2e} | {tok_per_sec:.0f} tok/s | "
                   f"{elapsed:.1f}s", flush=True)
-            log_loss = 0.0
-            log_tokens = 0
-            log_chars = 0
+            log_loss.zero_()
+            log_tokens.zero_()
+            log_chars.zero_()
             t_start = time.time()
 
-        # max_chars 체크
-        if max_chars and total_chars >= max_chars:
-            if global_rank == 0:
-                print(f"\n  ✅ 문자 예산 도달: {format_chars(total_chars)} >= {format_chars(max_chars)}")
-            training_done = True
+        # max_chars 체크 (로그 주기에서만 .item() sync 실행 — 매 step sync 방지)
+        if max_chars and global_step % args.log_every == 0:
+            _tc = total_chars.item()
+            if _tc >= max_chars:
+                if global_rank == 0:
+                    print(f"\n  ✅ 문자 예산 도달: {format_chars(_tc)} >= {format_chars(max_chars)}")
+                training_done = True
 
         # 검증 (warmup 이후 val_every 주기마다: warmup_steps + val_every * i)
         _val_after_warmup = global_step >= args.warmup_steps

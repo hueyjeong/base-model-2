@@ -127,6 +127,10 @@ def _load_cuda_doc_linear_attn():
         _CUDA_DOC_LINEAR_ATTN = None
         raise RuntimeError("Stale CUDA extension cache")
 
+    # 1회성 로드 성공 로그 (학습 로그에서 커널 사용 여부 확인용)
+    if rank == 0:
+        print(f"[LinearCrossAttn] CUDA fused kernel loaded: {ext_name} (version={_KERNEL_VERSION})")
+
     return _CUDA_DOC_LINEAR_ATTN
 
 
@@ -329,6 +333,7 @@ class LinearCrossAttention(nn.Module):
         encoder_mask: torch.Tensor | None = None,
         src_doc_ids: torch.Tensor | None = None,
         tgt_doc_ids: torch.Tensor | None = None,
+        max_docs: int | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -337,6 +342,7 @@ class LinearCrossAttention(nn.Module):
             encoder_mask: 인코더 마스크 (B, src_len) - True가 유효 데이터
             src_doc_ids: (B, src_len) int — 소스 문서 ID (BOS cumsum 기반)
             tgt_doc_ids: (B, tgt_len) int — 타겟 문서 ID (BOS cumsum 기반)
+            max_docs: int — 최대 문서 수 (pre-computed, .item() sync 제거용)
         """
         B, tgt_len, _ = x.shape
         _, src_len, _ = encoder_out.shape
@@ -368,18 +374,20 @@ class LinearCrossAttention(nn.Module):
 
         # 4. Compute attention
         if src_doc_ids is not None and tgt_doc_ids is not None:
-            # CUDA doc-isolated scatter/gather 경로 (float32 필수)
-            q_f = q.float()
-            k_f = k.float()
-            v_f = v.float()
+            # CUDA doc-isolated scatter/gather 경로
+            # float32 변환은 CUDA C++ launcher 내부에서 처리 — Python 측 임시 텐서 제거
+            # → autograd에 원본 dtype(bf16) 저장 → 레이어당 ~18MB 절약 × 12레이어 = ~216MB
             src_ids = src_doc_ids.to(torch.int32)
             tgt_ids = tgt_doc_ids.to(torch.int32)
-            max_docs = int(max(src_ids.max().item(), tgt_ids.max().item())) + 1
 
-            if q_f.is_cuda:
+            # max_docs: 외부에서 pre-computed → .item() 0회 (기존: 레이어당 2회×12=24회 sync)
+            if max_docs is None:
+                max_docs = int(torch.max(src_ids.max(), tgt_ids.max()).item()) + 1
+
+            if q.is_cuda:
                 try:
                     out = cuda_doc_linear_attn(
-                        q_f, k_f, v_f, src_ids, tgt_ids, max_docs, self.eps
+                        q, k, v, src_ids, tgt_ids, max_docs, self.eps
                     ).to(q.dtype)
                 except Exception as e:
                     # CUDA 커널 미빌드 시 PyTorch fallback — 경고 1회
@@ -393,11 +401,11 @@ class LinearCrossAttention(nn.Module):
                         )
                         _FALLBACK_WARNED = True
                     out = self._doc_isolated_forward_pytorch(
-                        q_f, k_f, v_f, src_doc_ids, tgt_doc_ids, self.eps
+                        q.float(), k.float(), v.float(), src_doc_ids, tgt_doc_ids, self.eps
                     ).to(q.dtype)
             else:
                 out = self._doc_isolated_forward_pytorch(
-                    q_f, k_f, v_f, src_doc_ids, tgt_doc_ids, self.eps
+                    q.float(), k.float(), v.float(), src_doc_ids, tgt_doc_ids, self.eps
                 ).to(q.dtype)
         else:
             out = self._pytorch_forward(q, k, v, self.eps)
