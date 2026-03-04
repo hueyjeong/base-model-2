@@ -141,6 +141,8 @@ class Decoder(nn.Module):
     ):
         super().__init__()
         self.gradient_checkpointing = False
+        # N 레이어마다 1개만 checkpoint (1=전체, 2=50%, 3=33% ...)
+        self.gradient_checkpointing_every: int = 1
         self.layers = nn.ModuleList([
             DecoderLayer(
                 d_model=d_model,
@@ -177,8 +179,8 @@ class Decoder(nn.Module):
             src_doc_ids: (batch, src_len) int — 소스 문서 ID
             tgt_doc_ids: (batch, tgt_len) int — 타겟 문서 ID
         """
-        for layer in self.layers:
-            if self.gradient_checkpointing and self.training:
+        for i, layer in enumerate(self.layers):
+            if self.gradient_checkpointing and self.training and (i % self.gradient_checkpointing_every == 0):
                 x = checkpoint(layer, x, encoder_out, encoder_mask, reset_mask,
                                src_doc_ids, tgt_doc_ids, use_reentrant=False)
             else:

@@ -143,6 +143,8 @@ class Encoder(nn.Module):
     ):
         super().__init__()
         self.gradient_checkpointing = False
+        # N 레이어마다 1개만 checkpoint (1=전체, 2=50%, 3=33% ...)
+        self.gradient_checkpointing_every: int = 1
         self.layers = nn.ModuleList([
             EncoderLayer(
                 d_model=d_model,
@@ -169,8 +171,8 @@ class Encoder(nn.Module):
         Returns:
             (batch, seq_len, d_model)  — 인코더 최종 출력
         """
-        for layer in self.layers:
-            if self.gradient_checkpointing and self.training:
+        for i, layer in enumerate(self.layers):
+            if self.gradient_checkpointing and self.training and (i % self.gradient_checkpointing_every == 0):
                 x = checkpoint(layer, x, reset_mask, use_reentrant=False)
             else:
                 x = layer(x, reset_mask=reset_mask)

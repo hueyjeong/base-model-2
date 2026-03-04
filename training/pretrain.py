@@ -705,9 +705,13 @@ def train(args):
 
     # Gradient Checkpointing
     if args.grad_ckpt:
+        every = max(1, args.grad_ckpt_every)
         model.encoder.gradient_checkpointing = True
         model.decoder.gradient_checkpointing = True
-        print("  Gradient Checkpointing: ✔")
+        model.encoder.gradient_checkpointing_every = every
+        model.decoder.gradient_checkpointing_every = every
+        ckpt_pct = round(100 / every)
+        print(f"  Gradient Checkpointing: ✔  (every={every}, ~{ckpt_pct}% 레이어 checkpoint)")
 
     # Fused Cross-Entropy 설정
     fused_ce_loss = None
@@ -1291,6 +1295,9 @@ def main():
                         help="BF16 Mixed precision (FP32 동일 범위, scaler 불필요, 더 안정적)")
     parser.add_argument("--grad_ckpt", action="store_true",
                         help="Gradient checkpointing (활성화 시 활성화 메모리 3~4배 절약)")
+    parser.add_argument("--grad_ckpt_every", type=int, default=1,
+                        help="N 레이어마다 1개만 checkpoint (1=전체, 2=50%%, 3=33%% ...). "
+                             "클수록 메모리는 덜 절약되지만 속도 손실이 줄어듦. (기본값: 1)")
     parser.add_argument("--compile", action="store_true",
                         help="torch.compile 적용 (커널 fusion, 첫 step 느리나 이후 1.3~2x 빠름)")
     parser.add_argument("--cuda_graph", action="store_true",
