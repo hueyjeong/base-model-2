@@ -1145,8 +1145,15 @@ def train(args):
             scaler.update()
         else:
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            # grad_norm이 NaN/Inf여도 clipping이 0으로 처리하므로 안전하게 step 실행
-            # (if grad_bad: 분기는 GPU→CPU sync를 유발하므로 제거)
+            # Gradient explosion guard: gnorm이 임계값 초과 시 step skip
+            _gnorm_val = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+            _gnorm_limit = args.grad_clip * args.grad_skip_factor
+            if _gnorm_val > _gnorm_limit or not math.isfinite(_gnorm_val):
+                if global_rank == 0:
+                    print(f"  ⚠️  step {global_step + 1} SKIPPED | gnorm {_gnorm_val:.2f} > {_gnorm_limit:.1f} (grad_clip × {args.grad_skip_factor})", flush=True)
+                optimizer.zero_grad(set_to_none=True)
+                global_step += 1
+                continue
             optimizer.step()
 
         optimizer.zero_grad(set_to_none=True)
@@ -1301,6 +1308,8 @@ def main():
                         help="DataLoader 배치 크기 (pack 단위)")
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping")
+    parser.add_argument("--grad_skip_factor", type=float, default=10.0,
+                        help="gnorm > grad_clip × 이 값이면 step skip (gradient explosion guard)")
     parser.add_argument("--fused_ce", action="store_true",
                         help="Fused Cross-Entropy (liger-kernel). logits 메모리 0으로 절약")
     parser.add_argument("--amp", action="store_true", help="FP16 Mixed precision (AMP)")
