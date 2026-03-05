@@ -242,6 +242,7 @@ def _pad_int8_mm_ab(a_int8: torch.Tensor, b_int8: torch.Tensor):
     return a_pad, b_pad, M, K
 
 
+@torch.compiler.allow_in_graph
 class _BitLinearCudaFn(torch.autograd.Function):
     @staticmethod
     @torch.amp.custom_fwd(device_type="cuda", cast_inputs=torch.float32)

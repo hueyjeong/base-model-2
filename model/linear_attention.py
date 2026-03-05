@@ -164,6 +164,7 @@ def relu1p_feature_map(x: torch.Tensor) -> torch.Tensor:
 # Autograd Function with CUDA forward + PyTorch backward
 # =========================================================================
 
+@torch.compiler.allow_in_graph
 class _LinearCrossAttnCudaFn(torch.autograd.Function):
     """CUDA fused forward + PyTorch-based backward for linear cross-attention."""
 
@@ -245,6 +246,7 @@ def cuda_linear_cross_attn(q, k, v, mask, eps=1e-5):
 # Doc-Isolated Linear Cross-Attention — CUDA scatter/gather autograd Function
 # =========================================================================
 
+@torch.compiler.allow_in_graph
 class _DocLinearAttnFn(torch.autograd.Function):
     """Document-isolated linear cross-attention — Fused CUDA kernel.
 
