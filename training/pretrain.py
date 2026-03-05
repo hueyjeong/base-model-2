@@ -1162,9 +1162,10 @@ def train(args):
             avg_loss = _log_loss / max(args.log_every, 1)
             tok_per_sec = _log_tokens / max(elapsed, 1e-6)
             bpc = (_log_loss / max(args.log_every, 1) * _log_tokens) / (max(_log_chars, 1) * math.log(2)) if _log_chars > 0 else 0.0
+            _grad_norm = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
             print(f"  step {global_step:>7d} | loss {avg_loss:.4f} | bpc {bpc:.3f} | "
                   f"chars {format_chars(_total_chars)} | "
-                  f"lr {lr:.2e} | {tok_per_sec:.0f} tok/s | "
+                  f"lr {lr:.2e} | gnorm {_grad_norm:.2f} | {tok_per_sec:.0f} tok/s | "
                   f"{elapsed:.1f}s", flush=True)
             log_loss.zero_()
             log_tokens.zero_()
