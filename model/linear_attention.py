@@ -5,7 +5,7 @@ Designed for integrating encoder context into a decoder without the O(N^2)
 memory/compute bottleneck of standard Softmax attention.
 
 Features:
-- Feature map phi(x) = elu(x) + 1 implementation for positive keys/queries
+- Feature map phi(x) = relu(x) + 1 implementation for positive keys/queries (≥1 guaranteed)
 - Custom CUDA fused kernel for K^T V + Q(K^T V) + normalization
 - Document-isolated CUDA kernel for per-doc context (scatter/gather 구조)
 - PyTorch exact fallback when CUDA kernel unavailable
@@ -147,8 +147,17 @@ HAS_CUDA_LINEAR_ATTN = torch.cuda.is_available()
 # =========================================================================
 
 def elu_feature_map(x: torch.Tensor) -> torch.Tensor:
-    """리니어 어텐션을 위한 양수 보장 특징 매핑: phi(x) = elu(x) + 1"""
+    """(deprecated) phi(x) = elu(x) + 1 — relu1p 로 대체됨"""
     return F.elu(x) + 1.0
+
+
+def relu1p_feature_map(x: torch.Tensor) -> torch.Tensor:
+    """리니어 어텐션을 위한 양수 보장 특징 매핑: phi(x) = relu(x) + 1
+
+    elu+1과 달리 출력이 항상 ≥ 1이므로 z=sum(phi(K))가 0에 가까워질 수 없어
+    backward에서 1/den 폭발을 구조적으로 방지합니다.
+    """
+    return F.relu(x) + 1.0
 
 
 # =========================================================================
@@ -191,7 +200,7 @@ class _LinearCrossAttnCudaFn(torch.autograd.Function):
         num = torch.matmul(q, context)
         # den = Q · z: (B, h, tgt)
         den = torch.einsum("bhld,bhd->bhl", q, z)
-        den_expanded = den.unsqueeze(-1) + eps  # (B, h, tgt, 1)
+        den_expanded = (den.unsqueeze(-1) + eps).clamp(min=0.1)  # gradient explosion 방지
 
         # grad through division: out = num / den
         # grad_num = grad_out / den
@@ -362,9 +371,9 @@ class LinearCrossAttention(nn.Module):
         v = self._repeat_kv(v)
 
         # 2. Apply feature map to make keys and queries positive
-        #    phi(x) = elu(x) + 1
-        q = elu_feature_map(q)
-        k = elu_feature_map(k)
+        #    phi(x) = relu(x) + 1  (≥1 보장 → z=sum(phi(K)) 0 방지)
+        q = relu1p_feature_map(q)
+        k = relu1p_feature_map(k)
 
         # 3. Apply Mask to K and V (PAD masking)
         if encoder_mask is not None:

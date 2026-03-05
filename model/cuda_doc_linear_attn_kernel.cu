@@ -323,7 +323,7 @@ __global__ void doc_backward_q_kernel(
         out_sm[i] = __ldg(&out_[(long)t * d + i]);
         __syncthreads();
 
-        float inv_den = 1.0f / den_[(long)t];
+        float inv_den = 1.0f / fmaxf(den_[(long)t], 0.1f);
 
         // ── alpha = Σ_j go[j]*out[j]: warp reduce ────────────────────────
         float alpha_partial = go_sm[i] * out_sm[i];
@@ -762,7 +762,7 @@ __global__ void doc_fused_bwd_kernel(
 
         // ── Process each tgt position in the tile (no sync between positions) ──
         for (int tt = 0; tt < tile_sz; tt++) {
-            float inv_den = 1.0f / __ldg(&den_bh[t + tt]);
+            float inv_den = 1.0f / fmaxf(__ldg(&den_bh[t + tt]), 0.1f);
             float q_i     = __ldg(&Q_bh[(long)(t + tt) * d + i]);
 
             // alpha = Σ_j go[j]*out[j] via warp reduce
@@ -778,7 +778,7 @@ __global__ void doc_fused_bwd_kernel(
             float alpha = 0.0f;
             for (int w = 0; w < n_warps; w++) alpha += warp_buf[tt * n_warps + w];
 
-            float inv_den = 1.0f / __ldg(&den_bh[t + tt]);
+            float inv_den = 1.0f / fmaxf(__ldg(&den_bh[t + tt]), 0.1f);
             float q_i     = __ldg(&Q_bh[(long)(t + tt) * d + i]);
 
             // grad_q[t+tt, i]
