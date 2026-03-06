@@ -32,7 +32,8 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # bf16/f16: exponent 범위 충분, float32 캐스팅 생략하여 커널 2회 절감
         rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        return (x * rms) * self.weight
+        # weight를 입력 dtype으로 캐스팅하여 BF16 → FP32 promotion 방지
+        return (x * rms) * self.weight.to(x.dtype)
 
 
 class BitNetFFN(nn.Module):
