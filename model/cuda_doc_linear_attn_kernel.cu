@@ -985,14 +985,15 @@ __global__ void doc_v3_scatter_ctx_kernel(
     const float* K_bh = K + (long)bh * src_len * d;
     const float* V_bh = V + (long)bh * src_len * d;
 
-    // smem: ctx_sm[d*d] + vtile[SCATTER_TILE*d]
+    // smem: ctx_sm[d*(d+1)] + vtile[SCATTER_TILE*d]  (d+1 stride eliminates bank conflicts)
+    const int d_pad = d + 1;
     extern __shared__ float smem_v3s[];
     float* ctx_sm  = smem_v3s;
-    float* v_tile  = smem_v3s + d * d;
+    float* v_tile  = smem_v3s + d * d_pad;
 
-    // Initialize smem context to zero
+    // Initialize smem context to zero (padded stride)
     #pragma unroll 4
-    for (int j = 0; j < d; j++) ctx_sm[i * d + j] = 0.0f;
+    for (int j = 0; j < d; j++) ctx_sm[i * d_pad + j] = 0.0f;
     float z_acc = 0.0f;
     __syncthreads();
 
@@ -1006,7 +1007,7 @@ __global__ void doc_v3_scatter_ctx_kernel(
 
         for (int tt = 0; tt < tile_sz; tt++) {
             float k_i = __ldg(&K_bh[(long)(s + tt) * d + i]);
-            float* ctx_row = ctx_sm + i * d;
+            float* ctx_row = ctx_sm + i * d_pad;
             #pragma unroll 4
             for (int j = 0; j < d; j++)
                 ctx_row[j] += k_i * v_tile[tt * d + j];
@@ -1015,11 +1016,11 @@ __global__ void doc_v3_scatter_ctx_kernel(
         __syncthreads();
     }
 
-    // Flush smem context to global (single coalesced write)
+    // Flush smem context to global (padded → unpadded)
     float* ctx_out = context + ((long)bh * max_docs * d * d + (long)doc * d * d + (long)i * d);
     #pragma unroll 4
     for (int j = 0; j < d; j++)
-        ctx_out[j] = ctx_sm[i * d + j];
+        ctx_out[j] = ctx_sm[i * d_pad + j];
     z[((long)bh * max_docs * d + (long)doc * d) + i] = z_acc;
 }
 
@@ -1060,16 +1061,17 @@ __global__ void doc_v3_gather_query_kernel(
     if (t_start >= doc_e) return;
 
     // Load context + z for this doc into smem (once per block)
+    const int d_pad = d + 1;
     extern __shared__ float smem_v3g[];
     float* ctx_sm = smem_v3g;
-    float* z_sm   = smem_v3g + d * d;
-    float* q_sm   = smem_v3g + d * d + d;
+    float* z_sm   = smem_v3g + d * d_pad;
+    float* q_sm   = smem_v3g + d * d_pad + d;
 
     const float* ctx_d = context + ((long)bh * max_docs * d * d + (long)doc * d * d);
     const float* z_d   = z       + ((long)bh * max_docs * d     + (long)doc * d);
 
     for (int jj = 0; jj < d; jj++)
-        ctx_sm[i * d + jj] = ctx_d[i * d + jj];
+        ctx_sm[i * d_pad + jj] = ctx_d[i * d + jj];
     z_sm[i] = z_d[i];
     __syncthreads();
 
@@ -1085,7 +1087,7 @@ __global__ void doc_v3_gather_query_kernel(
         #pragma unroll 4
         for (int r = 0; r < d; r++) {
             float q_r = q_sm[r];
-            num += q_r * ctx_sm[r * d + i];
+            num += q_r * ctx_sm[r * d_pad + i];
             den += q_r * z_sm[r];
         }
         float den_eps = den + eps;
@@ -1135,21 +1137,22 @@ __global__ void doc_v3_bwd_grad_q_kernel(
 
     if (t_start >= doc_e) return;
 
-    // smem layout
+    // smem layout (d+1 stride for bank-conflict-free ctx access)
+    const int d_pad = d + 1;
     const int n_warps = (d + 31) / 32;
     extern __shared__ float smem_v3q[];
     float* ctx_sm  = smem_v3q;
-    float* z_sm    = smem_v3q + d * d;
-    float* go_sm   = smem_v3q + d * d + d;
-    float* out_sm  = smem_v3q + d * d + d + d;
-    float* warp_buf = smem_v3q + d * d + d + d + d;
+    float* z_sm    = smem_v3q + d * d_pad;
+    float* go_sm   = smem_v3q + d * d_pad + d;
+    float* out_sm  = smem_v3q + d * d_pad + d + d;
+    float* warp_buf = smem_v3q + d * d_pad + d + d + d;
 
-    // Load context + z for this doc
+    // Load context + z for this doc (global d stride → smem d+1 stride)
     const float* ctx_d = context + ((long)bh * max_docs * d * d + (long)doc * d * d);
     const float* z_d   = z       + ((long)bh * max_docs * d     + (long)doc * d);
 
     for (int jj = 0; jj < d; jj++)
-        ctx_sm[i * d + jj] = ctx_d[i * d + jj];
+        ctx_sm[i * d_pad + jj] = ctx_d[i * d + jj];
     z_sm[i] = z_d[i];
     __syncthreads();
 
@@ -1186,7 +1189,7 @@ __global__ void doc_v3_bwd_grad_q_kernel(
 
         // grad_q[t, i] = inv_den * (Σ_j ctx[i,j]*go[j] - alpha * z[i])
         float ctx_go = 0.0f;
-        const float* ctx_row = ctx_sm + (long)i * d;
+        const float* ctx_row = ctx_sm + (long)i * d_pad;
         #pragma unroll 4
         for (int j = 0; j < d; j++)
             ctx_go += ctx_row[j] * go_sm[j];
@@ -1252,16 +1255,17 @@ __global__ void doc_v3_bwd_grad_kv_kernel(
     float*       gk_bh   = grad_k   + (long)bh * src_len * d;
     float*       gv_bh   = grad_v   + (long)bh * src_len * d;
 
-    // Load gctx row i and gz[i] to registers
-    float gctx_row_reg[64];
-    const float* gctx_row = gctx_d + (long)i * d;
-    for (int j = 0; j < d; j++) gctx_row_reg[j] = gctx_row[j];
-    float gz_i = gz_d[i];
-
-    // smem for K/V tiles
+    // Load gctx into shared memory with d+1 padding for bank-conflict-free access
+    const int d_pad = d + 1;
     extern __shared__ float smem_v3kv[];
-    float* k_tile = smem_v3kv;
-    float* v_tile = smem_v3kv + SCATTER_TILE * d;
+    float* gctx_sm = smem_v3kv;                    // [d * d_pad]
+    float* k_tile  = smem_v3kv + d * d_pad;         // [SCATTER_TILE * d]
+    float* v_tile  = smem_v3kv + d * d_pad + SCATTER_TILE * d;  // [SCATTER_TILE * d]
+
+    for (int j = 0; j < d; j++)
+        gctx_sm[i * d_pad + j] = gctx_d[i * d + j];
+    float gz_i = gz_d[i];
+    __syncthreads();
 
     for (int s = src_s; s < src_e; s += SCATTER_TILE) {
         const int tile_end = min(s + SCATTER_TILE, src_e);
@@ -1276,16 +1280,17 @@ __global__ void doc_v3_bwd_grad_kv_kernel(
         for (int tt = 0; tt < tile_sz; tt++) {
             // grad_k[s+tt, i] = Σ_j gctx[i,j]*v[s+tt,j] + gz[i]
             float gk_val = gz_i;
+            const float* gctx_row = gctx_sm + i * d_pad;
             #pragma unroll 4
             for (int j = 0; j < d; j++)
-                gk_val += gctx_row_reg[j] * v_tile[tt * d + j];
+                gk_val += gctx_row[j] * v_tile[tt * d + j];
             gk_bh[(long)(s + tt) * d + i] = gk_val;
 
-            // grad_v[s+tt, i] = Σ_r gctx[r,i]*k[s+tt,r]
+            // grad_v[s+tt, i] = Σ_r gctx[r,i]*k[s+tt,r]  (column i from smem)
             float gv_val = 0.0f;
             #pragma unroll 4
             for (int r = 0; r < d; r++)
-                gv_val += gctx_d[(long)r * d + i] * k_tile[tt * d + r];
+                gv_val += gctx_sm[r * d_pad + i] * k_tile[tt * d + r];
             gv_bh[(long)(s + tt) * d + i] = gv_val;
         }
         __syncthreads();
@@ -1329,7 +1334,7 @@ std::vector<torch::Tensor> doc_v3_forward(
     {
         dim3 grid(BH * max_docs);
         dim3 block(d);
-        size_t smem = ((size_t)d * d + SCATTER_TILE * d) * sizeof(float);
+        size_t smem = ((size_t)d * (d + 1) + SCATTER_TILE * d) * sizeof(float);
         doc_v3_scatter_ctx_kernel<<<grid, block, smem>>>(
             K_.data_ptr<float>(), V_.data_ptr<float>(),
             src_doc.data_ptr<int>(),
@@ -1347,7 +1352,7 @@ std::vector<torch::Tensor> doc_v3_forward(
         int n_chunks = (tgt_len + T_CHUNK - 1) / T_CHUNK;
         dim3 grid(BH * max_docs, n_chunks);
         dim3 block(d);
-        size_t smem = ((size_t)d * d + d + d) * sizeof(float);
+        size_t smem = ((size_t)d * (d + 1) + d + d) * sizeof(float);
         doc_v3_gather_query_kernel<<<grid, block, smem>>>(
             Q_.data_ptr<float>(),
             context.data_ptr<float>(), z_buf.data_ptr<float>(),
@@ -1401,7 +1406,7 @@ std::vector<torch::Tensor> doc_v3_backward(
     {
         dim3 grid(BH * max_docs);
         dim3 block(d);
-        size_t smem = ((size_t)d * d + SCATTER_TILE * d) * sizeof(float);
+        size_t smem = ((size_t)d * (d + 1) + SCATTER_TILE * d) * sizeof(float);
         doc_v3_scatter_ctx_kernel<<<grid, block, smem>>>(
             K_.data_ptr<float>(), V_.data_ptr<float>(),
             src_doc.data_ptr<int>(),
@@ -1420,7 +1425,7 @@ std::vector<torch::Tensor> doc_v3_backward(
         int n_chunks = (tgt_len + T_CHUNK - 1) / T_CHUNK;
         dim3 grid(BH * max_docs, n_chunks);
         dim3 block(d);
-        size_t smem = ((size_t)d * d + 3 * d + n_warps) * sizeof(float);
+        size_t smem = ((size_t)d * (d + 1) + 3 * d + n_warps) * sizeof(float);
         doc_v3_bwd_grad_q_kernel<<<grid, block, smem>>>(
             Q_.data_ptr<float>(),
             context.data_ptr<float>(), z_buf.data_ptr<float>(),
@@ -1441,7 +1446,7 @@ std::vector<torch::Tensor> doc_v3_backward(
     {
         dim3 grid(BH * max_docs);
         dim3 block(d);
-        size_t smem = (size_t)2 * SCATTER_TILE * d * sizeof(float);
+        size_t smem = ((size_t)d * (d + 1) + 2 * SCATTER_TILE * d) * sizeof(float);
         doc_v3_bwd_grad_kv_kernel<<<grid, block, smem>>>(
             K_.data_ptr<float>(), V_.data_ptr<float>(),
             grad_ctx.data_ptr<float>(), grad_z.data_ptr<float>(),
@@ -1506,7 +1511,7 @@ std::vector<torch::Tensor> doc_v3_backward_cached(
         int n_chunks = (tgt_len + T_CHUNK - 1) / T_CHUNK;
         dim3 grid(BH * max_docs, n_chunks);
         dim3 block(d);
-        size_t smem = ((size_t)d * d + 3 * d + n_warps) * sizeof(float);
+        size_t smem = ((size_t)d * (d + 1) + 3 * d + n_warps) * sizeof(float);
         doc_v3_bwd_grad_q_kernel<<<grid, block, smem>>>(
             Q_.data_ptr<float>(),
             ctx_.data_ptr<float>(), z_.data_ptr<float>(),
@@ -1527,7 +1532,7 @@ std::vector<torch::Tensor> doc_v3_backward_cached(
     {
         dim3 grid(BH * max_docs);
         dim3 block(d);
-        size_t smem = (size_t)2 * SCATTER_TILE * d * sizeof(float);
+        size_t smem = ((size_t)d * (d + 1) + 2 * SCATTER_TILE * d) * sizeof(float);
         doc_v3_bwd_grad_kv_kernel<<<grid, block, smem>>>(
             K_.data_ptr<float>(), V_.data_ptr<float>(),
             grad_ctx.data_ptr<float>(), grad_z.data_ptr<float>(),
