@@ -63,6 +63,43 @@ std::vector<torch::Tensor> doc_fused_backward(
     int max_docs
 );
 
+// V3 split kernels — 2D grid parallelization
+std::vector<torch::Tensor> doc_v3_forward(
+    torch::Tensor Q,
+    torch::Tensor K,
+    torch::Tensor V,
+    torch::Tensor src_doc_ids,
+    torch::Tensor tgt_doc_ids,
+    int max_docs,
+    float eps
+);
+
+std::vector<torch::Tensor> doc_v3_backward(
+    torch::Tensor Q,
+    torch::Tensor K,
+    torch::Tensor V,
+    torch::Tensor fwd_out,
+    torch::Tensor fwd_den,
+    torch::Tensor grad_out,
+    torch::Tensor src_doc_ids,
+    torch::Tensor tgt_doc_ids,
+    int max_docs
+);
+
+std::vector<torch::Tensor> doc_v3_backward_cached(
+    torch::Tensor Q,
+    torch::Tensor K,
+    torch::Tensor V,
+    torch::Tensor fwd_out,
+    torch::Tensor fwd_den,
+    torch::Tensor grad_out,
+    torch::Tensor context,
+    torch::Tensor z_cached,
+    torch::Tensor tgt_doc_ids,
+    torch::Tensor src_doc_ids,
+    int max_docs
+);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // v2 separate kernels
     m.def("doc_scatter_kv_fwd", &doc_scatter_kv_fwd,
@@ -87,7 +124,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("out"), py::arg("den"), py::arg("grad_out"),
           py::arg("tgt_doc_ids"));
 
-    // Fused kernels (Grid=B*H*D, context in smem only)
+    // Fused kernels (v2 — Grid=B*H*D, context in smem only)
     m.def("doc_fused_forward", &doc_fused_forward,
           "Fused scatter+gather forward (context stays in smem)",
           py::arg("Q"), py::arg("K"), py::arg("V"),
@@ -100,4 +137,27 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("fwd_out"), py::arg("fwd_den"), py::arg("grad_out"),
           py::arg("src_doc_ids"), py::arg("tgt_doc_ids"),
           py::arg("max_docs"));
+
+    // V3 split kernels (2D grid parallelization)
+    m.def("doc_v3_forward", &doc_v3_forward,
+          "V3: forward returns (out, den, context, z) for backward caching",
+          py::arg("Q"), py::arg("K"), py::arg("V"),
+          py::arg("src_doc_ids"), py::arg("tgt_doc_ids"),
+          py::arg("max_docs"), py::arg("eps") = 1e-5f);
+
+    m.def("doc_v3_backward", &doc_v3_backward,
+          "V3: backward with scatter_ctx recomputation",
+          py::arg("Q"), py::arg("K"), py::arg("V"),
+          py::arg("fwd_out"), py::arg("fwd_den"), py::arg("grad_out"),
+          py::arg("src_doc_ids"), py::arg("tgt_doc_ids"),
+          py::arg("max_docs"));
+
+    m.def("doc_v3_backward_cached", &doc_v3_backward_cached,
+          "V3: backward with cached context/z (skip scatter_ctx)",
+          py::arg("Q"), py::arg("K"), py::arg("V"),
+          py::arg("fwd_out"), py::arg("fwd_den"), py::arg("grad_out"),
+          py::arg("context"), py::arg("z_cached"),
+          py::arg("tgt_doc_ids"), py::arg("src_doc_ids"),
+          py::arg("max_docs"));
 }
+

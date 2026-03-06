@@ -260,9 +260,17 @@ class _DocLinearAttnFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, src_doc_ids, tgt_doc_ids, max_docs, eps):
         ext = _load_cuda_doc_linear_attn()
-        out, den = ext.doc_fused_forward(q, k, v, src_doc_ids, tgt_doc_ids, max_docs, eps)
+        # V3: returns (out, den, context, z) — context/z cached for backward
+        if hasattr(ext, 'doc_v3_forward'):
+            results = ext.doc_v3_forward(q, k, v, src_doc_ids, tgt_doc_ids, max_docs, eps)
+            out, den, fwd_ctx, fwd_z = results[0], results[1], results[2], results[3]
+            ctx.save_for_backward(q, k, v, out, den, fwd_ctx, fwd_z)
+            ctx._v3_cached = True
+        else:
+            out, den = ext.doc_fused_forward(q, k, v, src_doc_ids, tgt_doc_ids, max_docs, eps)
+            ctx.save_for_backward(q, k, v, out, den)
+            ctx._v3_cached = False
 
-        ctx.save_for_backward(q, k, v, out, den)
         ctx.src_doc_ids = src_doc_ids
         ctx.tgt_doc_ids = tgt_doc_ids
         ctx.max_docs    = max_docs
@@ -270,13 +278,28 @@ class _DocLinearAttnFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_out):
-        q, k, v, out, den = ctx.saved_tensors
         ext = _load_cuda_doc_linear_attn()
 
-        grads = ext.doc_fused_backward(
-            q, k, v, out, den, grad_out.contiguous(),
-            ctx.src_doc_ids, ctx.tgt_doc_ids, ctx.max_docs
-        )
+        if ctx._v3_cached:
+            # V3 cached: skip scatter_ctx recomputation
+            q, k, v, out, den, fwd_ctx, fwd_z = ctx.saved_tensors
+            grads = ext.doc_v3_backward_cached(
+                q, k, v, out, den, grad_out.contiguous(),
+                fwd_ctx, fwd_z,
+                ctx.tgt_doc_ids, ctx.src_doc_ids, ctx.max_docs
+            )
+        elif hasattr(ext, 'doc_v3_backward'):
+            q, k, v, out, den = ctx.saved_tensors
+            grads = ext.doc_v3_backward(
+                q, k, v, out, den, grad_out.contiguous(),
+                ctx.src_doc_ids, ctx.tgt_doc_ids, ctx.max_docs
+            )
+        else:
+            q, k, v, out, den = ctx.saved_tensors
+            grads = ext.doc_fused_backward(
+                q, k, v, out, den, grad_out.contiguous(),
+                ctx.src_doc_ids, ctx.tgt_doc_ids, ctx.max_docs
+            )
         return grads[0], grads[1], grads[2], None, None, None, None
 
 

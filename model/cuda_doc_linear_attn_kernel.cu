@@ -842,7 +842,7 @@ __global__ void doc_fused_bwd_kernel(
 
 
 // =========================================================================
-// Fused C++ launchers
+// Fused C++ launchers (v2 — original, kept for compatibility)
 // =========================================================================
 
 std::pair<torch::Tensor, torch::Tensor> doc_fused_forward(
@@ -863,7 +863,6 @@ std::pair<torch::Tensor, torch::Tensor> doc_fused_forward(
     const int src_len = K.size(2);
     const int BH      = B * H;
 
-    // 내부 float32 변환 — Python 측 .float() 제거, autograd에 원본 dtype 저장 허용
     auto Q_ = Q.to(torch::kFloat32).contiguous().view({BH, tgt_len, d});
     auto K_ = K.to(torch::kFloat32).contiguous().view({BH, src_len, d});
     auto V_ = V.to(torch::kFloat32).contiguous().view({BH, src_len, d});
@@ -876,7 +875,6 @@ std::pair<torch::Tensor, torch::Tensor> doc_fused_forward(
     const int num_blocks = BH * max_docs;
     dim3 grid(num_blocks);
     dim3 block(d);
-    // ctx_sm[d*d] + z_sm[d] + vtile[SCATTER_TILE*d]
     size_t smem = ((size_t)d * d + d + SCATTER_TILE * d) * sizeof(float);
 
     doc_fused_fwd_kernel<<<grid, block, smem>>>(
@@ -892,15 +890,9 @@ std::pair<torch::Tensor, torch::Tensor> doc_fused_forward(
 
 
 std::vector<torch::Tensor> doc_fused_backward(
-    torch::Tensor Q,            // [B, H, tgt_len, d]  (any float dtype)
-    torch::Tensor K,            // [B, H, src_len, d]  (any float dtype)
-    torch::Tensor V,            // [B, H, src_len, d]  (any float dtype)
-    torch::Tensor fwd_out,      // [B, H, tgt_len, d]
-    torch::Tensor fwd_den,      // [B, H, tgt_len]
-    torch::Tensor grad_out_t,   // [B, H, tgt_len, d]
-    torch::Tensor src_doc_ids,  // [B, src_len] int32
-    torch::Tensor tgt_doc_ids,  // [B, tgt_len] int32
-    int max_docs
+    torch::Tensor Q, torch::Tensor K, torch::Tensor V,
+    torch::Tensor fwd_out, torch::Tensor fwd_den, torch::Tensor grad_out_t,
+    torch::Tensor src_doc_ids, torch::Tensor tgt_doc_ids, int max_docs
 ) {
     const int B       = Q.size(0);
     const int H       = Q.size(1);
@@ -909,7 +901,6 @@ std::vector<torch::Tensor> doc_fused_backward(
     const int src_len = K.size(2);
     const int BH      = B * H;
 
-    // 내부 float32 변환 — backward에서도 bf16 입력 허용
     auto Q_   = Q.to(torch::kFloat32).contiguous().view({BH, tgt_len, d});
     auto K_   = K.to(torch::kFloat32).contiguous().view({BH, src_len, d});
     auto V_   = V.to(torch::kFloat32).contiguous().view({BH, src_len, d});
@@ -927,7 +918,6 @@ std::vector<torch::Tensor> doc_fused_backward(
     const int n_warps = (d + 31) / 32;
     dim3 grid(num_blocks);
     dim3 block(d);
-    // ctx[d*d] + z[d] + gctx[d*d] + gz[d] + go_tile[TGT_TILE*d] + out_tile[TGT_TILE*d] + alpha_buf[TGT_TILE] + warp_buf[n_warps*TGT_TILE]
     size_t smem = ((size_t)2 * d * d + 2 * d + 2 * TGT_TILE * d + TGT_TILE + n_warps * TGT_TILE) * sizeof(float);
 
     doc_fused_bwd_kernel<<<grid, block, smem>>>(
@@ -944,3 +934,613 @@ std::vector<torch::Tensor> doc_fused_backward(
             grad_k.view({B, H, src_len, d}),
             grad_v.view({B, H, src_len, d})};
 }
+
+
+// #########################################################################
+//  V3 SPLIT KERNELS — 2D Grid 병렬화
+//
+//  핵심 개선:
+//    1. Backward 3-phase monolithic kernel → 3개 별도 커널 분리
+//    2. Phase 2 (grad_q + gctx/gz 누적): 2D grid로 tgt_len 병렬 처리
+//       Grid.y = ceil(tgt_len / T_CHUNK) → 블록 수 최대 16x 증가
+//    3. gctx/gz: 각 chunk 블록이 register에 부분합 누적 후 atomicAdd
+//    4. Forward도 scatter + gather_2d로 분리하여 Phase 2 병렬화
+//    5. smem: gctx/gz 제거 → 블록당 ~17KB (기존 ~33KB) → occupancy 향상
+//
+//  블록 수: 144 (기존) → 2304 (16x, T_CHUNK=128 기준)
+//  SM 점유율: 4.2% → ~20% (5 blocks/SM × 64 threads)
+// #########################################################################
+
+// Tgt chunk size for 2D grid parallelization
+#define T_CHUNK 128
+
+// =========================================================================
+// V3 Kernel 1: Scatter K^T·V → global context, z
+//   Grid:  (B*H*max_docs,)
+//   Block: (d,)
+//   Forward/Backward 공유. Binary search로 해당 doc의 src 범위만 처리.
+// =========================================================================
+__global__ void doc_v3_scatter_ctx_kernel(
+    const float* __restrict__ K,           // [B*H, src_len, d]
+    const float* __restrict__ V,           // [B*H, src_len, d]
+    const int*   __restrict__ src_doc_ids, // [B, src_len] sorted
+    float*       __restrict__ context,     // [B*H, max_docs, d, d] pre-zeroed
+    float*       __restrict__ z,           // [B*H, max_docs, d]     pre-zeroed
+    int B, int H, int src_len, int d, int max_docs
+) {
+    const int block_id = blockIdx.x;
+    const int doc = block_id % max_docs;
+    const int bh  = block_id / max_docs;
+    const int b   = bh / H;
+    const int i   = threadIdx.x;
+
+    if (i >= d) return;
+
+    const int* src_doc_b = src_doc_ids + (long)b * src_len;
+    const int src_s = d_lower_bound(src_doc_b, 0, src_len, doc);
+    const int src_e = d_upper_bound(src_doc_b, src_s, src_len, doc);
+
+    if (src_s >= src_e) return;
+
+    const float* K_bh = K + (long)bh * src_len * d;
+    const float* V_bh = V + (long)bh * src_len * d;
+
+    // smem: ctx_sm[d*d] + vtile[SCATTER_TILE*d]
+    extern __shared__ float smem_v3s[];
+    float* ctx_sm  = smem_v3s;
+    float* v_tile  = smem_v3s + d * d;
+
+    // Initialize smem context to zero
+    #pragma unroll 4
+    for (int j = 0; j < d; j++) ctx_sm[i * d + j] = 0.0f;
+    float z_acc = 0.0f;
+    __syncthreads();
+
+    for (int s = src_s; s < src_e; s += SCATTER_TILE) {
+        const int tile_end = min(s + SCATTER_TILE, src_e);
+        const int tile_sz  = tile_end - s;
+
+        for (int tt = 0; tt < tile_sz; tt++)
+            v_tile[tt * d + i] = __ldg(&V_bh[(long)(s + tt) * d + i]);
+        __syncthreads();
+
+        for (int tt = 0; tt < tile_sz; tt++) {
+            float k_i = __ldg(&K_bh[(long)(s + tt) * d + i]);
+            float* ctx_row = ctx_sm + i * d;
+            #pragma unroll 4
+            for (int j = 0; j < d; j++)
+                ctx_row[j] += k_i * v_tile[tt * d + j];
+            z_acc += k_i;
+        }
+        __syncthreads();
+    }
+
+    // Flush smem context to global (single coalesced write)
+    float* ctx_out = context + ((long)bh * max_docs * d * d + (long)doc * d * d + (long)i * d);
+    #pragma unroll 4
+    for (int j = 0; j < d; j++)
+        ctx_out[j] = ctx_sm[i * d + j];
+    z[((long)bh * max_docs * d + (long)doc * d) + i] = z_acc;
+}
+
+
+// =========================================================================
+// V3 Kernel 2: Gather from global context → out, den (2D grid)
+//   Grid:  (B*H*max_docs, ceil(tgt_len / T_CHUNK))
+//   Block: (d,)
+//   smem: ctx_sm[d*d] + z_sm[d] + q_sm[d] = (d+2)*d floats ≈ 17KB
+// =========================================================================
+__global__ void doc_v3_gather_query_kernel(
+    const float* __restrict__ Q,           // [B*H, tgt_len, d]
+    const float* __restrict__ context,     // [B*H, max_docs, d, d]
+    const float* __restrict__ z,           // [B*H, max_docs, d]
+    const int*   __restrict__ tgt_doc_ids, // [B, tgt_len] sorted
+    float*       __restrict__ out,         // [B*H, tgt_len, d]
+    float*       __restrict__ den_out,     // [B*H, tgt_len]
+    int B, int H, int tgt_len, int d, int max_docs, float eps
+) {
+    const int doc = blockIdx.x % max_docs;
+    const int bh  = blockIdx.x / max_docs;
+    const int b   = bh / H;
+    const int chunk_id = blockIdx.y;
+    const int i   = threadIdx.x;
+
+    if (i >= d) return;
+
+    const int* tgt_doc_b = tgt_doc_ids + (long)b * tgt_len;
+
+    // Full doc range (binary search)
+    const int doc_s = d_lower_bound(tgt_doc_b, 0, tgt_len, doc);
+    const int doc_e = d_upper_bound(tgt_doc_b, doc_s, tgt_len, doc);
+
+    // This chunk's range within the doc
+    const int t_start = doc_s + chunk_id * T_CHUNK;
+    const int t_end   = min(t_start + T_CHUNK, doc_e);
+
+    if (t_start >= doc_e) return;
+
+    // Load context + z for this doc into smem (once per block)
+    extern __shared__ float smem_v3g[];
+    float* ctx_sm = smem_v3g;
+    float* z_sm   = smem_v3g + d * d;
+    float* q_sm   = smem_v3g + d * d + d;
+
+    const float* ctx_d = context + ((long)bh * max_docs * d * d + (long)doc * d * d);
+    const float* z_d   = z       + ((long)bh * max_docs * d     + (long)doc * d);
+
+    for (int jj = 0; jj < d; jj++)
+        ctx_sm[i * d + jj] = ctx_d[i * d + jj];
+    z_sm[i] = z_d[i];
+    __syncthreads();
+
+    const float* Q_bh   = Q       + (long)bh * tgt_len * d;
+    float*       out_bh = out     + (long)bh * tgt_len * d;
+    float*       den_bh = den_out + (long)bh * tgt_len;
+
+    for (int t = t_start; t < t_end; t++) {
+        q_sm[i] = __ldg(&Q_bh[(long)t * d + i]);
+        __syncthreads();
+
+        float num = 0.0f, den = 0.0f;
+        #pragma unroll 4
+        for (int r = 0; r < d; r++) {
+            float q_r = q_sm[r];
+            num += q_r * ctx_sm[r * d + i];
+            den += q_r * z_sm[r];
+        }
+        float den_eps = den + eps;
+        out_bh[(long)t * d + i] = num / den_eps;
+        if (i == 0) den_bh[t] = den_eps;
+        __syncthreads();
+    }
+}
+
+
+// =========================================================================
+// V3 Kernel 3: Backward Phase 2 — grad_q + gctx/gz accumulation (2D grid)
+//   Grid:  (B*H*max_docs, ceil(tgt_len / T_CHUNK))
+//   Block: (d,)
+//   각 블록이 T_CHUNK개의 tgt 위치를 처리하고, gctx/gz를 register에 누적한 뒤
+//   마지막에 atomicAdd로 global grad_ctx/grad_z에 합산.
+//   smem: ctx_sm[d*d] + z_sm[d] + go_buf[d] + out_buf[d] + warp_buf[n_warps]
+//         ≈ 17.3KB (d=64 기준)
+// =========================================================================
+__global__ void doc_v3_bwd_grad_q_kernel(
+    const float* __restrict__ Q,           // [B*H, tgt_len, d]
+    const float* __restrict__ context,     // [B*H, max_docs, d, d]
+    const float* __restrict__ z,           // [B*H, max_docs, d]
+    const float* __restrict__ fwd_out,     // [B*H, tgt_len, d]
+    const float* __restrict__ fwd_den,     // [B*H, tgt_len]
+    const float* __restrict__ grad_out,    // [B*H, tgt_len, d]
+    const int*   __restrict__ tgt_doc_ids, // [B, tgt_len] sorted
+    float*       __restrict__ grad_q,      // [B*H, tgt_len, d]
+    float*       __restrict__ grad_ctx,    // [B*H, max_docs, d, d]  pre-zeroed, atomicAdd
+    float*       __restrict__ grad_z,      // [B*H, max_docs, d]     pre-zeroed, atomicAdd
+    int B, int H, int tgt_len, int d, int max_docs
+) {
+    const int doc = blockIdx.x % max_docs;
+    const int bh  = blockIdx.x / max_docs;
+    const int b   = bh / H;
+    const int chunk_id = blockIdx.y;
+    const int i   = threadIdx.x;
+
+    if (i >= d) return;
+
+    const int* tgt_doc_b = tgt_doc_ids + (long)b * tgt_len;
+    const int doc_s = d_lower_bound(tgt_doc_b, 0, tgt_len, doc);
+    const int doc_e = d_upper_bound(tgt_doc_b, doc_s, tgt_len, doc);
+
+    const int t_start = doc_s + chunk_id * T_CHUNK;
+    const int t_end   = min(t_start + T_CHUNK, doc_e);
+
+    if (t_start >= doc_e) return;
+
+    // smem layout
+    const int n_warps = (d + 31) / 32;
+    extern __shared__ float smem_v3q[];
+    float* ctx_sm  = smem_v3q;
+    float* z_sm    = smem_v3q + d * d;
+    float* go_sm   = smem_v3q + d * d + d;
+    float* out_sm  = smem_v3q + d * d + d + d;
+    float* warp_buf = smem_v3q + d * d + d + d + d;
+
+    // Load context + z for this doc
+    const float* ctx_d = context + ((long)bh * max_docs * d * d + (long)doc * d * d);
+    const float* z_d   = z       + ((long)bh * max_docs * d     + (long)doc * d);
+
+    for (int jj = 0; jj < d; jj++)
+        ctx_sm[i * d + jj] = ctx_d[i * d + jj];
+    z_sm[i] = z_d[i];
+    __syncthreads();
+
+    const float* Q_bh   = Q        + (long)bh * tgt_len * d;
+    const float* out_bh = fwd_out  + (long)bh * tgt_len * d;
+    const float* den_bh = fwd_den  + (long)bh * tgt_len;
+    const float* go_bh  = grad_out + (long)bh * tgt_len * d;
+    float*       gq_bh  = grad_q   + (long)bh * tgt_len * d;
+
+    // Register accumulators for gctx row i (d values) and gz[i]
+    float gctx_reg[64];  // max d=64
+    for (int j = 0; j < d; j++) gctx_reg[j] = 0.0f;
+    float gz_reg = 0.0f;
+
+    for (int t = t_start; t < t_end; t++) {
+        // Load go[t] and out[t]
+        go_sm[i]  = __ldg(&go_bh[(long)t * d + i]);
+        out_sm[i] = __ldg(&out_bh[(long)t * d + i]);
+        __syncthreads();
+
+        float inv_den = 1.0f / fmaxf(__ldg(&den_bh[t]), 0.1f);
+        float q_i     = __ldg(&Q_bh[(long)t * d + i]);
+
+        // alpha = Σ_j go[j]*out[j]: warp reduce
+        float alpha_part = go_sm[i] * out_sm[i];
+        float alpha_warp = warp_reduce_sum(alpha_part);
+        int warp_id = i >> 5;
+        int lane_id = i & 31;
+        if (lane_id == 0) warp_buf[warp_id] = alpha_warp;
+        __syncthreads();
+
+        float alpha = 0.0f;
+        for (int w = 0; w < n_warps; w++) alpha += warp_buf[w];
+
+        // grad_q[t, i] = inv_den * (Σ_j ctx[i,j]*go[j] - alpha * z[i])
+        float ctx_go = 0.0f;
+        const float* ctx_row = ctx_sm + (long)i * d;
+        #pragma unroll 4
+        for (int j = 0; j < d; j++)
+            ctx_go += ctx_row[j] * go_sm[j];
+        gq_bh[(long)t * d + i] = inv_den * (ctx_go - alpha * z_sm[i]);
+
+        // Accumulate gctx[i,j] += q_bar_i * go[j]
+        float q_bar_i = q_i * inv_den;
+        #pragma unroll 4
+        for (int j = 0; j < d; j++)
+            gctx_reg[j] += q_bar_i * go_sm[j];
+
+        // Accumulate gz[i] += -q_bar_i * alpha
+        gz_reg += -q_bar_i * alpha;
+
+        __syncthreads();
+    }
+
+    // Flush gctx_reg and gz_reg to global via atomicAdd
+    float* gctx_row = grad_ctx + ((long)bh * max_docs * d * d + (long)doc * d * d + (long)i * d);
+    float* gz_ptr   = grad_z   + ((long)bh * max_docs * d     + (long)doc * d);
+
+    #pragma unroll 4
+    for (int j = 0; j < d; j++)
+        atomicAdd(&gctx_row[j], gctx_reg[j]);
+    atomicAdd(&gz_ptr[i], gz_reg);
+}
+
+
+// =========================================================================
+// V3 Kernel 4: Backward Phase 3 — grad_k, grad_v from global gctx/gz
+//   Grid:  (B*H*max_docs,)
+//   Block: (d,)
+//   Identical to old Phase 3, but reads gctx/gz from global memory.
+// =========================================================================
+__global__ void doc_v3_bwd_grad_kv_kernel(
+    const float* __restrict__ K,           // [B*H, src_len, d]
+    const float* __restrict__ V,           // [B*H, src_len, d]
+    const float* __restrict__ grad_ctx,    // [B*H, max_docs, d, d]
+    const float* __restrict__ grad_z,      // [B*H, max_docs, d]
+    const int*   __restrict__ src_doc_ids, // [B, src_len] sorted
+    float*       __restrict__ grad_k,      // [B*H, src_len, d]
+    float*       __restrict__ grad_v,      // [B*H, src_len, d]
+    int B, int H, int src_len, int d, int max_docs
+) {
+    const int block_id = blockIdx.x;
+    const int doc = block_id % max_docs;
+    const int bh  = block_id / max_docs;
+    const int b   = bh / H;
+    const int i   = threadIdx.x;
+
+    if (i >= d) return;
+
+    const int* src_doc_b = src_doc_ids + (long)b * src_len;
+    const int src_s = d_lower_bound(src_doc_b, 0, src_len, doc);
+    const int src_e = d_upper_bound(src_doc_b, src_s, src_len, doc);
+
+    if (src_s >= src_e) return;
+
+    const float* K_bh    = K        + (long)bh * src_len * d;
+    const float* V_bh    = V        + (long)bh * src_len * d;
+    const float* gctx_d  = grad_ctx + ((long)bh * max_docs * d * d + (long)doc * d * d);
+    const float* gz_d    = grad_z   + ((long)bh * max_docs * d     + (long)doc * d);
+    float*       gk_bh   = grad_k   + (long)bh * src_len * d;
+    float*       gv_bh   = grad_v   + (long)bh * src_len * d;
+
+    // Load gctx row i and gz[i] to registers
+    float gctx_row_reg[64];
+    const float* gctx_row = gctx_d + (long)i * d;
+    for (int j = 0; j < d; j++) gctx_row_reg[j] = gctx_row[j];
+    float gz_i = gz_d[i];
+
+    // smem for K/V tiles
+    extern __shared__ float smem_v3kv[];
+    float* k_tile = smem_v3kv;
+    float* v_tile = smem_v3kv + SCATTER_TILE * d;
+
+    for (int s = src_s; s < src_e; s += SCATTER_TILE) {
+        const int tile_end = min(s + SCATTER_TILE, src_e);
+        const int tile_sz  = tile_end - s;
+
+        for (int tt = 0; tt < tile_sz; tt++) {
+            k_tile[tt * d + i] = __ldg(&K_bh[(long)(s + tt) * d + i]);
+            v_tile[tt * d + i] = __ldg(&V_bh[(long)(s + tt) * d + i]);
+        }
+        __syncthreads();
+
+        for (int tt = 0; tt < tile_sz; tt++) {
+            // grad_k[s+tt, i] = Σ_j gctx[i,j]*v[s+tt,j] + gz[i]
+            float gk_val = gz_i;
+            #pragma unroll 4
+            for (int j = 0; j < d; j++)
+                gk_val += gctx_row_reg[j] * v_tile[tt * d + j];
+            gk_bh[(long)(s + tt) * d + i] = gk_val;
+
+            // grad_v[s+tt, i] = Σ_r gctx[r,i]*k[s+tt,r]
+            float gv_val = 0.0f;
+            #pragma unroll 4
+            for (int r = 0; r < d; r++)
+                gv_val += gctx_d[(long)r * d + i] * k_tile[tt * d + r];
+            gv_bh[(long)(s + tt) * d + i] = gv_val;
+        }
+        __syncthreads();
+    }
+}
+
+
+// =========================================================================
+// V3 C++ Launchers
+// =========================================================================
+
+std::vector<torch::Tensor> doc_v3_forward(
+    torch::Tensor Q,            // [B, H, tgt_len, d]
+    torch::Tensor K,            // [B, H, src_len, d]
+    torch::Tensor V,            // [B, H, src_len, d]
+    torch::Tensor src_doc_ids,  // [B, src_len] int32
+    torch::Tensor tgt_doc_ids,  // [B, tgt_len] int32
+    int max_docs,
+    float eps
+) {
+    TORCH_CHECK(Q.is_cuda(), "Q must be on CUDA");
+
+    const int B       = Q.size(0);
+    const int H       = Q.size(1);
+    const int tgt_len = Q.size(2);
+    const int d       = Q.size(3);
+    const int src_len = K.size(2);
+    const int BH      = B * H;
+
+    auto Q_ = Q.to(torch::kFloat32).contiguous().view({BH, tgt_len, d});
+    auto K_ = K.to(torch::kFloat32).contiguous().view({BH, src_len, d});
+    auto V_ = V.to(torch::kFloat32).contiguous().view({BH, src_len, d});
+    auto src_doc = src_doc_ids.contiguous().to(torch::kInt32);
+    auto tgt_doc = tgt_doc_ids.contiguous().to(torch::kInt32);
+    auto opts = Q_.options();
+
+    // Step 1: Scatter K,V → global context, z
+    auto context = torch::zeros({BH, max_docs, d, d}, opts);
+    auto z_buf   = torch::zeros({BH, max_docs, d},    opts);
+
+    {
+        dim3 grid(BH * max_docs);
+        dim3 block(d);
+        size_t smem = ((size_t)d * d + SCATTER_TILE * d) * sizeof(float);
+        doc_v3_scatter_ctx_kernel<<<grid, block, smem>>>(
+            K_.data_ptr<float>(), V_.data_ptr<float>(),
+            src_doc.data_ptr<int>(),
+            context.data_ptr<float>(), z_buf.data_ptr<float>(),
+            B, H, src_len, d, max_docs
+        );
+        TORCH_CHECK(cudaGetLastError() == cudaSuccess, "doc_v3_scatter_ctx_kernel failed");
+    }
+
+    // Step 2: Gather from context → out, den  (2D grid over tgt chunks)
+    auto out     = torch::empty({BH, tgt_len, d}, opts);
+    auto den_out = torch::empty({BH, tgt_len},    opts);
+
+    {
+        int n_chunks = (tgt_len + T_CHUNK - 1) / T_CHUNK;
+        dim3 grid(BH * max_docs, n_chunks);
+        dim3 block(d);
+        size_t smem = ((size_t)d * d + d + d) * sizeof(float);
+        doc_v3_gather_query_kernel<<<grid, block, smem>>>(
+            Q_.data_ptr<float>(),
+            context.data_ptr<float>(), z_buf.data_ptr<float>(),
+            tgt_doc.data_ptr<int>(),
+            out.data_ptr<float>(), den_out.data_ptr<float>(),
+            B, H, tgt_len, d, max_docs, eps
+        );
+        TORCH_CHECK(cudaGetLastError() == cudaSuccess, "doc_v3_gather_query_kernel failed");
+    }
+
+    // Return all 4: out, den, context, z (context/z cached for backward)
+    return {out.view({B, H, tgt_len, d}), den_out.view({B, H, tgt_len}),
+            context, z_buf};
+}
+
+
+std::vector<torch::Tensor> doc_v3_backward(
+    torch::Tensor Q,            // [B, H, tgt_len, d]
+    torch::Tensor K,            // [B, H, src_len, d]
+    torch::Tensor V,            // [B, H, src_len, d]
+    torch::Tensor fwd_out,      // [B, H, tgt_len, d]
+    torch::Tensor fwd_den,      // [B, H, tgt_len]
+    torch::Tensor grad_out_t,   // [B, H, tgt_len, d]
+    torch::Tensor src_doc_ids,  // [B, src_len] int32
+    torch::Tensor tgt_doc_ids,  // [B, tgt_len] int32
+    int max_docs
+) {
+    const int B       = Q.size(0);
+    const int H       = Q.size(1);
+    const int tgt_len = Q.size(2);
+    const int d       = Q.size(3);
+    const int src_len = K.size(2);
+    const int BH      = B * H;
+
+    auto Q_   = Q.to(torch::kFloat32).contiguous().view({BH, tgt_len, d});
+    auto K_   = K.to(torch::kFloat32).contiguous().view({BH, src_len, d});
+    auto V_   = V.to(torch::kFloat32).contiguous().view({BH, src_len, d});
+    auto out_ = fwd_out.to(torch::kFloat32).contiguous().view({BH, tgt_len, d});
+    auto den_ = fwd_den.to(torch::kFloat32).contiguous().view({BH, tgt_len});
+    auto go_  = grad_out_t.to(torch::kFloat32).contiguous().view({BH, tgt_len, d});
+    auto src_doc = src_doc_ids.contiguous().to(torch::kInt32);
+    auto tgt_doc = tgt_doc_ids.contiguous().to(torch::kInt32);
+    auto opts = Q_.options();
+
+    const int n_warps = (d + 31) / 32;
+
+    // Step 1: Recompute context, z (no cache available)
+    auto context = torch::zeros({BH, max_docs, d, d}, opts);
+    auto z_buf   = torch::zeros({BH, max_docs, d},    opts);
+
+    {
+        dim3 grid(BH * max_docs);
+        dim3 block(d);
+        size_t smem = ((size_t)d * d + SCATTER_TILE * d) * sizeof(float);
+        doc_v3_scatter_ctx_kernel<<<grid, block, smem>>>(
+            K_.data_ptr<float>(), V_.data_ptr<float>(),
+            src_doc.data_ptr<int>(),
+            context.data_ptr<float>(), z_buf.data_ptr<float>(),
+            B, H, src_len, d, max_docs
+        );
+        TORCH_CHECK(cudaGetLastError() == cudaSuccess, "v3 bwd scatter_ctx failed");
+    }
+
+    // Step 2: grad_q + accumulate grad_ctx, grad_z (2D grid)
+    auto grad_q   = torch::empty({BH, tgt_len, d}, opts);
+    auto grad_ctx = torch::zeros({BH, max_docs, d, d}, opts);
+    auto grad_z   = torch::zeros({BH, max_docs, d},    opts);
+
+    {
+        int n_chunks = (tgt_len + T_CHUNK - 1) / T_CHUNK;
+        dim3 grid(BH * max_docs, n_chunks);
+        dim3 block(d);
+        size_t smem = ((size_t)d * d + 3 * d + n_warps) * sizeof(float);
+        doc_v3_bwd_grad_q_kernel<<<grid, block, smem>>>(
+            Q_.data_ptr<float>(),
+            context.data_ptr<float>(), z_buf.data_ptr<float>(),
+            out_.data_ptr<float>(), den_.data_ptr<float>(),
+            go_.data_ptr<float>(),
+            tgt_doc.data_ptr<int>(),
+            grad_q.data_ptr<float>(),
+            grad_ctx.data_ptr<float>(), grad_z.data_ptr<float>(),
+            B, H, tgt_len, d, max_docs
+        );
+        TORCH_CHECK(cudaGetLastError() == cudaSuccess, "v3 bwd grad_q failed");
+    }
+
+    // Step 3: grad_k, grad_v from grad_ctx, grad_z
+    auto grad_k = torch::empty({BH, src_len, d}, opts);
+    auto grad_v = torch::empty({BH, src_len, d}, opts);
+
+    {
+        dim3 grid(BH * max_docs);
+        dim3 block(d);
+        size_t smem = (size_t)2 * SCATTER_TILE * d * sizeof(float);
+        doc_v3_bwd_grad_kv_kernel<<<grid, block, smem>>>(
+            K_.data_ptr<float>(), V_.data_ptr<float>(),
+            grad_ctx.data_ptr<float>(), grad_z.data_ptr<float>(),
+            src_doc.data_ptr<int>(),
+            grad_k.data_ptr<float>(), grad_v.data_ptr<float>(),
+            B, H, src_len, d, max_docs
+        );
+        TORCH_CHECK(cudaGetLastError() == cudaSuccess, "v3 bwd grad_kv failed");
+    }
+
+    return {grad_q.view({B, H, tgt_len, d}),
+            grad_k.view({B, H, src_len, d}),
+            grad_v.view({B, H, src_len, d})};
+}
+
+
+// Cached backward: skip scatter_ctx recomputation, use pre-computed context/z
+std::vector<torch::Tensor> doc_v3_backward_cached(
+    torch::Tensor Q,            // [B, H, tgt_len, d]
+    torch::Tensor K,            // [B, H, src_len, d]
+    torch::Tensor V,            // [B, H, src_len, d]
+    torch::Tensor fwd_out,      // [B, H, tgt_len, d]
+    torch::Tensor fwd_den,      // [B, H, tgt_len]
+    torch::Tensor grad_out_t,   // [B, H, tgt_len, d]
+    torch::Tensor context,      // [B*H, max_docs, d, d] — from forward
+    torch::Tensor z_cached,     // [B*H, max_docs, d]     — from forward
+    torch::Tensor tgt_doc_ids,  // [B, tgt_len] int32
+    torch::Tensor src_doc_ids,  // [B, src_len] int32
+    int max_docs
+) {
+    const int B       = Q.size(0);
+    const int H       = Q.size(1);
+    const int tgt_len = Q.size(2);
+    const int d       = Q.size(3);
+    const int src_len = K.size(2);
+    const int BH      = B * H;
+
+    auto Q_   = Q.to(torch::kFloat32).contiguous().view({BH, tgt_len, d});
+    auto K_   = K.to(torch::kFloat32).contiguous().view({BH, src_len, d});
+    auto V_   = V.to(torch::kFloat32).contiguous().view({BH, src_len, d});
+    auto out_ = fwd_out.to(torch::kFloat32).contiguous().view({BH, tgt_len, d});
+    auto den_ = fwd_den.to(torch::kFloat32).contiguous().view({BH, tgt_len});
+    auto go_  = grad_out_t.to(torch::kFloat32).contiguous().view({BH, tgt_len, d});
+    auto tgt_doc = tgt_doc_ids.contiguous().to(torch::kInt32);
+    auto src_doc = src_doc_ids.contiguous().to(torch::kInt32);
+    auto opts = Q_.options();
+
+    // context/z already in float32 from forward — just ensure contiguous
+    auto ctx_ = context.contiguous();
+    auto z_   = z_cached.contiguous();
+
+    const int n_warps = (d + 31) / 32;
+
+    // Step 1: SKIPPED — context/z from forward cache
+
+    // Step 2: grad_q + accumulate grad_ctx, grad_z (2D grid)
+    auto grad_q   = torch::empty({BH, tgt_len, d}, opts);
+    auto grad_ctx = torch::zeros({BH, max_docs, d, d}, opts);
+    auto grad_z   = torch::zeros({BH, max_docs, d},    opts);
+
+    {
+        int n_chunks = (tgt_len + T_CHUNK - 1) / T_CHUNK;
+        dim3 grid(BH * max_docs, n_chunks);
+        dim3 block(d);
+        size_t smem = ((size_t)d * d + 3 * d + n_warps) * sizeof(float);
+        doc_v3_bwd_grad_q_kernel<<<grid, block, smem>>>(
+            Q_.data_ptr<float>(),
+            ctx_.data_ptr<float>(), z_.data_ptr<float>(),
+            out_.data_ptr<float>(), den_.data_ptr<float>(),
+            go_.data_ptr<float>(),
+            tgt_doc.data_ptr<int>(),
+            grad_q.data_ptr<float>(),
+            grad_ctx.data_ptr<float>(), grad_z.data_ptr<float>(),
+            B, H, tgt_len, d, max_docs
+        );
+        TORCH_CHECK(cudaGetLastError() == cudaSuccess, "v3 cached bwd grad_q failed");
+    }
+
+    // Step 3: grad_k, grad_v from grad_ctx, grad_z
+    auto grad_k = torch::empty({BH, src_len, d}, opts);
+    auto grad_v = torch::empty({BH, src_len, d}, opts);
+
+    {
+        dim3 grid(BH * max_docs);
+        dim3 block(d);
+        size_t smem = (size_t)2 * SCATTER_TILE * d * sizeof(float);
+        doc_v3_bwd_grad_kv_kernel<<<grid, block, smem>>>(
+            K_.data_ptr<float>(), V_.data_ptr<float>(),
+            grad_ctx.data_ptr<float>(), grad_z.data_ptr<float>(),
+            src_doc.data_ptr<int>(),
+            grad_k.data_ptr<float>(), grad_v.data_ptr<float>(),
+            B, H, src_len, d, max_docs
+        );
+        TORCH_CHECK(cudaGetLastError() == cudaSuccess, "v3 cached bwd grad_kv failed");
+    }
+
+    return {grad_q.view({B, H, tgt_len, d}),
+            grad_k.view({B, H, src_len, d}),
+            grad_v.view({B, H, src_len, d})};
+}
+
+
