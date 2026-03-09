@@ -152,12 +152,18 @@ def elu_feature_map(x: torch.Tensor) -> torch.Tensor:
 
 
 def relu1p_feature_map(x: torch.Tensor) -> torch.Tensor:
-    """리니어 어텐션을 위한 양수 보장 특징 매핑: phi(x) = relu(x) + 1
-
-    elu+1과 달리 출력이 항상 ≥ 1이므로 z=sum(phi(K))가 0에 가까워질 수 없어
-    backward에서 1/den 폭발을 구조적으로 방지합니다.
-    """
+    """(deprecated) phi(x) = relu(x) + 1 — gelu1p 로 대체됨"""
     return F.relu(x) + 1.0
+
+
+def gelu1p_feature_map(x: torch.Tensor) -> torch.Tensor:
+    """리니어 어텐션을 위한 양수 보장 특징 매핑: phi(x) = gelu(x) + 1
+
+    relu+1과 달리 x < 0 영역에서도 smooth gradient가 전달되어
+    attention weight 학습이 더 원활합니다.
+    출력 하한 ≈ 0.83 (GELU 최솟값 ≈ -0.17 at x ≈ -0.75) → 양수 보장.
+    """
+    return F.gelu(x) + 1.0
 
 
 # =========================================================================
@@ -397,8 +403,8 @@ class LinearCrossAttention(nn.Module):
 
         # 2. Apply feature map to make keys and queries positive
         #    phi(x) = relu(x) + 1  (≥1 보장 → z=sum(phi(K)) 0 방지)
-        q = relu1p_feature_map(q)
-        k = relu1p_feature_map(k)
+        q = gelu1p_feature_map(q)
+        k = gelu1p_feature_map(k)
 
         # 3. Apply Mask to K and V (PAD masking)
         if encoder_mask is not None:

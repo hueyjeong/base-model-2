@@ -26,19 +26,20 @@ class BitMambaSeq2Seq(nn.Module):
         super().__init__()
         self.config = config
 
-        # --- 임베딩 (FP16) ---
+        # --- 임베딩 (BF16) ---
+        # FP16(max=65504)은 tie_lm_head 시 gradient overflow 발생 →
+        # BF16(max=3.4e38)으로 전환. 메모리 동일(2B/param), 지수 범위 FP32 동급.
         self.encoder_embedding = nn.Embedding(
             config.vocab_size, config.d_model, padding_idx=config.pad_id,
         )
-        # 임베딩을 FP16으로 유지
-        self.encoder_embedding = self.encoder_embedding.half()
+        self.encoder_embedding = self.encoder_embedding.bfloat16()
 
         if config.tie_embeddings:
             self.decoder_embedding = self.encoder_embedding
         else:
             self.decoder_embedding = nn.Embedding(
                 config.vocab_size, config.d_model, padding_idx=config.pad_id,
-            ).half()
+            ).bfloat16()
 
         # 임베딩 스케일링 (d_model ** 0.5)
         self.embed_scale = config.d_model ** 0.5
