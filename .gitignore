@@ -37,6 +37,15 @@ _tmp_*
 *.swo
 *~
 
+# Exported model (large files)
+exported/
+
+# Rust build artifacts
+inference/target/
+
+# Zone.Identifier (WSL)
+*.Zone.Identifier
+
 # OS
 .DS_Store
 Thumbs.db
