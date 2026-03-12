@@ -1232,11 +1232,14 @@ struct DecoderBufs {
     q_h: Vec<f32>,         // d_head (64)
     x_norm_buf: Vec<f32>,  // max(in_dim) for BitLinear layernorm
     x_u8: Vec<u8>,         // int8 양자화된 활성화 버퍼 (AVX-VNNI용)
+    // per-token 할당 제거용 사전할당 버퍼
+    logits: Vec<f32>,      // vocab_size
+    embed: Vec<f32>,       // d_model (embed_one 결과)
 }
 
 impl DecoderBufs {
     fn new(d_model: usize, proj_dim: usize, conv_ch: usize, d_ff: usize,
-           d_inner: usize, d_head: usize, max_in_dim: usize) -> Self {
+           d_inner: usize, d_head: usize, max_in_dim: usize, vocab_size: usize) -> Self {
         Self {
             proj: vec![0.0; proj_dim],
             xbc: vec![0.0; conv_ch],
@@ -1251,6 +1254,8 @@ impl DecoderBufs {
             q_h: vec![0.0; d_head],
             x_norm_buf: vec![0.0; max_in_dim],
             x_u8: vec![0u8; max_in_dim],
+            logits: vec![0.0; vocab_size],
+            embed: vec![0.0; d_model],
         }
     }
 }
@@ -1659,15 +1664,13 @@ impl BitMambaSeq2Seq {
     }
 
     #[inline]
-    fn embed_one(&self, id: u32) -> Vec<f32> {
+    fn embed_one_into(&self, id: u32, out: &mut [f32]) {
         let d = self.cfg.d_model;
         let scale = self.cfg.embed_scale();
         let offset = id as usize * d;
-        let mut out = vec![0.0f32; d];
         for i in 0..d {
             out[i] = self.embed_data[offset + i] * scale;
         }
-        out
     }
 
     pub fn encode(&self, src_ids: &[u32]) -> Result<Tensor> {
@@ -1703,17 +1706,19 @@ impl BitMambaSeq2Seq {
         }
     }
 
-    /// Incremental 1-token decode step → logits
+    /// Incremental 1-token decode step → logits (bufs.logits에 결과 저장, 할당 없음)
     fn decode_step(
         &self,
         token_id: u32,
         state: &mut DecoderState,
-        src_ids: &[u32],
+        copy_logits: &[f32],
         bufs: &mut DecoderBufs,
-    ) -> Vec<f32> {
+    ) {
         let d = self.cfg.d_model;
 
-        let mut x = self.embed_one(token_id);
+        // embed를 bufs에서 분리하여 borrow 충돌 방지
+        let mut x = std::mem::take(&mut bufs.embed);
+        self.embed_one_into(token_id, &mut x);
 
         for (i, layer) in self.decoder_layers.iter().enumerate() {
             layer.step(
@@ -1722,15 +1727,14 @@ impl BitMambaSeq2Seq {
                 &state.cross_attn_caches[i],
                 bufs,
             );
-            // normed가 결과 — x에 복사
-            x.copy_from_slice(&bufs.normed[..d]);
+            x[..d].copy_from_slice(&bufs.normed[..d]);
         }
 
         // final_norm
         self.final_norm.forward_vec(&x, &mut bufs.normed);
+        bufs.embed = x;  // 반환
 
         // LM Head via AVX-VNNI i8
-        let mut logits = vec![0.0f32; self.cfg.vocab_size];
         let x_scale = unsafe {
             quantize_f32_to_u8(bufs.normed.as_ptr(), bufs.x_u8.as_mut_ptr(), d as c_int)
         };
@@ -1738,7 +1742,7 @@ impl BitMambaSeq2Seq {
             i8_sgemv(
                 self.lm_head_i8.as_ptr(),
                 bufs.x_u8.as_ptr(),
-                logits.as_mut_ptr(),
+                bufs.logits.as_mut_ptr(),
                 self.cfg.vocab_size as c_int,
                 d as c_int,
                 self.lm_head_row_sums.as_ptr(),
@@ -1748,33 +1752,18 @@ impl BitMambaSeq2Seq {
             );
         }
 
-        // Copy Gate
-        if let Some(ref gate_proj) = self.copy_gate {
+        // Copy Gate (사전계산된 copy_logits 사용)
+        if self.copy_gate.is_some() {
+            let gate_proj = self.copy_gate.as_ref().unwrap();
             gate_proj.forward_vec(&bufs.normed, &mut bufs.out, &mut bufs.x_u8);
             let raw_sig = 1.0 / (1.0 + (-bufs.out[0]).exp());
             let gate = 0.5 + 0.5 * raw_sig;
             let one_minus_gate = 1.0 - gate;
 
-            let mut p_copy = vec![0.0f32; self.cfg.vocab_size];
-            let mut count = 0.0f32;
-            for &id in src_ids {
-                if id != self.cfg.pad_id {
-                    p_copy[id as usize] += 1.0;
-                    count += 1.0;
-                }
-            }
-            if count > 0.0 {
-                let inv_count = 1.0 / count;
-                for v in p_copy.iter_mut() { *v *= inv_count; }
-            }
-
             for v in 0..self.cfg.vocab_size {
-                let copy_logit = (p_copy[v].max(1e-5)).ln();
-                logits[v] = gate * logits[v] + one_minus_gate * copy_logit;
+                bufs.logits[v] = gate * bufs.logits[v] + one_minus_gate * copy_logits[v];
             }
         }
-
-        logits
     }
 
     /// Auto-regressive 생성 (state를 외부에서 받음 — 타이밍 분리용)
@@ -1788,7 +1777,7 @@ impl BitMambaSeq2Seq {
         dec_state: &mut DecoderState,
     ) -> Result<Vec<u32>> {
         let d_model = self.cfg.d_model;
-        // 첫 디코더 레이어에서 proj_dim과 conv_channels, d_ff 가져오기
+        let vocab_size = self.cfg.vocab_size;
         let proj_dim = self.decoder_layers[0].mamba.proj_dim;
         let conv_ch = self.decoder_layers[0].mamba.conv_channels;
         let d_ff = self.decoder_layers[0].ffn.d_ff;
@@ -1797,14 +1786,38 @@ impl BitMambaSeq2Seq {
         let d_head = 64usize;
         let max_in_dim = d_model.max(d_inner).max(self.cfg.d_ff);
         let mut bufs = DecoderBufs::new(d_model, proj_dim, conv_ch, d_ff,
-                                         d_inner, d_head, max_in_dim);
+                                         d_inner, d_head, max_in_dim, vocab_size);
+
+        // Copy gate: 소스 분포 사전계산 (전체 디코딩에 걸쳐 불변)
+        let copy_logits = if self.copy_gate.is_some() {
+            let mut p_copy = vec![0.0f32; vocab_size];
+            let mut count = 0.0f32;
+            for &id in src_ids {
+                if id != self.cfg.pad_id {
+                    p_copy[id as usize] += 1.0;
+                    count += 1.0;
+                }
+            }
+            if count > 0.0 {
+                let inv_count = 1.0 / count;
+                for v in p_copy.iter_mut() { *v *= inv_count; }
+            }
+            // log 변환 (매 토큰마다 반복하지 않음)
+            for v in p_copy.iter_mut() {
+                *v = (*v).max(1e-5).ln();
+            }
+            p_copy
+        } else {
+            Vec::new()
+        };
+
         let mut generated = vec![bos_id];
         let mut current_token = bos_id;
 
         for step in 0..max_len {
-            let logits = self.decode_step(current_token, dec_state, src_ids, &mut bufs);
+            self.decode_step(current_token, dec_state, &copy_logits, &mut bufs);
 
-            let next_token = logits.iter()
+            let next_token = bufs.logits[..vocab_size].iter()
                 .enumerate()
                 .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
                 .map(|(idx, _)| idx as u32)
