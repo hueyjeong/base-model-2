@@ -7,6 +7,8 @@ use clap::Parser;
 use std::io::{self, BufRead, Write};
 use std::time::Instant;
 
+extern "C" { fn malloc_trim(pad: usize) -> i32; }
+
 #[derive(Parser)]
 #[command(name = "bitmamba-inference")]
 #[command(about = "BitMamba Seq2Seq 한국어 문법 교정 추론 엔진")]
@@ -40,12 +42,12 @@ fn main() -> Result<()> {
     // 모델 로드
     let t0 = Instant::now();
     let model_path = format!("{}/model.safetensors", args.model_dir);
-    let model = model::BitMambaSeq2Seq::load(&model_path, &cfg)?;
+    let mut model = model::BitMambaSeq2Seq::load(&model_path, &cfg)?;
     let load_ms = t0.elapsed().as_millis();
     eprintln!("모델 로드: {}ms", load_ms);
 
     if let Some(input) = args.input {
-        run_inference(&model, &tok, &input, args.max_tokens)?;
+        run_inference(&mut model, &tok, &input, args.max_tokens, true)?;
     } else {
         eprintln!("\n대화형 모드 (Ctrl+D로 종료)");
         eprintln!("교정할 텍스트를 입력하세요:");
@@ -62,7 +64,7 @@ fn main() -> Result<()> {
             let line = line.trim();
             if line.is_empty() { continue; }
 
-            run_inference(&model, &tok, line, args.max_tokens)?;
+            run_inference(&mut model, &tok, line, args.max_tokens, false)?;
             println!();
         }
     }
@@ -71,10 +73,11 @@ fn main() -> Result<()> {
 }
 
 fn run_inference(
-    model: &model::BitMambaSeq2Seq,
+    model: &mut model::BitMambaSeq2Seq,
     tok: &tokenizer::KeyboardTokenizer,
     input: &str,
     max_tokens: usize,
+    drop_after_encode: bool,
 ) -> Result<()> {
     eprintln!("입력: {}", input);
 
@@ -92,6 +95,22 @@ fn run_inference(
     let t0 = Instant::now();
     let mut dec_state = model.init_decoder_state(&encoder_out)?;
     let cache_ms = t0.elapsed().as_millis();
+
+    // f32 Tensor 해제 — 디코딩에는 i8 weight만 사용
+    drop(encoder_out);
+    if drop_after_encode {
+        model.drop_tensors();
+        // glibc에 해제된 메모리를 OS에 반환하도록 요청
+        unsafe { malloc_trim(0); }
+        // RSS 측정 (drop 후 실제 사용 메모리)
+        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+            for line in status.lines() {
+                if line.starts_with("VmRSS:") {
+                    eprintln!("  [메모리] drop 후 {}", line.trim());
+                }
+            }
+        }
+    }
 
     // 디코딩
     let t0 = Instant::now();

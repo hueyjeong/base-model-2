@@ -5,7 +5,6 @@
 
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, IndexOp, Tensor, D};
-use rayon::prelude::*;
 use std::collections::HashMap;
 
 use crate::config::ModelConfig;
@@ -16,6 +15,7 @@ use crate::config::ModelConfig;
 type c_int = i32;
 
 const CBLAS_ROW_MAJOR: c_int = 101;
+#[allow(dead_code)]
 const CBLAS_NO_TRANS: c_int = 111;
 
 extern "C" {
@@ -35,25 +35,28 @@ extern "C" {
     );
 }
 
-/// y = A @ x  (A: m×n row-major, x: n, y: m)
-#[inline]
-fn sgemv(a: &[f32], x: &[f32], y: &mut [f32], m: usize, n: usize) {
-    unsafe {
-        cblas_sgemv(
-            CBLAS_ROW_MAJOR,
-            CBLAS_NO_TRANS,
-            m as c_int,
-            n as c_int,
-            1.0,
-            a.as_ptr(),
-            n as c_int,
-            x.as_ptr(),
-            1,
-            0.0,
-            y.as_mut_ptr(),
-            1,
-        );
-    }
+// ── AVX-VNNI int8 커널 FFI ──────────────────────────
+
+extern "C" {
+    /// i8 weight × u8 activation → f32 output (AVX-VNNI vpdpbusd)
+    fn i8_sgemv(
+        weights: *const i8,
+        x_u8: *const u8,
+        y: *mut f32,
+        m: c_int,
+        n: c_int,
+        row_sums: *const i32,
+        row_scales: *const f32,  // NULL이면 w_scale 사용
+        x_scale: f32,
+        w_scale: f32,
+    );
+
+    /// f32 → u8 양자화 (absmax 기반, x_scale 반환)
+    fn quantize_f32_to_u8(
+        x: *const f32,
+        out: *mut u8,
+        n: c_int,
+    ) -> f32;
 }
 
 // ── 활성화 함수 ──────────────────────────────────────
@@ -102,7 +105,7 @@ fn gelu1p_scalar(x: f32) -> f32 {
 // ── RMSNorm ──────────────────────────────────────────
 
 pub struct RMSNorm {
-    weight: Tensor,
+    weight: Option<Tensor>,
     weight_vec: Vec<f32>,
     eps: f32,
 }
@@ -112,14 +115,17 @@ impl RMSNorm {
         let weight = tensors.get(&format!("{}.weight", prefix))
             .context(format!("RMSNorm weight 없음: {}", prefix))?.clone();
         let weight_vec: Vec<f32> = weight.flatten_all()?.to_vec1()?;
-        Ok(Self { weight, weight_vec, eps: eps as f32 })
+        Ok(Self { weight: Some(weight), weight_vec, eps: eps as f32 })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let w = self.weight.as_ref().expect("RMSNorm Tensor dropped");
         let var = x.sqr()?.mean_keepdim(D::Minus1)?;
         let rms = (var + self.eps as f64)?.sqrt()?.recip()?;
-        Ok((x.broadcast_mul(&rms))?.broadcast_mul(&self.weight)?)
+        Ok((x.broadcast_mul(&rms))?.broadcast_mul(w)?)
     }
+
+    fn drop_tensor(&mut self) { self.weight = None; }
 
     #[inline]
     fn forward_vec(&self, x: &[f32], out: &mut [f32]) {
@@ -158,14 +164,15 @@ fn layer_norm_no_affine_vec(x: &[f32], out: &mut [f32], eps: f32) {
     for v in out.iter_mut().take(n) { *v *= inv_std; }
 }
 
-// ── BitLinear (i8 ternary + rayon) ───────────────────
+// ── BitLinear (i8 ternary + AVX-VNNI) ───────────────
 
 pub struct BitLinear {
-    w_quant: Tensor,          // 사전 양자화된 ternary weight (인코더 Tensor path용)
+    w_quant: Option<Tensor>,  // 인코더 Tensor path용 (디코딩 후 해제)
     gamma: f32,
     out_dim: usize,
     in_dim: usize,
-    w_ternary_f32: Vec<f32>,  // f32 {-1,0,+1} (sgemv용 — BLAS > auto-vec)
+    w_i8: Vec<i8>,            // i8 ternary {-1,0,+1} — 4x 메모리 절감
+    row_sums: Vec<i32>,       // Σ_j w[i,j] — u8 오프셋 보정용 사전계산
 }
 
 impl BitLinear {
@@ -182,13 +189,25 @@ impl BitLinear {
         let w_scaled = weight.broadcast_div(&gamma_t)?;
         let w_quant = w_scaled.clamp(-1.0, 1.0)?.round()?;
 
-        // f32 ternary (BLAS sgemv용 — hand-tuned AVX2가 auto-vec i8보다 빠름)
-        let w_ternary_f32: Vec<f32> = w_quant.flatten_all()?.to_vec1()?;
+        // i8 ternary + row_sums 사전계산
+        let w_f32: Vec<f32> = w_quant.flatten_all()?.to_vec1()?;
+        let mut w_i8 = vec![0i8; out_dim * in_dim];
+        let mut row_sums = vec![0i32; out_dim];
+        for row in 0..out_dim {
+            let mut rsum = 0i32;
+            for col in 0..in_dim {
+                let v = w_f32[row * in_dim + col] as i8;
+                w_i8[row * in_dim + col] = v;
+                rsum += v as i32;
+            }
+            row_sums[row] = rsum;
+        }
 
-        Ok(Self { w_quant, gamma, out_dim, in_dim, w_ternary_f32 })
+        Ok(Self { w_quant: Some(w_quant), gamma, out_dim, in_dim, w_i8, row_sums })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let w_quant = self.w_quant.as_ref().expect("Tensor already dropped");
         let x_norm = layer_norm_no_affine(x, 1e-5)?;
         let eta = x_norm.abs()?.max_keepdim(D::Minus1)?.clamp(1e-5, f64::MAX)?;
         let x_quant = x_norm.broadcast_div(&eta)?
@@ -196,7 +215,7 @@ impl BitLinear {
             .clamp(-128.0, 127.0)?.round()?;
         let x_scale = (eta / 127.0)?;
 
-        let wt = self.w_quant.t()?;
+        let wt = w_quant.t()?;
         let dims = x_quant.dims();
         let out = if dims.len() == 3 {
             let (b, l, d) = x_quant.dims3()?;
@@ -212,37 +231,46 @@ impl BitLinear {
         Ok(out.broadcast_mul(&scale)?)
     }
 
-    /// ternary matmul via sgemv (할당 없음 — 외부 버퍼)
-    fn forward_vec(&self, x: &[f32], out: &mut [f32], x_norm: &mut [f32]) {
+    /// 인코딩 후 Tensor 해제 (메모리 절감)
+    fn drop_tensor(&mut self) { self.w_quant = None; }
+
+    /// i8 ternary matmul via AVX-VNNI (할당 없음 — 외부 버퍼)
+    fn forward_vec(&self, x: &[f32], out: &mut [f32], x_norm: &mut [f32], x_u8: &mut [u8]) {
         debug_assert_eq!(x.len(), self.in_dim);
         let n = self.in_dim;
 
         // 1. LayerNorm
         layer_norm_no_affine_vec(x, &mut x_norm[..n], 1e-5);
 
-        // 2. 활성화 양자화
-        let mut eta = 0.0f32;
-        for i in 0..n { eta = eta.max(x_norm[i].abs()); }
-        eta = eta.max(1e-5);
-        let scale_in = 127.0 / eta;
-        for i in 0..n {
-            x_norm[i] = (x_norm[i] * scale_in).clamp(-128.0, 127.0).round();
-        }
-        let combined_scale = (eta / 127.0) * self.gamma;
+        // 2. f32 → u8 양자화 (AVX absmax + offset: u8 = clamp(round(x/eta*127)) + 128)
+        let x_scale = unsafe {
+            quantize_f32_to_u8(x_norm.as_ptr(), x_u8.as_mut_ptr(), n as c_int)
+        };
 
-        // 3. Ternary matmul via BLAS sgemv (hand-tuned AVX2 > auto-vec i8)
-        sgemv(&self.w_ternary_f32, &x_norm[..n], out, self.out_dim, n);
-        for o in 0..self.out_dim {
-            out[o] *= combined_scale;
+        // 3. AVX-VNNI i8 matmul: y = (w_i8 · x_u8 - 128*row_sum) * gamma * x_scale
+        unsafe {
+            i8_sgemv(
+                self.w_i8.as_ptr(),
+                x_u8.as_ptr(),
+                out.as_mut_ptr(),
+                self.out_dim as c_int,
+                n as c_int,
+                self.row_sums.as_ptr(),
+                std::ptr::null(),  // row_scales=NULL → w_scale 사용
+                x_scale,
+                self.gamma,
+            );
         }
     }
 }
 
-// ── Linear (rayon 병렬) ──────────────────────────────
+// ── Linear (i8 양자화 + AVX-VNNI) ───────────────────
 
 pub struct Linear {
-    weight: Tensor,
-    weight_data: Vec<f32>,
+    weight: Option<Tensor>,   // 인코더 Tensor path용 (디코딩 후 해제)
+    w_i8: Vec<i8>,            // per-row int8 양자화 weight
+    row_scales: Vec<f32>,     // per-row dequant scale: max(abs(row))/127
+    row_sums: Vec<i32>,       // Σ_j w_i8[i,j] — u8 오프셋 보정용
     out_dim: usize,
     in_dim: usize,
 }
@@ -253,12 +281,40 @@ impl Linear {
             .context(format!("Linear weight 없음: {}", prefix))?.clone();
         let out_dim = weight.dim(0)?;
         let in_dim = weight.dim(1)?;
-        let weight_data: Vec<f32> = weight.flatten_all()?.to_vec1()?;
-        Ok(Self { weight, weight_data, out_dim, in_dim })
+        let w_f32: Vec<f32> = weight.flatten_all()?.to_vec1()?;
+
+        // per-row int8 양자화
+        let mut w_i8 = vec![0i8; out_dim * in_dim];
+        let mut row_scales = vec![0.0f32; out_dim];
+        let mut row_sums = vec![0i32; out_dim];
+
+        for row in 0..out_dim {
+            let base = row * in_dim;
+            let mut max_abs = 0.0f32;
+            for col in 0..in_dim {
+                let a = w_f32[base + col].abs();
+                if a > max_abs { max_abs = a; }
+            }
+            if max_abs < 1e-10 { max_abs = 1e-10; }
+            let scale = max_abs / 127.0;
+            let inv_scale = 127.0 / max_abs;
+            row_scales[row] = scale;
+
+            let mut rsum = 0i32;
+            for col in 0..in_dim {
+                let v = (w_f32[base + col] * inv_scale).round().clamp(-128.0, 127.0) as i8;
+                w_i8[base + col] = v;
+                rsum += v as i32;
+            }
+            row_sums[row] = rsum;
+        }
+
+        Ok(Self { weight: Some(weight), w_i8, row_scales, row_sums, out_dim, in_dim })
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let wt = self.weight.t()?;
+        let weight = self.weight.as_ref().expect("Tensor already dropped");
+        let wt = weight.t()?;
         let dims = x.dims();
         if dims.len() == 3 {
             let (b, l, d) = x.dims3()?;
@@ -270,15 +326,37 @@ impl Linear {
         }
     }
 
-    fn forward_vec(&self, x: &[f32], out: &mut [f32]) {
-        sgemv(&self.weight_data, x, out, self.out_dim, self.in_dim);
+    /// 인코딩 후 Tensor 해제 (메모리 절감)
+    fn drop_tensor(&mut self) { self.weight = None; }
+
+    /// i8 matmul via AVX-VNNI (할당 없음)
+    fn forward_vec(&self, x: &[f32], out: &mut [f32], x_u8: &mut [u8]) {
+        let n = self.in_dim;
+        let x_scale = unsafe {
+            quantize_f32_to_u8(x.as_ptr(), x_u8.as_mut_ptr(), n as c_int)
+        };
+        unsafe {
+            i8_sgemv(
+                self.w_i8.as_ptr(),
+                x_u8.as_ptr(),
+                out.as_mut_ptr(),
+                self.out_dim as c_int,
+                n as c_int,
+                self.row_sums.as_ptr(),
+                self.row_scales.as_ptr(),  // per-row scales
+                x_scale,
+                0.0,  // w_scale 미사용
+            );
+        }
     }
 }
 
-// ── LinearWithBias (Copy Gate용) ─────────────────────
+// ── LinearWithBias (Copy Gate용 — i8 양자화) ─────────
 
 pub struct LinearWithBias {
-    weight_data: Vec<f32>,
+    w_i8: Vec<i8>,
+    row_scales: Vec<f32>,
+    row_sums: Vec<i32>,
     bias_data: Vec<f32>,
     out_dim: usize,
     in_dim: usize,
@@ -292,13 +370,49 @@ impl LinearWithBias {
             .context(format!("Linear bias 없음: {}", prefix))?.clone();
         let out_dim = weight.dim(0)?;
         let in_dim = weight.dim(1)?;
-        let weight_data: Vec<f32> = weight.flatten_all()?.to_vec1()?;
+        let w_f32: Vec<f32> = weight.flatten_all()?.to_vec1()?;
         let bias_data: Vec<f32> = bias.flatten_all()?.to_vec1()?;
-        Ok(Self { weight_data, bias_data, out_dim, in_dim })
+
+        let mut w_i8 = vec![0i8; out_dim * in_dim];
+        let mut row_scales = vec![0.0f32; out_dim];
+        let mut row_sums = vec![0i32; out_dim];
+        for row in 0..out_dim {
+            let base = row * in_dim;
+            let mut max_abs = 0.0f32;
+            for col in 0..in_dim { max_abs = max_abs.max(w_f32[base + col].abs()); }
+            if max_abs < 1e-10 { max_abs = 1e-10; }
+            row_scales[row] = max_abs / 127.0;
+            let inv_scale = 127.0 / max_abs;
+            let mut rsum = 0i32;
+            for col in 0..in_dim {
+                let v = (w_f32[base + col] * inv_scale).round().clamp(-128.0, 127.0) as i8;
+                w_i8[base + col] = v;
+                rsum += v as i32;
+            }
+            row_sums[row] = rsum;
+        }
+
+        Ok(Self { w_i8, row_scales, row_sums, bias_data, out_dim, in_dim })
     }
 
-    fn forward_vec(&self, x: &[f32], out: &mut [f32]) {
-        sgemv(&self.weight_data, x, out, self.out_dim, self.in_dim);
+    fn forward_vec(&self, x: &[f32], out: &mut [f32], x_u8: &mut [u8]) {
+        let n = self.in_dim;
+        let x_scale = unsafe {
+            quantize_f32_to_u8(x.as_ptr(), x_u8.as_mut_ptr(), n as c_int)
+        };
+        unsafe {
+            i8_sgemv(
+                self.w_i8.as_ptr(),
+                x_u8.as_ptr(),
+                out.as_mut_ptr(),
+                self.out_dim as c_int,
+                n as c_int,
+                self.row_sums.as_ptr(),
+                self.row_scales.as_ptr(),
+                x_scale,
+                0.0,
+            );
+        }
         for o in 0..self.out_dim {
             out[o] += self.bias_data[o];
         }
@@ -334,11 +448,11 @@ impl BitNetFFN {
     }
 
     fn forward_vec(&self, x: &[f32], buf_ff: &mut Vec<f32>, buf_ff2: &mut Vec<f32>,
-                    x_norm_buf: &mut [f32], out: &mut [f32]) {
+                    x_norm_buf: &mut [f32], x_u8: &mut [u8], out: &mut [f32]) {
         buf_ff.resize(self.d_ff, 0.0);
         buf_ff2.resize(self.d_ff, 0.0);
-        self.gate_proj.forward_vec(x, buf_ff, x_norm_buf);
-        self.up_proj.forward_vec(x, buf_ff2, x_norm_buf);
+        self.gate_proj.forward_vec(x, buf_ff, x_norm_buf, x_u8);
+        self.up_proj.forward_vec(x, buf_ff2, x_norm_buf, x_u8);
 
         // sigmoid(gate) * up → reuse buf_ff
         for i in 0..self.d_ff {
@@ -346,7 +460,13 @@ impl BitNetFFN {
             buf_ff[i] = sig * buf_ff2[i];
         }
 
-        self.down_proj.forward_vec(buf_ff, out, x_norm_buf);
+        self.down_proj.forward_vec(buf_ff, out, x_norm_buf, x_u8);
+    }
+
+    fn drop_tensors(&mut self) {
+        self.gate_proj.drop_tensor();
+        self.up_proj.drop_tensor();
+        self.down_proj.drop_tensor();
     }
 }
 
@@ -362,9 +482,9 @@ pub struct Mamba2State {
 
 pub struct Mamba2Block {
     in_proj: Linear,
-    conv1d_weight: Tensor,
-    conv1d_bias: Tensor,
-    norm_weight: Tensor,
+    conv1d_weight: Option<Tensor>,  // 인코더 Tensor path용
+    conv1d_bias: Option<Tensor>,
+    norm_weight: Option<Tensor>,
     out_proj: Linear,
     // scalar용
     conv_weight_data: Vec<f32>,
@@ -417,9 +537,9 @@ impl Mamba2Block {
 
         Ok(Self {
             in_proj: Linear::load(tensors, &format!("{}.in_proj", p))?,
-            conv1d_weight,
-            conv1d_bias,
-            norm_weight,
+            conv1d_weight: Some(conv1d_weight),
+            conv1d_bias: Some(conv1d_bias),
+            norm_weight: Some(norm_weight),
             out_proj: Linear::load(tensors, &format!("{}.out_proj", p))?,
             conv_weight_data,
             conv_bias_data,
@@ -447,16 +567,18 @@ impl Mamba2Block {
     }
 
     fn causal_conv1d(&self, x: &Tensor) -> Result<Tensor> {
+        let conv1d_weight = self.conv1d_weight.as_ref().expect("Tensor dropped");
+        let conv1d_bias = self.conv1d_bias.as_ref().expect("Tensor dropped");
         let (_, seq_len, channels) = x.dims3()?;
         let dev = x.device();
         let pad = Tensor::zeros((1, self.d_conv - 1, channels), DType::F32, dev)?;
         let x_padded = Tensor::cat(&[&pad, x], 1)?;
 
-        let mut out = self.conv1d_bias.unsqueeze(0)?.unsqueeze(0)?
+        let mut out = conv1d_bias.unsqueeze(0)?.unsqueeze(0)?
             .broadcast_as((1, seq_len, channels))?.contiguous()?;
 
         for k in 0..self.d_conv {
-            let w_k = self.conv1d_weight.i((.., 0, k))?;
+            let w_k = conv1d_weight.i((.., 0, k))?;
             let x_k = x_padded.narrow(1, k, seq_len)?;
             out = (out + x_k.broadcast_mul(&w_k)?)?;
         }
@@ -555,7 +677,7 @@ impl Mamba2Block {
 
         let y = self.sequential_scan(&x_ssm, &dt, &b_ssm, &c_ssm)?;
         let y = y.reshape((1, seq_len, self.d_inner))?;
-        let y_norm = rmsnorm_with_weight(&y, &self.norm_weight, 1e-5)?;
+        let y_norm = rmsnorm_with_weight(&y, self.norm_weight.as_ref().expect("Tensor dropped"), 1e-5)?;
         let z_gate = silu(&z.reshape((1, seq_len, self.d_inner))?)?;
         let y_gated = (y_norm * z_gate)?;
 
@@ -563,10 +685,10 @@ impl Mamba2Block {
     }
 
     /// Incremental 1-token step (ssm_y: 재활용 버퍼)
-    pub fn step(&self, x: &[f32], state: &mut Mamba2State, proj_buf: &mut Vec<f32>, xbc_buf: &mut Vec<f32>, ssm_y: &mut [f32]) {
+    pub fn step(&self, x: &[f32], state: &mut Mamba2State, proj_buf: &mut Vec<f32>, xbc_buf: &mut Vec<f32>, ssm_y: &mut [f32], x_u8: &mut [u8]) {
         // 1. in_proj
         proj_buf.resize(self.proj_dim, 0.0);
-        self.in_proj.forward_vec(x, proj_buf);
+        self.in_proj.forward_vec(x, proj_buf, x_u8);
 
         let z_dim = self.d_inner;
         let xbc_dim = self.conv_channels;
@@ -672,7 +794,15 @@ impl Mamba2Block {
 
         // 5. out_proj → proj_buf 재활용 (d_model 크기로 resize됨)
         proj_buf.resize(self.out_proj.out_dim, 0.0);
-        self.out_proj.forward_vec(xbc_buf, proj_buf);
+        self.out_proj.forward_vec(xbc_buf, proj_buf, x_u8);
+    }
+
+    fn drop_tensors(&mut self) {
+        self.in_proj.drop_tensor();
+        self.out_proj.drop_tensor();
+        self.conv1d_weight = None;
+        self.conv1d_bias = None;
+        self.norm_weight = None;
     }
 }
 
@@ -750,14 +880,14 @@ impl LinearCrossAttention {
 
     /// 캐시된 KV로 1-token forward (할당 없음 — 외부 버퍼 재활용)
     fn forward_cached_vec(&self, x: &[f32], cache: &CrossAttnCache, q_buf: &mut Vec<f32>,
-                          attn_out: &mut [f32], q_h: &mut [f32], out: &mut [f32]) {
+                          attn_out: &mut [f32], q_h: &mut [f32], out: &mut [f32], x_u8: &mut [u8]) {
         let nh = self.n_heads;
         let dh = self.d_head;
         let d_model = nh * dh;
 
         // Q projection
         q_buf.resize(d_model, 0.0);
-        self.q_proj.forward_vec(x, q_buf);
+        self.q_proj.forward_vec(x, q_buf, x_u8);
 
         for h in 0..nh {
             // gelu1p on Q[h]
@@ -807,7 +937,14 @@ impl LinearCrossAttention {
         }
 
         // O projection
-        self.o_proj.forward_vec(&attn_out, out);
+        self.o_proj.forward_vec(&attn_out, out, x_u8);
+    }
+
+    fn drop_tensors(&mut self) {
+        self.q_proj.drop_tensor();
+        self.k_proj.drop_tensor();
+        self.v_proj.drop_tensor();
+        self.o_proj.drop_tensor();
     }
 }
 
@@ -843,6 +980,13 @@ impl EncoderLayer {
         let x = self.ffn.forward(&x)?;
         self.norm2.forward(&(residual + &x)?)
     }
+
+    fn drop_tensors(&mut self) {
+        self.mamba.drop_tensors();
+        self.norm1.drop_tensor();
+        self.ffn.drop_tensors();
+        self.norm2.drop_tensor();
+    }
 }
 
 // ── Decoder State ────────────────────────────────────
@@ -868,6 +1012,7 @@ struct DecoderBufs {
     attn_out: Vec<f32>,    // d_model
     q_h: Vec<f32>,         // d_head (64)
     x_norm_buf: Vec<f32>,  // max(in_dim) for BitLinear layernorm
+    x_u8: Vec<u8>,         // int8 양자화된 활성화 버퍼 (AVX-VNNI용)
 }
 
 impl DecoderBufs {
@@ -886,6 +1031,7 @@ impl DecoderBufs {
             attn_out: vec![0.0; d_model],
             q_h: vec![0.0; d_head],
             x_norm_buf: vec![0.0; max_in_dim],
+            x_u8: vec![0u8; max_in_dim],
         }
     }
 }
@@ -937,34 +1083,46 @@ impl DecoderLayer {
         let d = self.d_model;
 
         // 1. Mamba step → proj_buf에 결과 저장
-        self.mamba.step(x, mamba_state, &mut bufs.proj, &mut bufs.xbc, &mut bufs.ssm_y);
+        self.mamba.step(x, mamba_state, &mut bufs.proj, &mut bufs.xbc, &mut bufs.ssm_y, &mut bufs.x_u8);
         // mamba 결과가 bufs.proj에 있음 (out_proj 출력)
         for i in 0..d { bufs.residual[i] = x[i] + bufs.proj[i]; }
         self.norm1.forward_vec(&bufs.residual, &mut bufs.normed);
 
         // 2. Cross-attention (cached scalar)
         self.cross_attn.forward_cached_vec(&bufs.normed, cross_cache, &mut bufs.q,
-                                           &mut bufs.attn_out, &mut bufs.q_h, &mut bufs.out);
+                                           &mut bufs.attn_out, &mut bufs.q_h, &mut bufs.out, &mut bufs.x_u8);
         for i in 0..d { bufs.residual[i] = bufs.normed[i] + bufs.out[i]; }
         self.norm_cross.forward_vec(&bufs.residual, &mut bufs.normed);
 
         // 3. FFN
-        self.ffn.forward_vec(&bufs.normed, &mut bufs.ff1, &mut bufs.ff2, &mut bufs.x_norm_buf, &mut bufs.out);
+        self.ffn.forward_vec(&bufs.normed, &mut bufs.ff1, &mut bufs.ff2, &mut bufs.x_norm_buf, &mut bufs.x_u8, &mut bufs.out);
         for i in 0..d { bufs.residual[i] = bufs.normed[i] + bufs.out[i]; }
         self.norm2.forward_vec(&bufs.residual, &mut bufs.normed);
         // normed가 이 레이어의 최종 출력
+    }
+
+    fn drop_tensors(&mut self) {
+        self.mamba.drop_tensors();
+        self.norm1.drop_tensor();
+        self.cross_attn.drop_tensors();
+        self.norm_cross.drop_tensor();
+        self.ffn.drop_tensors();
+        self.norm2.drop_tensor();
     }
 }
 
 // ── BitMambaSeq2Seq ──────────────────────────────────
 
 pub struct BitMambaSeq2Seq {
-    encoder_embedding: Tensor,
+    encoder_embedding: Option<Tensor>,  // 인코딩 후 해제
     embed_data: Vec<f32>,
     encoder_layers: Vec<EncoderLayer>,
     decoder_layers: Vec<DecoderLayer>,
     final_norm: RMSNorm,
-    lm_head_data: Vec<f32>,
+    // lm_head도 i8 양자화
+    lm_head_i8: Vec<i8>,
+    lm_head_row_scales: Vec<f32>,
+    lm_head_row_sums: Vec<i32>,
     copy_gate: Option<LinearWithBias>,
     pub cfg: ModelConfig,
 }
@@ -989,7 +1147,28 @@ impl BitMambaSeq2Seq {
             tensors.get("lm_head.weight")
                 .context("lm_head weight 없음")?.clone()
         };
-        let lm_head_data: Vec<f32> = lm_head_weight.flatten_all()?.to_vec1()?;
+        // lm_head i8 양자화 (vocab_size × d_model)
+        let lm_head_f32: Vec<f32> = lm_head_weight.flatten_all()?.to_vec1()?;
+        let lm_vocab = cfg.vocab_size;
+        let lm_dim = cfg.d_model;
+        let mut lm_head_i8 = vec![0i8; lm_vocab * lm_dim];
+        let mut lm_head_row_scales = vec![0.0f32; lm_vocab];
+        let mut lm_head_row_sums = vec![0i32; lm_vocab];
+        for row in 0..lm_vocab {
+            let base = row * lm_dim;
+            let mut max_abs = 0.0f32;
+            for col in 0..lm_dim { max_abs = max_abs.max(lm_head_f32[base + col].abs()); }
+            if max_abs < 1e-10 { max_abs = 1e-10; }
+            lm_head_row_scales[row] = max_abs / 127.0;
+            let inv_scale = 127.0 / max_abs;
+            let mut rsum = 0i32;
+            for col in 0..lm_dim {
+                let v = (lm_head_f32[base + col] * inv_scale).round().clamp(-128.0, 127.0) as i8;
+                lm_head_i8[base + col] = v;
+                rsum += v as i32;
+            }
+            lm_head_row_sums[row] = rsum;
+        }
 
         let mut encoder_layers = Vec::new();
         for i in 0..cfg.n_encoder_layers {
@@ -1015,24 +1194,27 @@ impl BitMambaSeq2Seq {
 
         // i8 BitLinear 메모리 절약량 계산
         let bitlinear_count = (cfg.n_encoder_layers + cfg.n_decoder_layers) * 3; // gate+up+down per layer
-        eprintln!("모델 로드 완료 (BitLinear i8 ternary ×{}, rayon 병렬화)", bitlinear_count);
+        eprintln!("모델 로드 완료 (BitLinear i8 ternary ×{}, AVX-VNNI int8 커널)", bitlinear_count);
 
         Ok(Self {
-            encoder_embedding,
+            encoder_embedding: Some(encoder_embedding),
             embed_data,
             encoder_layers,
             decoder_layers,
             final_norm,
-            lm_head_data,
+            lm_head_i8,
+            lm_head_row_scales,
+            lm_head_row_sums,
             copy_gate,
             cfg: cfg.clone(),
         })
     }
 
     fn embed(&self, ids: &Tensor) -> Result<Tensor> {
+        let enc_emb = self.encoder_embedding.as_ref().expect("encoder_embedding already dropped");
         let (batch, seq_len) = ids.dims2()?;
         let flat_ids = ids.flatten_all()?;
-        let emb = self.encoder_embedding.index_select(&flat_ids, 0)?;
+        let emb = enc_emb.index_select(&flat_ids, 0)?;
         let emb = emb.reshape((batch, seq_len, self.cfg.d_model))?;
         let scale = Tensor::new(self.cfg.embed_scale(), ids.device())?;
         Ok(emb.broadcast_mul(&scale)?)
@@ -1072,6 +1254,19 @@ impl BitMambaSeq2Seq {
         Ok(DecoderState { mamba_states, cross_attn_caches })
     }
 
+    /// 인코딩+KV캐시 후 f32 Tensor 해제 — 메모리 대폭 절감
+    pub fn drop_tensors(&mut self) {
+        self.encoder_embedding = None;
+        for layer in &mut self.encoder_layers {
+            layer.drop_tensors();
+        }
+        for layer in &mut self.decoder_layers {
+            layer.drop_tensors();
+        }
+        // RMSNorm의 Tensor도 해제 (weight_vec만 사용)
+        // final_norm.weight는 작으므로 무시
+    }
+
     /// Incremental 1-token decode step → logits
     fn decode_step(
         &self,
@@ -1098,14 +1293,28 @@ impl BitMambaSeq2Seq {
         // final_norm
         self.final_norm.forward_vec(&x, &mut bufs.normed);
 
-        // LM Head via sgemv
+        // LM Head via AVX-VNNI i8
         let mut logits = vec![0.0f32; self.cfg.vocab_size];
-        sgemv(&self.lm_head_data, &bufs.normed[..d], &mut logits, self.cfg.vocab_size, d);
+        let x_scale = unsafe {
+            quantize_f32_to_u8(bufs.normed.as_ptr(), bufs.x_u8.as_mut_ptr(), d as c_int)
+        };
+        unsafe {
+            i8_sgemv(
+                self.lm_head_i8.as_ptr(),
+                bufs.x_u8.as_ptr(),
+                logits.as_mut_ptr(),
+                self.cfg.vocab_size as c_int,
+                d as c_int,
+                self.lm_head_row_sums.as_ptr(),
+                self.lm_head_row_scales.as_ptr(),
+                x_scale,
+                0.0,
+            );
+        }
 
         // Copy Gate
         if let Some(ref gate_proj) = self.copy_gate {
-            let mut gate_out = [0.0f32; 1];
-            gate_proj.forward_vec(&bufs.normed, &mut bufs.out);
+            gate_proj.forward_vec(&bufs.normed, &mut bufs.out, &mut bufs.x_u8);
             let raw_sig = 1.0 / (1.0 + (-bufs.out[0]).exp());
             let gate = 0.5 + 0.5 * raw_sig;
             let one_minus_gate = 1.0 - gate;

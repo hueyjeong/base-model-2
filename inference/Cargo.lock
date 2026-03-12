@@ -107,6 +107,7 @@ dependencies = [
  "anyhow",
  "candle-core",
  "candle-nn",
+ "cc",
  "clap",
  "rayon",
  "serde",
