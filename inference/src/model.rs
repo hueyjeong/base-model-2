@@ -3,10 +3,11 @@
 //! v2 최적화: i8 ternary BitLinear (mul→add/sub), rayon 병렬 matmul,
 //!           cross-attn 순수 scalar, 버퍼 재활용, 정밀 타이밍
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use candle_core::{DType, Device, IndexOp, Tensor, D};
 use std::collections::HashMap;
 
+use crate::bmmq::{self, TensorData};
 use crate::config::ModelConfig;
 
 // ── OpenBLAS FFI ─────────────────────────────────────
@@ -51,6 +52,19 @@ extern "C" {
         w_scale: f32,
     );
 
+    /// 2-bit packed ternary weight × u8 activation → f32 output
+    fn ternary_sgemv(
+        packed_weights: *const u8,
+        x_u8: *const u8,
+        y: *mut f32,
+        m: c_int,
+        n: c_int,
+        packed_stride: c_int,
+        row_sums: *const i32,
+        gamma: f32,
+        x_scale: f32,
+    );
+
     /// f32 → u8 양자화 (absmax 기반, x_scale 반환)
     fn quantize_f32_to_u8(
         x: *const f32,
@@ -58,6 +72,17 @@ extern "C" {
         n: c_int,
     ) -> f32;
 }
+
+// ── BMMQ 헬퍼 ────────────────────────────────────────
+
+/// BMMQ TensorData에서 f32 Vec 추출 (소유권 이전)
+fn bmmq_take_f32(tensors: &mut HashMap<String, TensorData>, key: &str) -> Result<Vec<f32>> {
+    match tensors.remove(key).context(format!("텐서 없음: {}", key))? {
+        TensorData::F32 { data, .. } => Ok(data),
+        _ => bail!("f32 타입이어야 함: {}", key),
+    }
+}
+
 
 // ── 활성화 함수 ──────────────────────────────────────
 
@@ -118,6 +143,12 @@ impl RMSNorm {
         Ok(Self { weight: Some(weight), weight_vec, eps: eps as f32 })
     }
 
+    pub fn load_bmmq(tensors: &mut HashMap<String, TensorData>, prefix: &str, eps: f64) -> Result<Self> {
+        let key = format!("{}.weight", prefix);
+        let weight_vec = bmmq_take_f32(tensors, &key)?;
+        Ok(Self { weight: None, weight_vec, eps: eps as f32 })
+    }
+
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let w = self.weight.as_ref().expect("RMSNorm Tensor dropped");
         let var = x.sqr()?.mean_keepdim(D::Minus1)?;
@@ -171,8 +202,12 @@ pub struct BitLinear {
     gamma: f32,
     out_dim: usize,
     in_dim: usize,
-    w_i8: Vec<i8>,            // i8 ternary {-1,0,+1} — 4x 메모리 절감
-    row_sums: Vec<i32>,       // Σ_j w[i,j] — u8 오프셋 보정용 사전계산
+    // 2-bit packed 모드 (BMMQ): w_packed 사용, w_i8은 빈 Vec
+    // i8 모드 (safetensors): w_i8 사용, w_packed은 빈 Vec
+    w_i8: Vec<i8>,             // i8 ternary {-1,0,+1} (safetensors 경로)
+    w_packed: Vec<u8>,         // 2-bit packed ternary (BMMQ 경로)
+    packed_stride: usize,      // (in_dim + 3) / 4
+    row_sums: Vec<i32>,        // Σ_j w[i,j]
 }
 
 impl BitLinear {
@@ -203,7 +238,29 @@ impl BitLinear {
             row_sums[row] = rsum;
         }
 
-        Ok(Self { w_quant: Some(w_quant), gamma, out_dim, in_dim, w_i8, row_sums })
+        Ok(Self {
+            w_quant: Some(w_quant), gamma, out_dim, in_dim,
+            w_i8, w_packed: Vec::new(), packed_stride: 0, row_sums,
+        })
+    }
+
+    pub fn load_bmmq(tensors: &mut HashMap<String, TensorData>, prefix: &str) -> Result<Self> {
+        let key = format!("{}.weight", prefix);
+        match tensors.remove(&key).context(format!("BitLinear weight 없음: {}", key))? {
+            TensorData::Packed2Bit { data, gamma, row_sums, rows, cols, packed_stride } => {
+                Ok(Self {
+                    w_quant: None,
+                    gamma,
+                    out_dim: rows,
+                    in_dim: cols,
+                    w_i8: Vec::new(),
+                    w_packed: data,
+                    packed_stride,
+                    row_sums,
+                })
+            }
+            _ => bail!("BitLinear은 Packed2Bit 타입이어야 함: {}", key),
+        }
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -234,7 +291,9 @@ impl BitLinear {
     /// 인코딩 후 Tensor 해제 (메모리 절감)
     fn drop_tensor(&mut self) { self.w_quant = None; }
 
-    /// i8 ternary matmul via AVX-VNNI (할당 없음 — 외부 버퍼)
+    /// AVX-VNNI matmul (할당 없음 — 외부 버퍼)
+    /// packed 모드: ternary_sgemv (2-bit → 언팩 → VNNI)
+    /// i8 모드: i8_sgemv
     fn forward_vec(&self, x: &[f32], out: &mut [f32], x_norm: &mut [f32], x_u8: &mut [u8]) {
         debug_assert_eq!(x.len(), self.in_dim);
         let n = self.in_dim;
@@ -242,24 +301,42 @@ impl BitLinear {
         // 1. LayerNorm
         layer_norm_no_affine_vec(x, &mut x_norm[..n], 1e-5);
 
-        // 2. f32 → u8 양자화 (AVX absmax + offset: u8 = clamp(round(x/eta*127)) + 128)
+        // 2. f32 → u8 양자화
         let x_scale = unsafe {
             quantize_f32_to_u8(x_norm.as_ptr(), x_u8.as_mut_ptr(), n as c_int)
         };
 
-        // 3. AVX-VNNI i8 matmul: y = (w_i8 · x_u8 - 128*row_sum) * gamma * x_scale
-        unsafe {
-            i8_sgemv(
-                self.w_i8.as_ptr(),
-                x_u8.as_ptr(),
-                out.as_mut_ptr(),
-                self.out_dim as c_int,
-                n as c_int,
-                self.row_sums.as_ptr(),
-                std::ptr::null(),  // row_scales=NULL → w_scale 사용
-                x_scale,
-                self.gamma,
-            );
+        // 3. matmul
+        if !self.w_packed.is_empty() {
+            // 2-bit packed → ternary_sgemv (on-the-fly 언팩)
+            unsafe {
+                ternary_sgemv(
+                    self.w_packed.as_ptr(),
+                    x_u8.as_ptr(),
+                    out.as_mut_ptr(),
+                    self.out_dim as c_int,
+                    n as c_int,
+                    self.packed_stride as c_int,
+                    self.row_sums.as_ptr(),
+                    self.gamma,
+                    x_scale,
+                );
+            }
+        } else {
+            // i8 → i8_sgemv (safetensors 경로)
+            unsafe {
+                i8_sgemv(
+                    self.w_i8.as_ptr(),
+                    x_u8.as_ptr(),
+                    out.as_mut_ptr(),
+                    self.out_dim as c_int,
+                    n as c_int,
+                    self.row_sums.as_ptr(),
+                    std::ptr::null(),
+                    x_scale,
+                    self.gamma,
+                );
+            }
         }
     }
 }
@@ -310,6 +387,23 @@ impl Linear {
         }
 
         Ok(Self { weight: Some(weight), w_i8, row_scales, row_sums, out_dim, in_dim })
+    }
+
+    pub fn load_bmmq(tensors: &mut HashMap<String, TensorData>, prefix: &str) -> Result<Self> {
+        let key = format!("{}.weight", prefix);
+        match tensors.remove(&key).context(format!("Linear weight 없음: {}", key))? {
+            TensorData::I8Quantized { data, row_scales, row_sums, rows, cols } => {
+                Ok(Self {
+                    weight: None,
+                    w_i8: data,
+                    row_scales,
+                    row_sums,
+                    out_dim: rows,
+                    in_dim: cols,
+                })
+            }
+            _ => bail!("Linear은 I8Quantized 타입이어야 함: {}", key),
+        }
     }
 
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
@@ -395,6 +489,46 @@ impl LinearWithBias {
         Ok(Self { w_i8, row_scales, row_sums, bias_data, out_dim, in_dim })
     }
 
+    pub fn load_bmmq(tensors: &mut HashMap<String, TensorData>, prefix: &str) -> Result<Self> {
+        let w_key = format!("{}.weight", prefix);
+        let td = tensors.remove(&w_key).context(format!("LinearWithBias weight 없음: {}", w_key))?;
+
+        let (w_i8, row_scales, row_sums, out_dim, in_dim) = match td {
+            TensorData::I8Quantized { data, row_scales, row_sums, rows, cols } => {
+                (data, row_scales, row_sums, rows, cols)
+            }
+            TensorData::F32 { data, shape } => {
+                // f32 → per-row i8 양자화 (copy_gate 등 소형 텐서)
+                let (out_dim, in_dim) = (shape[0], shape[1]);
+                let mut w_i8 = vec![0i8; out_dim * in_dim];
+                let mut row_scales = vec![0.0f32; out_dim];
+                let mut row_sums = vec![0i32; out_dim];
+                for row in 0..out_dim {
+                    let base = row * in_dim;
+                    let mut max_abs = 0.0f32;
+                    for col in 0..in_dim { max_abs = max_abs.max(data[base + col].abs()); }
+                    if max_abs < 1e-10 { max_abs = 1e-10; }
+                    row_scales[row] = max_abs / 127.0;
+                    let inv_scale = 127.0 / max_abs;
+                    let mut rsum = 0i32;
+                    for col in 0..in_dim {
+                        let v = (data[base + col] * inv_scale).round().clamp(-128.0, 127.0) as i8;
+                        w_i8[base + col] = v;
+                        rsum += v as i32;
+                    }
+                    row_sums[row] = rsum;
+                }
+                (w_i8, row_scales, row_sums, out_dim, in_dim)
+            }
+            _ => bail!("LinearWithBias weight은 I8 또는 F32 타입이어야 함: {}", w_key),
+        };
+
+        let bias_key = format!("{}.bias", prefix);
+        let bias_data = bmmq_take_f32(tensors, &bias_key)?;
+
+        Ok(Self { w_i8, row_scales, row_sums, bias_data, out_dim, in_dim })
+    }
+
     fn forward_vec(&self, x: &[f32], out: &mut [f32], x_u8: &mut [u8]) {
         let n = self.in_dim;
         let x_scale = unsafe {
@@ -436,6 +570,17 @@ impl BitNetFFN {
             gate_proj,
             up_proj: BitLinear::load(tensors, &format!("{}.up_proj", prefix))?,
             down_proj: BitLinear::load(tensors, &format!("{}.down_proj", prefix))?,
+            d_ff,
+        })
+    }
+
+    pub fn load_bmmq(tensors: &mut HashMap<String, TensorData>, prefix: &str) -> Result<Self> {
+        let gate_proj = BitLinear::load_bmmq(tensors, &format!("{}.gate_proj", prefix))?;
+        let d_ff = gate_proj.out_dim;
+        Ok(Self {
+            gate_proj,
+            up_proj: BitLinear::load_bmmq(tensors, &format!("{}.up_proj", prefix))?,
+            down_proj: BitLinear::load_bmmq(tensors, &format!("{}.down_proj", prefix))?,
             d_ff,
         })
     }
@@ -541,6 +686,50 @@ impl Mamba2Block {
             conv1d_bias: Some(conv1d_bias),
             norm_weight: Some(norm_weight),
             out_proj: Linear::load(tensors, &format!("{}.out_proj", p))?,
+            conv_weight_data,
+            conv_bias_data,
+            norm_weight_data,
+            dt_bias_data,
+            a_data,
+            d_data,
+            d_inner: cfg.d_inner,
+            d_state: cfg.d_state,
+            d_conv: cfg.d_conv,
+            nheads,
+            headdim: cfg.headdim,
+            ngroups: cfg.ngroups,
+            conv_channels,
+            proj_dim,
+        })
+    }
+
+    pub fn load_bmmq(
+        tensors: &mut HashMap<String, TensorData>,
+        prefix: &str,
+        cfg: &ModelConfig,
+    ) -> Result<Self> {
+        let p = format!("{}.mamba2", prefix);
+
+        let conv_weight_data = bmmq_take_f32(tensors, &format!("{}.conv1d.weight", p))?;
+        let conv_bias_data = bmmq_take_f32(tensors, &format!("{}.conv1d.bias", p))?;
+        let norm_weight_data = bmmq_take_f32(tensors, &format!("{}.norm.weight", p))?;
+        let dt_bias_data = bmmq_take_f32(tensors, &format!("{}.dt_bias", p))?;
+
+        let a_log_data = bmmq_take_f32(tensors, &format!("{}.A_log", p))?;
+        let a_data: Vec<f32> = a_log_data.iter().map(|&v| -(v.exp())).collect();
+
+        let d_data = bmmq_take_f32(tensors, &format!("{}.D", p))?;
+
+        let conv_channels = cfg.d_inner + 2 * cfg.ngroups * cfg.d_state;
+        let nheads = cfg.nheads();
+        let proj_dim = 2 * cfg.d_inner + 2 * cfg.ngroups * cfg.d_state + nheads;
+
+        Ok(Self {
+            in_proj: Linear::load_bmmq(tensors, &format!("{}.in_proj", p))?,
+            conv1d_weight: None,
+            conv1d_bias: None,
+            norm_weight: None,
+            out_proj: Linear::load_bmmq(tensors, &format!("{}.out_proj", p))?,
             conv_weight_data,
             conv_bias_data,
             norm_weight_data,
@@ -853,6 +1042,23 @@ impl LinearCrossAttention {
         })
     }
 
+    pub fn load_bmmq(
+        tensors: &mut HashMap<String, TensorData>,
+        prefix: &str,
+        n_heads: usize,
+        d_head: usize,
+    ) -> Result<Self> {
+        Ok(Self {
+            q_proj: Linear::load_bmmq(tensors, &format!("{}.q_proj", prefix))?,
+            k_proj: Linear::load_bmmq(tensors, &format!("{}.k_proj", prefix))?,
+            v_proj: Linear::load_bmmq(tensors, &format!("{}.v_proj", prefix))?,
+            o_proj: Linear::load_bmmq(tensors, &format!("{}.o_proj", prefix))?,
+            n_heads,
+            d_head,
+            eps: 1e-5,
+        })
+    }
+
     /// Encoder KV 캐시 생성 (순수 scalar)
     pub fn cache_encoder(&self, encoder_out: &Tensor) -> Result<CrossAttnCache> {
         let (_, src_len, _) = encoder_out.dims3()?;
@@ -971,6 +1177,19 @@ impl EncoderLayer {
         })
     }
 
+    pub fn load_bmmq(
+        tensors: &mut HashMap<String, TensorData>,
+        prefix: &str,
+        cfg: &ModelConfig,
+    ) -> Result<Self> {
+        Ok(Self {
+            mamba: Mamba2Block::load_bmmq(tensors, &format!("{}.mamba", prefix), cfg)?,
+            norm1: RMSNorm::load_bmmq(tensors, &format!("{}.norm1", prefix), cfg.rms_norm_eps)?,
+            ffn: BitNetFFN::load_bmmq(tensors, &format!("{}.ffn", prefix))?,
+            norm2: RMSNorm::load_bmmq(tensors, &format!("{}.norm2", prefix), cfg.rms_norm_eps)?,
+        })
+    }
+
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let residual = x.clone();
         let x = self.mamba.forward(x)?;
@@ -1068,6 +1287,29 @@ impl DecoderLayer {
             norm_cross: RMSNorm::load(tensors, &format!("{}.norm_cross", prefix), cfg.rms_norm_eps)?,
             ffn: BitNetFFN::load(tensors, &format!("{}.ffn", prefix))?,
             norm2: RMSNorm::load(tensors, &format!("{}.norm2", prefix), cfg.rms_norm_eps)?,
+            d_model: cfg.d_model,
+        })
+    }
+
+    pub fn load_bmmq(
+        tensors: &mut HashMap<String, TensorData>,
+        prefix: &str,
+        cfg: &ModelConfig,
+    ) -> Result<Self> {
+        let n_heads = cfg.d_model / 64;
+        let d_head = 64;
+        Ok(Self {
+            mamba: Mamba2Block::load_bmmq(tensors, &format!("{}.mamba", prefix), cfg)?,
+            norm1: RMSNorm::load_bmmq(tensors, &format!("{}.norm1", prefix), cfg.rms_norm_eps)?,
+            cross_attn: LinearCrossAttention::load_bmmq(
+                tensors,
+                &format!("{}.cross_attn", prefix),
+                n_heads,
+                d_head,
+            )?,
+            norm_cross: RMSNorm::load_bmmq(tensors, &format!("{}.norm_cross", prefix), cfg.rms_norm_eps)?,
+            ffn: BitNetFFN::load_bmmq(tensors, &format!("{}.ffn", prefix))?,
+            norm2: RMSNorm::load_bmmq(tensors, &format!("{}.norm2", prefix), cfg.rms_norm_eps)?,
             d_model: cfg.d_model,
         })
     }
@@ -1210,6 +1452,202 @@ impl BitMambaSeq2Seq {
         })
     }
 
+    pub fn load_bmmq(model_path: &str, cfg: &ModelConfig) -> Result<Self> {
+        eprintln!("BMMQ 모델 로드 중: {}", model_path);
+
+        let mut tensors = bmmq::load_bmmq(model_path)
+            .context("BMMQ 파일 로드 실패")?;
+
+        eprintln!("  텐서 수: {}", tensors.len());
+
+        // 임베딩 (f32)
+        let embed_data = bmmq_take_f32(&mut tensors, "encoder_embedding.weight")?;
+
+        // lm_head: tie_lm_head이면 encoder_embedding과 동일
+        let lm_head_f32 = if cfg.tie_lm_head {
+            embed_data.clone()
+        } else {
+            bmmq_take_f32(&mut tensors, "lm_head.weight")?
+        };
+        // lm_head i8 양자화
+        let lm_vocab = cfg.vocab_size;
+        let lm_dim = cfg.d_model;
+        let mut lm_head_i8 = vec![0i8; lm_vocab * lm_dim];
+        let mut lm_head_row_scales = vec![0.0f32; lm_vocab];
+        let mut lm_head_row_sums = vec![0i32; lm_vocab];
+        for row in 0..lm_vocab {
+            let base = row * lm_dim;
+            let mut max_abs = 0.0f32;
+            for col in 0..lm_dim { max_abs = max_abs.max(lm_head_f32[base + col].abs()); }
+            if max_abs < 1e-10 { max_abs = 1e-10; }
+            lm_head_row_scales[row] = max_abs / 127.0;
+            let inv_scale = 127.0 / max_abs;
+            let mut rsum = 0i32;
+            for col in 0..lm_dim {
+                let v = (lm_head_f32[base + col] * inv_scale).round().clamp(-128.0, 127.0) as i8;
+                lm_head_i8[base + col] = v;
+                rsum += v as i32;
+            }
+            lm_head_row_sums[row] = rsum;
+        }
+
+        let mut encoder_layers = Vec::new();
+        for i in 0..cfg.n_encoder_layers {
+            let prefix = format!("encoder.layers.{}", i);
+            encoder_layers.push(EncoderLayer::load_bmmq(&mut tensors, &prefix, cfg)?);
+            eprintln!("  인코더 레이어 {} 로드", i);
+        }
+
+        let mut decoder_layers = Vec::new();
+        for i in 0..cfg.n_decoder_layers {
+            let prefix = format!("decoder.layers.{}", i);
+            decoder_layers.push(DecoderLayer::load_bmmq(&mut tensors, &prefix, cfg)?);
+            eprintln!("  디코더 레이어 {} 로드", i);
+        }
+
+        let final_norm = RMSNorm::load_bmmq(&mut tensors, "final_norm", cfg.rms_norm_eps)?;
+
+        let copy_gate = if cfg.use_copy_gate {
+            Some(LinearWithBias::load_bmmq(&mut tensors, "copy_gate")?)
+        } else {
+            None
+        };
+
+        let bitlinear_count = (cfg.n_encoder_layers + cfg.n_decoder_layers) * 3;
+        eprintln!("BMMQ 모델 로드 완료 (BitLinear 2-bit ×{}, AVX-VNNI int8 커널)", bitlinear_count);
+
+        Ok(Self {
+            encoder_embedding: None,  // Vec path 사용 — Tensor 불필요
+            embed_data,
+            encoder_layers,
+            decoder_layers,
+            final_norm,
+            lm_head_i8,
+            lm_head_row_scales,
+            lm_head_row_sums,
+            copy_gate,
+            cfg: cfg.clone(),
+        })
+    }
+
+    /// 인코더 Vec path: 토큰별 순차 처리 (Tensor 불필요)
+    pub fn encode_vec(&self, src_ids: &[u32]) -> Vec<f32> {
+        let d = self.cfg.d_model;
+        let seq_len = src_ids.len();
+        let scale = self.cfg.embed_scale();
+
+        // 인코더 출력: (seq_len, d_model) flat
+        let mut x = vec![0.0f32; seq_len * d];
+        for (t, &id) in src_ids.iter().enumerate() {
+            let offset = id as usize * d;
+            for i in 0..d {
+                x[t * d + i] = self.embed_data[offset + i] * scale;
+            }
+        }
+
+        // 인코더 버퍼
+        let proj_dim = self.encoder_layers[0].mamba.proj_dim;
+        let conv_ch = self.encoder_layers[0].mamba.conv_channels;
+        let d_ff = self.encoder_layers[0].ffn.d_ff;
+        let d_inner = self.cfg.d_inner;
+        let max_in_dim = d.max(d_inner).max(self.cfg.d_ff);
+        let mut proj_buf = vec![0.0f32; proj_dim];
+        let mut xbc_buf = vec![0.0f32; conv_ch];
+        let mut ssm_y = vec![0.0f32; d_inner];
+        let mut x_u8 = vec![0u8; max_in_dim];
+        let mut x_norm_buf = vec![0.0f32; max_in_dim];
+        let mut ff1 = vec![0.0f32; d_ff];
+        let mut ff2 = vec![0.0f32; d_ff];
+        let mut residual = vec![0.0f32; d];
+        let mut normed = vec![0.0f32; d];
+        let mut ffn_out = vec![0.0f32; d];
+        let mut x_next = vec![0.0f32; seq_len * d];
+
+        for layer in &self.encoder_layers {
+            let mut mamba_state = layer.mamba.new_state();
+
+            for t in 0..seq_len {
+                let x_t = &x[t * d..(t + 1) * d];
+
+                // Mamba step
+                layer.mamba.step(x_t, &mut mamba_state, &mut proj_buf, &mut xbc_buf, &mut ssm_y, &mut x_u8);
+                // proj_buf는 mamba 결과 (d_model)
+                for i in 0..d { residual[i] = x_t[i] + proj_buf[i]; }
+                layer.norm1.forward_vec(&residual, &mut normed);
+
+                // FFN
+                layer.ffn.forward_vec(&normed, &mut ff1, &mut ff2, &mut x_norm_buf, &mut x_u8, &mut ffn_out);
+                for i in 0..d { residual[i] = normed[i] + ffn_out[i]; }
+                layer.norm2.forward_vec(&residual, &mut normed);
+
+                // 결과를 x_next에 저장
+                x_next[t * d..(t + 1) * d].copy_from_slice(&normed[..d]);
+            }
+
+            // 레이어 출력을 다음 레이어 입력으로
+            std::mem::swap(&mut x, &mut x_next);
+        }
+
+        x
+    }
+
+    /// Vec path 인코더 출력으로 디코더 state 초기화
+    pub fn init_decoder_state_vec(&self, enc_out: &[f32], seq_len: usize) -> DecoderState {
+        let d = self.cfg.d_model;
+        let max_in_dim = d.max(self.cfg.d_inner).max(self.cfg.d_ff);
+        let mut x_u8 = vec![0u8; max_in_dim];
+
+        let mut mamba_states = Vec::new();
+        let mut cross_attn_caches = Vec::new();
+
+        for layer in &self.decoder_layers {
+            mamba_states.push(layer.mamba.new_state());
+
+            let ca = &layer.cross_attn;
+            let nh = ca.n_heads;
+            let dh = ca.d_head;
+
+            // KV 캐시: 토큰별 k_proj, v_proj → 누적
+            let mut kv_data = vec![0.0f32; nh * dh * dh];
+            let mut z_data = vec![0.0f32; nh * dh];
+            let mut k_buf = vec![0.0f32; d];
+            let mut v_buf = vec![0.0f32; d];
+
+            for t in 0..seq_len {
+                let x_t = &enc_out[t * d..(t + 1) * d];
+
+                // K, V projection
+                ca.k_proj.forward_vec(x_t, &mut k_buf, &mut x_u8);
+                ca.v_proj.forward_vec(x_t, &mut v_buf, &mut x_u8);
+
+                // gelu1p on K
+                for i in 0..d { k_buf[i] = gelu1p_scalar(k_buf[i]); }
+
+                // 헤드별 outer product 누적: KV[h] += k_h^T @ v_h
+                for h in 0..nh {
+                    let k_off = h * dh;
+                    let v_off = h * dh;
+                    let kv_off = h * dh * dh;
+                    let z_off = h * dh;
+
+                    for ki in 0..dh {
+                        let k_val = k_buf[k_off + ki];
+                        z_data[z_off + ki] += k_val;
+                        for vi in 0..dh {
+                            kv_data[kv_off + ki * dh + vi] += k_val * v_buf[v_off + vi];
+                        }
+                    }
+                }
+            }
+
+            cross_attn_caches.push(CrossAttnCache {
+                kv_data, z_data, n_heads: nh, d_head: dh,
+            });
+        }
+
+        DecoderState { mamba_states, cross_attn_caches }
+    }
+
     fn embed(&self, ids: &Tensor) -> Result<Tensor> {
         let enc_emb = self.encoder_embedding.as_ref().expect("encoder_embedding already dropped");
         let (batch, seq_len) = ids.dims2()?;
@@ -1254,17 +1692,15 @@ impl BitMambaSeq2Seq {
         Ok(DecoderState { mamba_states, cross_attn_caches })
     }
 
-    /// 인코딩+KV캐시 후 f32 Tensor 해제 — 메모리 대폭 절감
+    /// 인코딩+KV캐시 후 불필요한 데이터 해제 — 메모리 대폭 절감
     pub fn drop_tensors(&mut self) {
         self.encoder_embedding = None;
-        for layer in &mut self.encoder_layers {
-            layer.drop_tensors();
-        }
+        // 인코더 레이어 전체 해제 (인코딩 완료 후 불필요)
+        self.encoder_layers.clear();
+        self.encoder_layers.shrink_to_fit();
         for layer in &mut self.decoder_layers {
             layer.drop_tensors();
         }
-        // RMSNorm의 Tensor도 해제 (weight_vec만 사용)
-        // final_norm.weight는 작으므로 무시
     }
 
     /// Incremental 1-token decode step → logits

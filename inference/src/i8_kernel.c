@@ -59,6 +59,74 @@ void i8_sgemv(
     }
 }
 
+/* ── 2-bit ternary → i8 언팩 (per-row, byte-LUT 최적화) ── */
+
+/* 256-entry byte LUT: 각 packed byte → 4개의 i8 ternary 값
+ * 인코딩: 00=0, 01=+1, 11=-1, MSB-first */
+static int32_t _byte_lut[256]; /* 4xi8 packed as int32_t */
+static int _byte_lut_init = 0;
+
+static const int8_t _2bit_val[4] = {0, 1, 0, -1};
+
+static void init_byte_lut(void) {
+    if (_byte_lut_init) return;
+    for (int b = 0; b < 256; b++) {
+        int8_t vals[4];
+        vals[0] = _2bit_val[(b >> 6) & 3];
+        vals[1] = _2bit_val[(b >> 4) & 3];
+        vals[2] = _2bit_val[(b >> 2) & 3];
+        vals[3] = _2bit_val[ b       & 3];
+        __builtin_memcpy(&_byte_lut[b], vals, 4);
+    }
+    _byte_lut_init = 1;
+}
+
+static inline void unpack_2bit_row(
+    const uint8_t* packed, int8_t* out, int cols, int packed_stride
+) {
+    init_byte_lut();
+    /* byte-LUT: 1 lookup + 4-byte store per packed byte */
+    int full_bytes = cols / 4;
+    for (int b = 0; b < full_bytes; b++) {
+        __builtin_memcpy(out + b * 4, &_byte_lut[packed[b]], 4);
+    }
+    /* 나머지 */
+    int c = full_bytes * 4;
+    if (c < cols) {
+        int8_t tmp[4];
+        __builtin_memcpy(tmp, &_byte_lut[packed[full_bytes]], 4);
+        for (int i = 0; c < cols; i++, c++) out[c] = tmp[i];
+    }
+    /* VNNI 32바이트 정렬 패딩 */
+    int aligned = (cols + 31) & ~31;
+    for (int i = cols; i < aligned; i++) out[i] = 0;
+}
+
+/* ── ternary_sgemv: packed 2-bit weight × u8 activation → f32 output ── */
+
+void ternary_sgemv(
+    const uint8_t* packed_weights,  /* [m × packed_stride] packed 2-bit */
+    const uint8_t* x_u8,           /* [n] quantized activation */
+    float* y,                       /* [m] output */
+    int m, int n, int packed_stride,
+    const int32_t* row_sums,       /* [m] Σ_j w[i,j] — 사전 계산 */
+    float gamma,                    /* BitLinear gamma */
+    float x_scale                   /* activation dequant scale */
+) {
+    #pragma omp parallel for schedule(static) if(m >= 64)
+    for (int row = 0; row < m; row++) {
+        /* thread-local 언팩 버퍼 (최대 in_dim + 32 패딩) */
+        static __thread int8_t unpack_buf[8192];
+        unpack_2bit_row(
+            packed_weights + (int64_t)row * packed_stride,
+            unpack_buf, n, packed_stride
+        );
+        int32_t dot = vnni_dot(x_u8, unpack_buf, n);
+        int32_t corrected = dot - 128 * row_sums[row];
+        y[row] = (float)corrected * gamma * x_scale;
+    }
+}
+
 /* ── f32 → u8 양자화 (eta 반환) ───────────────────── */
 
 float quantize_f32_to_u8(const float* x, uint8_t* out, int n) {

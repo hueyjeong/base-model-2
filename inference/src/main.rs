@@ -1,3 +1,4 @@
+mod bmmq;
 mod config;
 mod model;
 mod tokenizer;
@@ -24,6 +25,10 @@ struct Args {
     /// 단일 입력 텍스트 (없으면 대화형 모드)
     #[arg(short, long)]
     input: Option<String>,
+
+    /// 모델 포맷: safetensors (기본) 또는 bmmq
+    #[arg(short, long, default_value = "auto")]
+    format: String,
 }
 
 fn main() -> Result<()> {
@@ -39,15 +44,29 @@ fn main() -> Result<()> {
     let tok = tokenizer::KeyboardTokenizer::from_dir(&args.model_dir)?;
     eprintln!("토크나이저 로드: vocab_size={}", tok.vocab_size());
 
-    // 모델 로드
+    // 모델 로드 (포맷 자동 감지)
     let t0 = Instant::now();
-    let model_path = format!("{}/model.safetensors", args.model_dir);
-    let mut model = model::BitMambaSeq2Seq::load(&model_path, &cfg)?;
+    let bmmq_path = format!("{}/model.bmmq", args.model_dir);
+    let safetensors_path = format!("{}/model.safetensors", args.model_dir);
+
+    let use_bmmq = match args.format.as_str() {
+        "bmmq" => true,
+        "safetensors" => false,
+        _ => std::path::Path::new(&bmmq_path).exists(), // auto: bmmq 우선
+    };
+
+    let mut model = if use_bmmq {
+        eprintln!("포맷: BMMQ");
+        model::BitMambaSeq2Seq::load_bmmq(&bmmq_path, &cfg)?
+    } else {
+        eprintln!("포맷: safetensors");
+        model::BitMambaSeq2Seq::load(&safetensors_path, &cfg)?
+    };
     let load_ms = t0.elapsed().as_millis();
     eprintln!("모델 로드: {}ms", load_ms);
 
     if let Some(input) = args.input {
-        run_inference(&mut model, &tok, &input, args.max_tokens, true)?;
+        run_inference(&mut model, &tok, &input, args.max_tokens, true, use_bmmq)?;
     } else {
         eprintln!("\n대화형 모드 (Ctrl+D로 종료)");
         eprintln!("교정할 텍스트를 입력하세요:");
@@ -64,7 +83,7 @@ fn main() -> Result<()> {
             let line = line.trim();
             if line.is_empty() { continue; }
 
-            run_inference(&mut model, &tok, line, args.max_tokens, false)?;
+            run_inference(&mut model, &tok, line, args.max_tokens, false, use_bmmq)?;
             println!();
         }
     }
@@ -78,6 +97,7 @@ fn run_inference(
     input: &str,
     max_tokens: usize,
     drop_after_encode: bool,
+    use_vec_path: bool,
 ) -> Result<()> {
     eprintln!("입력: {}", input);
 
@@ -86,23 +106,34 @@ fn run_inference(
 
     let t_total = Instant::now();
 
-    // 인코딩
-    let t0 = Instant::now();
-    let encoder_out = model.encode(&src_ids)?;
-    let enc_ms = t0.elapsed().as_millis();
+    let mut dec_state;
+    let enc_ms;
+    let cache_ms;
 
-    // KV 캐시 초기화
-    let t0 = Instant::now();
-    let mut dec_state = model.init_decoder_state(&encoder_out)?;
-    let cache_ms = t0.elapsed().as_millis();
+    if use_vec_path {
+        // Vec path: Tensor 없이 인코딩 + KV 캐시 생성
+        let t0 = Instant::now();
+        let enc_out = model.encode_vec(&src_ids);
+        enc_ms = t0.elapsed().as_millis();
 
-    // f32 Tensor 해제 — 디코딩에는 i8 weight만 사용
-    drop(encoder_out);
+        let t0 = Instant::now();
+        dec_state = model.init_decoder_state_vec(&enc_out, src_ids.len());
+        cache_ms = t0.elapsed().as_millis();
+    } else {
+        // Tensor path (safetensors 하위호환)
+        let t0 = Instant::now();
+        let encoder_out = model.encode(&src_ids)?;
+        enc_ms = t0.elapsed().as_millis();
+
+        let t0 = Instant::now();
+        dec_state = model.init_decoder_state(&encoder_out)?;
+        cache_ms = t0.elapsed().as_millis();
+        drop(encoder_out);
+    }
+
     if drop_after_encode {
         model.drop_tensors();
-        // glibc에 해제된 메모리를 OS에 반환하도록 요청
         unsafe { malloc_trim(0); }
-        // RSS 측정 (drop 후 실제 사용 메모리)
         if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
             for line in status.lines() {
                 if line.starts_with("VmRSS:") {
