@@ -11,17 +11,11 @@ import torch.nn.functional as F
 
 from model.encoder import BatchedBitNetFFN
 
-# CUDA MoE dispatch 감지
+# CUDA MoE dispatch 비활성화
+# scatter/gather가 raw CUDA 커널이라 autograd 미지원 → expert gradient 차단
+# TODO: torch.autograd.Function으로 scatter/gather backward 구현 후 재활성화
 _CUDA_MOE_AVAILABLE = False
 _moe_dispatch_forward = None
-try:
-    from model.cuda_moe_dispatch import moe_dispatch_forward as _moe_fn
-    from model.cuda_moe_dispatch import is_available as _moe_check
-    if _moe_check():
-        _CUDA_MOE_AVAILABLE = True
-        _moe_dispatch_forward = _moe_fn
-except (ImportError, Exception):
-    pass
 
 
 class MoEBitNetFFN(nn.Module):
