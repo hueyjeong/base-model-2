@@ -26,19 +26,20 @@ class BitMambaSeq2Seq(nn.Module):
         super().__init__()
         self.config = config
 
-        # --- 임베딩 (FP16) ---
+        # --- 임베딩 (BF16) ---
+        # FP16(max=65504)은 tie_lm_head 시 gradient overflow 발생 →
+        # BF16(max=3.4e38)으로 전환. 메모리 동일(2B/param), 지수 범위 FP32 동급.
         self.encoder_embedding = nn.Embedding(
             config.vocab_size, config.d_model, padding_idx=config.pad_id,
         )
-        # 임베딩을 FP16으로 유지
-        self.encoder_embedding = self.encoder_embedding.half()
+        self.encoder_embedding = self.encoder_embedding.bfloat16()
 
         if config.tie_embeddings:
             self.decoder_embedding = self.encoder_embedding
         else:
             self.decoder_embedding = nn.Embedding(
                 config.vocab_size, config.d_model, padding_idx=config.pad_id,
-            ).half()
+            ).bfloat16()
 
         # 임베딩 스케일링 (d_model ** 0.5)
         self.embed_scale = config.d_model ** 0.5
@@ -130,8 +131,12 @@ class BitMambaSeq2Seq(nn.Module):
         # Document isolation: BOS 위치에서 SSM state 리셋
         reset_mask = (src_ids == self.config.bos_id)  # (B, src_len)
 
-        # 임베딩 (FP16 → FP32 변환)
-        x = self.encoder_embedding(src_ids).float() * self.embed_scale
+        # 임베딩: AMP 하에서는 AMP dtype(BF16)으로 출력하여 전체 BF16 동작
+        if torch.is_autocast_enabled('cuda'):
+            _emb_dtype = torch.get_autocast_dtype('cuda')
+        else:
+            _emb_dtype = torch.float32
+        x = self.encoder_embedding(src_ids).to(_emb_dtype) * self.embed_scale
         x = self.embed_dropout(x)
         if self.encoder.gradient_checkpointing:
             x.requires_grad_(True)
@@ -139,7 +144,7 @@ class BitMambaSeq2Seq(nn.Module):
         # 패딩 위치를 완전히 0으로 만들면 역전파 시 MambaBlock에서 NaN 유발 가능성 존재
         # 극소값 1e-5를 남겨두어 gradient flow를 안전하게 유지
         if src_mask is not None:
-            x = x * (src_mask.unsqueeze(-1).float() + 1e-5)  # (B, src_len, 1)
+            x = x * (src_mask.unsqueeze(-1).to(x.dtype) + 1e-5)  # (B, src_len, 1)
 
         # 인코더 스택
         encoder_out = self.encoder(x, reset_mask=reset_mask)
@@ -176,19 +181,31 @@ class BitMambaSeq2Seq(nn.Module):
         # Document isolation: BOS 위치에서 SSM state 리셋
         reset_mask = (tgt_ids == self.config.bos_id)  # (B, tgt_len)
 
-        # 타겟 임베딩 (FP16 → FP32 변환)
-        tgt_emb = self.decoder_embedding(tgt_ids).float() * self.embed_scale
+        # Cross-attention 문서 격리: 각 문서별로 context matrix 분리
+        src_doc_ids = (src_ids == self.config.bos_id).int().cumsum(dim=1) - 1  # (B, src_len)
+        tgt_doc_ids = reset_mask.int().cumsum(dim=1) - 1  # (B, tgt_len)
+
+        # max_docs를 여기서 1회만 계산 (기존: 레이어당 2회 .item() sync × 12레이어 = 24회 sync → 1회로 감소)
+        max_docs = int(torch.max(src_doc_ids.max(), tgt_doc_ids.max()).item()) + 1
+
+        # 타겟 임베딩: AMP 하에서는 AMP dtype(BF16)으로 출력
+        if torch.is_autocast_enabled('cuda'):
+            _emb_dtype = torch.get_autocast_dtype('cuda')
+        else:
+            _emb_dtype = torch.float32
+        tgt_emb = self.decoder_embedding(tgt_ids).to(_emb_dtype) * self.embed_scale
         tgt_emb = self.embed_dropout(tgt_emb)
         if self.decoder.gradient_checkpointing:
             tgt_emb.requires_grad_(True)
 
         # 패딩 위치의 encoder_out 마스킹 시 극소값 잔존으로 완전한 0.0 회피
         if encoder_mask is not None:
-            encoder_out = encoder_out * (encoder_mask.unsqueeze(-1).float() + 1e-5)
+            encoder_out = encoder_out * (encoder_mask.unsqueeze(-1).to(encoder_out.dtype) + 1e-5)
 
         # 디코더 스택 (Target Embedding만 Mamba로 들어가고, encoder_out은 Linear Cross-Attention으로 전달됨)
         x = self.decoder(tgt_emb, encoder_out=encoder_out, encoder_mask=encoder_mask,
-                         reset_mask=reset_mask)
+                         reset_mask=reset_mask, src_doc_ids=src_doc_ids,
+                         tgt_doc_ids=tgt_doc_ids, max_docs=max_docs)
 
         # 최종 정규화
         x = self.final_norm(x)

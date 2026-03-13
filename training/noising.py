@@ -461,6 +461,8 @@ def _apply_text_infilling(
 ) -> tuple[list[int], list[float]]:
     """텍스트 인필링 — 원본 토큰 구간(weight=1.0)에서 span을 단일 [MASK]로 교체"""
     n = len(ids)
+    if n == 0 or ratio <= 0.0 or poisson_lambda <= 0.0:
+        return ids, weights
     n_to_mask = max(1, int(n * ratio))
     masked = 0
     
@@ -668,12 +670,14 @@ class DenoisingNoiser:
         noised_text = self._apply_text_noise(text, lang)
         noised_ids_base = self.tokenizer.encode(noised_text, add_special=False)
 
-        # Difflib을 이용하여 텍스트 노이즈 결과와 원본 간의 일치하는 블록 찾기
-        import difflib
-        matcher = difflib.SequenceMatcher(None, target_ids_base, noised_ids_base)
+        # rapidfuzz C++ opcodes로 텍스트 노이즈 결과와 원본 간의 일치하는 블록 찾기
+        # (difflib.SequenceMatcher O(N²) → rapidfuzz C++ backend O(N×M) with early exit)
+        from rapidfuzz.distance import Opcodes as _Opcodes
+        from rapidfuzz.distance.Indel import opcodes as _indel_opcodes
+        _ops = _indel_opcodes(target_ids_base, noised_ids_base)
         src_weights_base = [0.5] * len(noised_ids_base)
         
-        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        for tag, i1, i2, j1, j2 in _ops:
             if tag == 'equal':
                 for j in range(j1, j2):
                     src_weights_base[j] = 1.0
