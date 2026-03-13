@@ -972,7 +972,6 @@ impl Mamba2Block {
         }
 
         // 4. RMSNorm + silu(z) gate → out_proj
-        // y_norm → reuse xbc_buf (충분한 크기)
         xbc_buf.resize(self.d_inner, 0.0);
         let mut sq_sum = 0.0f32;
         for i in 0..self.d_inner { sq_sum += ssm_y[i] * ssm_y[i]; }
@@ -1345,7 +1344,6 @@ impl DecoderLayer {
         self.ffn.forward_vec(&bufs.normed, &mut bufs.ff1, &mut bufs.ff2, &mut bufs.x_norm_buf, &mut bufs.x_u8, &mut bufs.out);
         for i in 0..d { bufs.residual[i] = bufs.normed[i] + bufs.out[i]; }
         self.norm2.forward_vec(&bufs.residual, &mut bufs.normed);
-        // normed가 이 레이어의 최종 출력
     }
 
     fn drop_tensors(&mut self) {
