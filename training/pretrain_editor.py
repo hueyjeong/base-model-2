@@ -36,6 +36,22 @@ from model.edit_tags import compute_edit_tags, apply_edit_tags, TAG_KEEP
 from training.noising import DenoisingNoiser, NoiseConfig
 from training.editor_dataset import EditorDataset
 
+# C++ Levenshtein 확장 JIT 로드 (학습 시 iterative refinement 가속)
+_LEVENSHTEIN_CPP = None
+try:
+    from torch.utils.cpp_extension import load as _cpp_load
+    _ext_src = os.path.join(os.path.dirname(__file__), "..", "model", "levenshtein_ext.cpp")
+    if os.path.exists(_ext_src):
+        _LEVENSHTEIN_CPP = _cpp_load(
+            name="levenshtein_ext",
+            sources=[_ext_src],
+            extra_cflags=["-O3", "-fopenmp"],
+            extra_ldflags=["-fopenmp"],
+            verbose=False,
+        )
+except Exception:
+    pass
+
 # ── 토크나이저 프리셋 (pretrain.py 재사용) ──
 
 PROJECT_ROOT = os.path.join(os.path.dirname(__file__), "..")
@@ -294,35 +310,41 @@ def train(args):
                 if it < config.n_iterations - 1:
                     with torch.no_grad():
                         pred_tags = tag_logits.argmax(dim=-1)  # (B, T)
-                        B, T = current_ids.shape
 
-                        # 배치별로 태그 적용
-                        new_ids_list = []
-                        new_tags_list = []
-                        for b in range(B):
-                            valid = pad_mask[b]
-                            src = current_ids[b][valid].tolist()
-                            tags_b = pred_tags[b][valid].tolist()
+                        if _LEVENSHTEIN_CPP is not None:
+                            # C++ OpenMP 가속 (배치 병렬 처리)
+                            new_ids, new_tags_t, new_mask = _LEVENSHTEIN_CPP.batch_refinement_step(
+                                current_ids, pred_tags, original_ids, pad_mask,
+                                config.vocab_size, config.pad_id, config.max_seq_len,
+                            )
+                            current_ids = new_ids
+                            edit_tags = new_tags_t
+                            pad_mask = new_mask
+                        else:
+                            # Python 폴백
+                            B, T = current_ids.shape
+                            new_ids_list = []
+                            new_tags_list = []
+                            for b in range(B):
+                                valid = pad_mask[b]
+                                src = current_ids[b][valid].tolist()
+                                tags_b = pred_tags[b][valid].tolist()
 
-                            # 태그 적용
-                            modified = apply_edit_tags(src, tags_b, config.vocab_size)
-                            # truncate/pad to max_seq_len
-                            modified = modified[:config.max_seq_len]
-                            pad_len = config.max_seq_len - len(modified)
-                            modified_padded = modified + [config.pad_id] * pad_len
+                                modified = apply_edit_tags(src, tags_b, config.vocab_size)
+                                modified = modified[:config.max_seq_len]
+                                pad_len = config.max_seq_len - len(modified)
+                                modified_padded = modified + [config.pad_id] * pad_len
 
-                            # 새 편집 태그 계산
-                            orig = original_ids[b][original_ids[b] != config.pad_id].tolist()
-                            new_tags = compute_edit_tags(modified, orig, config.vocab_size)
-                            new_tags = new_tags + [TAG_KEEP] * pad_len
+                                orig = original_ids[b][original_ids[b] != config.pad_id].tolist()
+                                new_tags = compute_edit_tags(modified, orig, config.vocab_size)
+                                new_tags = new_tags + [TAG_KEEP] * pad_len
 
-                            new_ids_list.append(modified_padded)
-                            new_tags_list.append(new_tags)
+                                new_ids_list.append(modified_padded)
+                                new_tags_list.append(new_tags)
 
-                        current_ids = torch.tensor(new_ids_list, dtype=torch.long, device=device)
-                        edit_tags = torch.tensor(new_tags_list, dtype=torch.long, device=device)
-                        # pad_mask 업데이트
-                        pad_mask = (current_ids != config.pad_id)
+                            current_ids = torch.tensor(new_ids_list, dtype=torch.long, device=device)
+                            edit_tags = torch.tensor(new_tags_list, dtype=torch.long, device=device)
+                            pad_mask = (current_ids != config.pad_id)
 
             total_loss = total_loss + iter_loss / config.n_iterations
             n_tok = batch["pad_mask"].sum().item()
