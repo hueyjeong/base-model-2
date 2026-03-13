@@ -191,7 +191,7 @@ class EditorDataset(IterableDataset):
             "n_chars": text_len,
         }
 
-    def _make_packed_sample(self, buf_input, buf_tags):
+    def _make_packed_sample(self, buf_input, buf_tags, n_chars):
         """패킹된 버퍼를 max_seq_len으로 패딩하여 dict 반환"""
         seq_len = len(buf_input)
         pad_len = self.max_seq_len - seq_len
@@ -202,7 +202,7 @@ class EditorDataset(IterableDataset):
             "edit_tags": torch.tensor(buf_tags + [TAG_KEEP] * pad_len, dtype=torch.long),
             "pad_mask": torch.tensor([True] * seq_len + [False] * pad_len, dtype=torch.bool),
             "original_ids": torch.zeros(self.max_seq_len, dtype=torch.long),  # 패킹 시 미사용
-            "n_chars": 0,
+            "n_chars": n_chars,
         }
 
     def __iter__(self):
@@ -232,6 +232,7 @@ class EditorDataset(IterableDataset):
         """패킹 모드: 여러 문장을 연결하여 max_seq_len 채움"""
         buf_input = []
         buf_tags = []
+        buf_chars = 0
 
         for i, (text, lang) in enumerate(self._iter_lines(
                 skip_worker_id=global_worker_id, skip_total=total_workers)):
@@ -246,18 +247,20 @@ class EditorDataset(IterableDataset):
             if len(noised_ids) > remaining:
                 # 버퍼 방출
                 if buf_input:
-                    yield self._make_packed_sample(buf_input, buf_tags)
+                    yield self._make_packed_sample(buf_input, buf_tags, buf_chars)
                 buf_input = []
                 buf_tags = []
+                buf_chars = 0
 
             # 버퍼에 추가 (max_seq_len 초과 시 truncate)
             remaining = self.max_seq_len - len(buf_input)
             buf_input.extend(noised_ids[:remaining])
             buf_tags.extend(tags[:remaining])
+            buf_chars += len(text)
 
         # 잔여 버퍼 방출
         if buf_input:
-            yield self._make_packed_sample(buf_input, buf_tags)
+            yield self._make_packed_sample(buf_input, buf_tags, buf_chars)
 
 
 if __name__ == "__main__":
