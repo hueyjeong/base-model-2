@@ -192,6 +192,7 @@ def train(args):
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True,
+        prefetch_factor=4 if args.num_workers > 0 else None,
     )
 
     if global_rank == 0:
@@ -377,8 +378,8 @@ def main():
                         choices=list(EDITOR_CONFIGS.keys()))
     parser.add_argument("--tokenizer", type=str, default="keyboard",
                         choices=list(TOKENIZER_PRESETS.keys()))
-    parser.add_argument("--n_iterations", type=int, default=3,
-                        help="Iterative refinement 반복 횟수")
+    parser.add_argument("--n_iterations", type=int, default=1,
+                        help="Iterative refinement 반복 횟수 (초기 학습 1, fine-tuning 2-3)")
 
     # 데이터
     parser.add_argument("--corpus", type=str, nargs="+", required=True)
@@ -394,7 +395,7 @@ def main():
     parser.add_argument("--warmup_steps", type=int, default=1000)
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--grad_ckpt", action="store_true")
-    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
 
     # 로깅/저장

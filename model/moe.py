@@ -71,23 +71,36 @@ class MoEBitNetFFN(nn.Module):
         top_probs = top_probs / (top_probs.sum(dim=-1, keepdim=True) + 1e-8)
 
         # Expert dispatch (토큰 단위 라우팅)
-        # 효율성: expert별로 해당 토큰만 배치 처리
         x_flat = x.view(-1, D)              # (B*T, D)
         out_flat = torch.zeros_like(x_flat)  # (B*T, D)
         top_indices_flat = top_indices.view(-1, self.top_k)  # (B*T, top_k)
         top_probs_flat = top_probs.view(-1, self.top_k)      # (B*T, top_k)
 
         for k_idx in range(self.top_k):
-            expert_indices = top_indices_flat[:, k_idx]  # (B*T,)
-            expert_weights = top_probs_flat[:, k_idx]    # (B*T,)
+            expert_idx = top_indices_flat[:, k_idx]   # (B*T,)
+            expert_w = top_probs_flat[:, k_idx]       # (B*T,)
 
-            for e_idx in range(self.n_experts):
-                mask = (expert_indices == e_idx)
-                if not mask.any():
-                    continue
-                tokens = x_flat[mask]           # (n_tokens, D)
-                expert_out = self.experts[e_idx](tokens)
-                out_flat[mask] += expert_out * expert_weights[mask].unsqueeze(-1)
+            # argsort로 expert별 연속 배치 구성 (GPU sync 1회만)
+            sorted_order = expert_idx.argsort()
+            sorted_x = x_flat[sorted_order]
+            counts = torch.bincount(expert_idx, minlength=self.n_experts)
+            splits = counts.tolist()
+
+            # expert별 연속 chunk 처리
+            chunks = sorted_x.split(splits)
+            out_chunks = []
+            for e_idx, chunk in enumerate(chunks):
+                if chunk.shape[0] > 0:
+                    out_chunks.append(self.experts[e_idx](chunk))
+                else:
+                    out_chunks.append(chunk)
+
+            sorted_out = torch.cat(out_chunks)
+            sorted_out = sorted_out * expert_w[sorted_order].unsqueeze(-1)
+
+            # 원래 순서로 복원
+            inv_order = sorted_order.argsort()
+            out_flat = out_flat + sorted_out[inv_order]
 
         output = out_flat.view(B, T, D)
 
