@@ -16,9 +16,11 @@ import torch.nn.functional as F
 
 from model.bitlinear import BitLinear
 
-# fla 라이브러리 감지 (GPU fused recurrent 가속)
+# fla (최우선, 고도로 최적화된 Triton) → CUDA 커널 → Python 순차
 _FLA_AVAILABLE = False
 _fused_recurrent_rwkv6 = None
+_CUDA_RWKV6_AVAILABLE = False
+_cuda_rwkv6_recurrent = None
 
 try:
     from fla.ops.rwkv6 import fused_recurrent_rwkv6 as _fused_recurrent_rwkv6_fn
@@ -26,6 +28,29 @@ try:
     _fused_recurrent_rwkv6 = _fused_recurrent_rwkv6_fn
 except ImportError:
     pass
+
+if not _FLA_AVAILABLE:
+    try:
+        from model.cuda_rwkv6 import cuda_rwkv6_recurrent as _cuda_rwkv6_fn
+        from model.cuda_rwkv6 import is_available as _cuda_rwkv6_check
+        if _cuda_rwkv6_check():
+            _CUDA_RWKV6_AVAILABLE = True
+            _cuda_rwkv6_recurrent = _cuda_rwkv6_fn
+    except (ImportError, Exception):
+        pass
+
+
+# torch.compile 호환 래퍼 — 외부 Triton/CUDA 커널을 그래프에서 제외
+@torch.compiler.disable
+def _fla_recurrent_wrapper(r, k, v, w, u, scale, output_final_state):
+    return _fused_recurrent_rwkv6(r, k, v, w, u,
+                                   scale=scale, output_final_state=output_final_state)
+
+
+@torch.compiler.disable
+def _cuda_rwkv6_wrapper(r, k, v, w, u, scale, output_final_state):
+    return _cuda_rwkv6_recurrent(r, k, v, w, u,
+                                  scale=scale, output_final_state=output_final_state)
 
 
 def wkv6_sequential(r, k, v, w, u=None):
@@ -143,34 +168,34 @@ class RWKV6TimeMix(nn.Module):
         """
         B, T, D = x.shape
 
-        # 프로젝션
-        r = self.r_proj(x).view(B, T, self.n_heads, self.headdim).transpose(1, 2)
-        k = self.k_proj(x).view(B, T, self.n_heads, self.headdim).transpose(1, 2)
-        v = self.v_proj(x).view(B, T, self.n_heads, self.headdim).transpose(1, 2)
+        # 프로젝션 — (B, T, H, D) 레이아웃 유지 (fla 기대 형식)
+        r = self.r_proj(x).view(B, T, self.n_heads, self.headdim)
+        k = self.k_proj(x).view(B, T, self.n_heads, self.headdim)
+        v = self.v_proj(x).view(B, T, self.n_heads, self.headdim)
 
         # 데이터 의존 감쇄
         w = self.w_base + self.w_lora_up(torch.tanh(self.w_lora_down(x)))
         w = -F.softplus(w)   # 음수 보장 → exp(w) ∈ (0, 1)
-        w = w.view(B, T, self.n_heads, self.headdim).transpose(1, 2)
+        w = w.view(B, T, self.n_heads, self.headdim)
 
         # 게이트
         g = torch.sigmoid(self.g_proj(x))  # (B, T, D)
 
-        # WKV 스캔
+        # WKV 스캔 — fla (최우선) > CUDA 커널 > Python 순차
         if _FLA_AVAILABLE and x.is_cuda:
-            # fla fused_recurrent: custom autograd → backward 안정성 확보
-            # bf16 overflow 방지: float32로 변환 후 연산
-            r_fla = r.transpose(1, 2).float()  # (B, T, H, D)
-            k_fla = k.transpose(1, 2).float()
-            v_fla = v.transpose(1, 2).float()
-            w_fla = w.transpose(1, 2).float()
-            u_f32 = self.u.float()
-            o, _ = _fused_recurrent_rwkv6(r_fla, k_fla, v_fla, w_fla, u_f32,
+            o, _ = _fla_recurrent_wrapper(r, k, v, w, self.u,
                                            scale=1.0, output_final_state=False)
-            out = o.to(r.dtype)  # (B, T, H, D)
+            out = o
+        elif _CUDA_RWKV6_AVAILABLE and x.is_cuda:
+            o, _ = _cuda_rwkv6_wrapper(r, k, v, w, self.u,
+                                        scale=1.0, output_final_state=False)
+            out = o
         else:
-            out = wkv6_sequential(r, k, v, w, self.u)  # (B, H, T, D)
-            out = out.transpose(1, 2)  # (B, T, H, D)
+            out = wkv6_sequential(
+                r.transpose(1, 2), k.transpose(1, 2),
+                v.transpose(1, 2), w.transpose(1, 2), self.u,
+            )
+            out = out.transpose(1, 2)
 
         # per-head normalization
         out = self.output_norm(out)  # (B, T, H, D)

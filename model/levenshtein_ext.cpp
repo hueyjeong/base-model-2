@@ -207,7 +207,35 @@ std::vector<torch::Tensor> batch_refinement_step(
 }
 
 
+/**
+ * 단일 시퀀스 쌍에 대한 compute_edit_tags (Python list 입출력)
+ * DataLoader 워커에서 호출용
+ */
+std::vector<int64_t> compute_edit_tags_py(
+    std::vector<int64_t> source,
+    std::vector<int64_t> target,
+    int64_t vocab_size
+) {
+    int n = (int)source.size();
+    int m = (int)target.size();
+
+    // int64→int32 변환
+    std::vector<int> src32(n), tgt32(m);
+    for (int i = 0; i < n; i++) src32[i] = (int)source[i];
+    for (int i = 0; i < m; i++) tgt32[i] = (int)target[i];
+
+    auto tags = compute_edit_tags_single(src32.data(), n, tgt32.data(), m, (int)vocab_size);
+
+    // int→int64 변환
+    std::vector<int64_t> result(n);
+    for (int i = 0; i < n; i++) result[i] = tags[i];
+    return result;
+}
+
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("batch_refinement_step", &batch_refinement_step,
           "Batched edit tag refinement step (C++ OpenMP)");
+    m.def("compute_edit_tags", &compute_edit_tags_py,
+          "Single sequence edit tags (C++ accelerated)");
 }

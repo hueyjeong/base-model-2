@@ -203,8 +203,7 @@ class BitEditor(nn.Module):
         # MoE expert 파라미터 = 전체 expert 파라미터 × (1 - top_k/n_experts)
         expert_params = 0
         for layer in self.layers:
-            for expert in layer.moe_ffn.experts:
-                expert_params += sum(p.numel() for p in expert.parameters())
+            expert_params += sum(p.numel() for p in layer.moe_ffn.experts.parameters())
 
         inactive_ratio = 1.0 - self.cfg.top_k / self.cfg.n_experts
         inactive_params = int(expert_params * inactive_ratio)

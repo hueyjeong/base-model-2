@@ -35,21 +35,13 @@ from model.editor import BitEditor
 from model.edit_tags import compute_edit_tags, apply_edit_tags, TAG_KEEP
 from training.noising import DenoisingNoiser, NoiseConfig
 from training.editor_dataset import EditorDataset
+from training.upload_gdrive import upload_and_cleanup
 
-# C++ Levenshtein 확장 JIT 로드 (학습 시 iterative refinement 가속)
+# C++ Levenshtein 확장 (editor_dataset에서 JIT 빌드한 것 재사용)
 _LEVENSHTEIN_CPP = None
 try:
-    from torch.utils.cpp_extension import load as _cpp_load
-    _ext_src = os.path.join(os.path.dirname(__file__), "..", "model", "levenshtein_ext.cpp")
-    if os.path.exists(_ext_src):
-        _LEVENSHTEIN_CPP = _cpp_load(
-            name="levenshtein_ext",
-            sources=[_ext_src],
-            extra_cflags=["-O3", "-fopenmp"],
-            extra_ldflags=["-fopenmp"],
-            verbose=False,
-        )
-except Exception:
+    from training.editor_dataset import _lev_ext as _LEVENSHTEIN_CPP
+except (ImportError, AttributeError):
     pass
 
 # ── 토크나이저 프리셋 (pretrain.py 재사용) ──
@@ -100,13 +92,33 @@ EDITOR_CONFIGS = {
 }
 
 
-def get_lr(step: int, warmup: int, max_lr: float, max_steps: int) -> float:
-    """Linear warmup + cosine decay"""
-    min_lr = max_lr * 0.01
+def get_lr(
+    step: int, warmup: int, max_lr: float, max_steps: int,
+    min_lr_ratio: float = 0.1, schedule: str = "cosine",
+) -> float:
+    """학습률 스케줄러
+
+    Args:
+        schedule: "cosine" (warmup + cosine decay) 또는
+                  "wsd" (Warmup-Stable-Decay: warmup → 80% stable → 20% decay)
+        min_lr_ratio: 최소 LR = max_lr × min_lr_ratio
+    """
+    min_lr = max_lr * min_lr_ratio
     if step < warmup:
         return min_lr + (max_lr - min_lr) * step / max(warmup, 1)
-    progress = (step - warmup) / max(max_steps - warmup, 1)
-    return min_lr + (max_lr - min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
+
+    if schedule == "wsd":
+        # WSD: warmup 이후 80%는 peak LR 유지, 마지막 20% decay
+        remaining = max_steps - warmup
+        stable_end = warmup + int(remaining * 0.8)
+        if step < stable_end:
+            return max_lr
+        decay_progress = (step - stable_end) / max(max_steps - stable_end, 1)
+        return min_lr + (max_lr - min_lr) * 0.5 * (1 + math.cos(math.pi * decay_progress))
+    else:
+        # Cosine decay
+        progress = (step - warmup) / max(max_steps - warmup, 1)
+        return min_lr + (max_lr - min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
 
 
 def format_params(n: int) -> str:
@@ -115,6 +127,79 @@ def format_params(n: int) -> str:
     elif n >= 1_000:
         return f"{n / 1_000:.1f}K"
     return str(n)
+
+
+def format_chars(n: int) -> str:
+    """문자 수를 읽기 좋게 포맷 (500M, 1.2B 등)"""
+    if n >= 1_000_000_000:
+        return f"{n / 1_000_000_000:.2f}B"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(n)
+
+
+def validate_editor(model, val_loader, criterion, config, device, use_amp, n_steps,
+                     amp_dtype=torch.bfloat16):
+    """검증 루프: n_steps 배치에 대해 loss, 태그 정확도, 편집 precision/recall 계산"""
+    model.eval()
+    total_loss = 0.0
+    total_tokens = 0
+    total_correct = 0
+    edit_tp = 0  # non-KEEP 정답
+    edit_fp = 0  # KEEP인데 non-KEEP으로 예측
+    edit_fn = 0  # non-KEEP인데 KEEP으로 예측
+    val_iter = iter(val_loader)
+
+    with torch.no_grad():
+        for _ in range(n_steps):
+            try:
+                batch = next(val_iter)
+            except StopIteration:
+                break
+
+            input_ids = batch["input_ids"].to(device)
+            edit_tags = batch["edit_tags"].to(device)
+            pad_mask = batch["pad_mask"].to(device)
+
+            if use_amp:
+                with torch.amp.autocast("cuda", dtype=amp_dtype):
+                    tag_logits, aux_loss = model(input_ids, pad_mask)
+            else:
+                tag_logits, aux_loss = model(input_ids, pad_mask)
+
+            targets = edit_tags.clone()
+            targets[~pad_mask] = -100
+            loss = criterion(
+                tag_logits.view(-1, config.n_tags),
+                targets.view(-1),
+            )
+
+            valid = pad_mask
+            n_tok = valid.sum().item()
+            total_loss += loss.item() * n_tok
+            total_tokens += n_tok
+
+            preds = tag_logits.argmax(dim=-1)
+            total_correct += (preds[valid] == edit_tags[valid]).sum().item()
+
+            # Precision/Recall: non-KEEP 태그 (TAG_KEEP=0)
+            pred_edit = preds[valid] != TAG_KEEP
+            true_edit = edit_tags[valid] != TAG_KEEP
+            edit_tp += (pred_edit & true_edit).sum().item()
+            edit_fp += (pred_edit & ~true_edit).sum().item()
+            edit_fn += (~pred_edit & true_edit).sum().item()
+
+    model.train()
+    if total_tokens == 0:
+        return float("nan"), float("nan"), float("nan"), float("nan")
+
+    val_loss = total_loss / total_tokens
+    tag_acc = total_correct / total_tokens
+    edit_precision = edit_tp / max(edit_tp + edit_fp, 1)
+    edit_recall = edit_tp / max(edit_tp + edit_fn, 1)
+    return val_loss, tag_acc, edit_precision, edit_recall
 
 
 def train(args):
@@ -171,6 +256,23 @@ def train(args):
         print(f"  총 파라미터: {format_params(params['total'])}")
         print(f"  활성 파라미터: {format_params(active)}")
 
+    # INT8 텐서코어 BitLinear 교체
+    if args.int8:
+        if args.int8_backend == "cuda":
+            try:
+                from model.cuda_bitlinear import replace_bitlinear_with_cuda
+                model = replace_bitlinear_with_cuda(model)
+            except Exception as e:
+                if global_rank == 0:
+                    print(f"CUDA BitLinear 로드 실패: {e}, triton fallback")
+                from model.triton_bitlinear import replace_bitlinear_with_triton
+                model = replace_bitlinear_with_triton(model)
+        else:
+            from model.triton_bitlinear import replace_bitlinear_with_triton
+            model = replace_bitlinear_with_triton(model)
+        if global_rank == 0:
+            print(f"  INT8 backend: {args.int8_backend}")
+
     if is_distributed:
         model = DDP(model, device_ids=[local_rank])
     raw_model = model.module if is_distributed else model
@@ -178,6 +280,15 @@ def train(args):
     # Gradient checkpointing
     if args.grad_ckpt:
         raw_model.gradient_checkpointing = True
+
+    # torch.compile
+    if args.compile:
+        torch._dynamo.config.capture_scalar_outputs = True
+        torch._dynamo.config.recompile_limit = 64
+        torch._dynamo.config.cache_size_limit = 256
+        if global_rank == 0:
+            print("torch.compile 적용 중... (첫 step 느림, 이후 빠름)")
+        model = torch.compile(model)
 
     # 노이즈 설정 (토큰 레벨 비활성화)
     noise_cfg = NoiseConfig(
@@ -211,15 +322,49 @@ def train(args):
         pin_memory=True,
         drop_last=True,
         prefetch_factor=4 if args.num_workers > 0 else None,
+        persistent_workers=args.num_workers > 0,
     )
+
+    # 검증 데이터셋
+    val_loader = None
+    if args.val_corpus:
+        val_noiser = DenoisingNoiser(
+            tokenizer, noise_cfg,
+            seed=args.seed + 1,
+            use_korean_errors=True,
+        )
+        val_dataset = EditorDataset(
+            args.val_corpus, tokenizer, val_noiser,
+            vocab_size=tokenizer.vocab_size,
+            max_seq_len=args.max_seq_len,
+            text_key=args.text_key,
+            lang_key=args.lang_key,
+            seed=args.seed + 1,
+            rank=global_rank,
+            world_size=world_size,
+            pack=False,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            num_workers=max(args.num_workers, 1),
+            pin_memory=True,
+            drop_last=True,
+            prefetch_factor=4,
+            persistent_workers=True,
+        )
 
     if global_rank == 0:
         print(f"\n데이터셋: 스트리밍 (max_seq_len={args.max_seq_len})")
+        if args.val_corpus:
+            print(f"검증 데이터: {args.val_corpus}")
 
-    # 옵티마이저
+    # 옵티마이저 (CUDA: fused 단일 커널로 optimizer step)
+    use_fused = torch.cuda.is_available()
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr, betas=(0.9, 0.98), weight_decay=0.01,
+        fused=use_fused,
     )
 
     # Loss
@@ -232,13 +377,27 @@ def train(args):
 
     # 체크포인트 복원
     start_step = 0
+    restored_total_chars = 0
     if args.resume and os.path.exists(args.resume):
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         raw_model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_step = ckpt.get("step", 0)
-        if global_rank == 0:
-            print(f"\n체크포인트 복원: step {start_step}")
+        restored_total_chars = ckpt.get("total_chars", 0)
+
+        # 데이터 RNG state 복원 (동일 데이터 순서 재현)
+        data_state = ckpt.get("data_state")
+        if isinstance(data_state, dict):
+            if "noiser_state" in data_state:
+                noiser.load_state_dict(data_state["noiser_state"])
+            if "dataset_state" in data_state:
+                dataset.load_state_dict(data_state["dataset_state"])
+            if global_rank == 0:
+                print(f"\n체크포인트 복원: step {start_step}, chars {format_chars(restored_total_chars)} (data state 포함)")
+        else:
+            if global_rank == 0:
+                print(f"\n체크포인트 복원: step {start_step}, chars {format_chars(restored_total_chars)} (data state 없음 — 데이터 처음부터)")
+
         del ckpt
         gc.collect()
 
@@ -251,24 +410,34 @@ def train(args):
         print()
 
     model.train()
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("high")  # TF32 on Ampere+
+
     data_iter = iter(loader)
     log_interval = args.log_interval
     save_interval = args.save_interval
 
-    running_loss = 0.0
-    running_aux = 0.0
-    running_tokens = 0
+    # GPU 스칼라 프리얼로케이션 (매 step torch.tensor() 생성 회피)
+    running_loss_t = torch.zeros(1, device=device)
+    running_aux_t = torch.zeros(1, device=device)
+    running_tokens_t = torch.zeros(1, dtype=torch.long, device=device)
+    log_chars = torch.zeros(1, dtype=torch.long, device=device)
+    total_chars = torch.tensor(restored_total_chars, dtype=torch.long, device=device)
+    _total_loss = torch.zeros(1, device=device)
+    _iter_loss = torch.zeros(1, device=device)
+    _ignore_idx = torch.tensor(-100, dtype=torch.long, device=device)
     t0 = time.time()
 
     for step in range(start_step, args.max_steps):
         # LR 스케줄
-        lr = get_lr(step, args.warmup_steps, args.lr, args.max_steps)
+        lr = get_lr(step, args.warmup_steps, args.lr, args.max_steps,
+                    min_lr_ratio=args.min_lr_ratio, schedule=args.schedule)
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
         optimizer.zero_grad(set_to_none=True)
 
-        total_loss = torch.tensor(0.0, device=device)
+        _total_loss.zero_()
 
         for accum_step in range(args.grad_accum_steps):
             try:
@@ -277,14 +446,14 @@ def train(args):
                 data_iter = iter(loader)
                 batch = next(data_iter)
 
-            input_ids = batch["input_ids"].to(device)
-            edit_tags = batch["edit_tags"].to(device)
-            pad_mask = batch["pad_mask"].to(device)
-            original_ids = batch["original_ids"].to(device)
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            edit_tags = batch["edit_tags"].to(device, non_blocking=True)
+            pad_mask = batch["pad_mask"].to(device, non_blocking=True)
+            original_ids = batch["original_ids"].to(device, non_blocking=True)
 
             # Iterative refinement 학습
             current_ids = input_ids
-            iter_loss = torch.tensor(0.0, device=device)
+            _iter_loss.zero_()
 
             for it in range(config.n_iterations):
                 if use_amp:
@@ -293,10 +462,8 @@ def train(args):
                 else:
                     tag_logits, aux_loss = model(current_ids, pad_mask)
 
-                # 현재 iteration의 태그에 대한 CE loss
-                # PAD 위치는 -100으로 ignore
-                targets = edit_tags.clone()
-                targets[~pad_mask] = -100
+                # 현재 iteration의 태그에 대한 CE loss (PAD → -100)
+                targets = torch.where(pad_mask, edit_tags, _ignore_idx)
 
                 ce_loss = criterion(
                     tag_logits.view(-1, config.n_tags),
@@ -306,7 +473,7 @@ def train(args):
                 loss = (ce_loss + aux_loss) / (config.n_iterations * args.grad_accum_steps)
                 loss.backward()
 
-                iter_loss = iter_loss + ce_loss.detach()
+                _iter_loss += ce_loss.detach()
 
                 # 다음 iteration 준비: 예측 태그 적용 → 새 편집 태그 계산
                 if it < config.n_iterations - 1:
@@ -348,47 +515,87 @@ def train(args):
                             edit_tags = torch.tensor(new_tags_list, dtype=torch.long, device=device)
                             pad_mask = (current_ids != config.pad_id)
 
-            total_loss = total_loss + iter_loss / config.n_iterations
-            n_tok = batch["pad_mask"].sum().item()
-            running_tokens += n_tok
+            _total_loss += _iter_loss / config.n_iterations
+            running_tokens_t += batch["pad_mask"].sum()
+            batch_chars = batch["n_chars"].sum().to(device)
+            log_chars += batch_chars
+            total_chars += batch_chars
 
         # Gradient step
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
-        running_loss += total_loss.item() / args.grad_accum_steps
-        running_aux += aux_loss.item()
+        running_loss_t += _total_loss / args.grad_accum_steps
+        running_aux_t += aux_loss.detach()
 
-        # 로깅
+        # 로깅 (GPU sync는 로깅 시점에만 1회)
         if (step + 1) % log_interval == 0 and global_rank == 0:
             dt = time.time() - t0
-            avg_loss = running_loss / log_interval
-            avg_aux = running_aux / log_interval
-            tok_s = running_tokens / max(dt, 1e-6)
+            avg_loss = running_loss_t.item() / log_interval
+            avg_aux = running_aux_t.item() / log_interval
+            tok_s = running_tokens_t.item() / max(dt, 1e-6)
+            _total_chars = total_chars.item()
             print(f"step {step + 1:>6d} | loss {avg_loss:.4f} | aux {avg_aux:.4f} | "
-                  f"lr {lr:.2e} | {tok_s:.0f} tok/s")
-            running_loss = 0.0
-            running_aux = 0.0
-            running_tokens = 0
+                  f"chars {format_chars(_total_chars)} | "
+                  f"lr {lr:.2e} | {tok_s:.0f} tok/s | {dt:.1f}s", flush=True)
+            running_loss_t.zero_()
+            running_aux_t.zero_()
+            running_tokens_t.zero_()
+            log_chars.zero_()
             t0 = time.time()
+
+        # 검증
+        if (val_loader is not None and args.val_every
+                and (step + 1) >= args.warmup_steps
+                and (step + 1 - args.warmup_steps) % args.val_every == 0):
+            if global_rank == 0:
+                val_loss, tag_acc, edit_p, edit_r = validate_editor(
+                    raw_model, val_loader, criterion, config, device,
+                    use_amp, args.val_steps, amp_dtype=amp_dtype,
+                )
+                print(f"  val step {step + 1:>6d} | val_loss {val_loss:.4f} | "
+                      f"tag_acc {tag_acc:.2%} | edit_P {edit_p:.2%} | edit_R {edit_r:.2%}", flush=True)
+            if is_distributed:
+                dist.barrier()
 
         # 체크포인트
         if (step + 1) % save_interval == 0 and global_rank == 0:
             ckpt_path = os.path.join(
                 args.save_dir,
-                f"editor_{args.size}_step{step + 1}.pt"
+                f"editor_{args.size}_step_{step + 1}.pt"
             )
             os.makedirs(args.save_dir, exist_ok=True)
             torch.save({
                 "step": step + 1,
+                "total_chars": int(total_chars),
                 "config": asdict(config),
                 "model": raw_model.state_dict(),
                 "optimizer": optimizer.state_dict(),
+                "data_state": {
+                    "noiser_state": noiser.state_dict(),
+                    "dataset_state": dataset.state_dict(),
+                },
             }, ckpt_path)
-            print(f"  체크포인트 저장: {ckpt_path}")
+            print(f"  체크포인트 저장: {ckpt_path}", flush=True)
 
+            if args.gdrive_remote:
+                upload_and_cleanup(ckpt_path, args.log_file, args.gdrive_remote, keep_latest_n=1)
+
+    # 최종 저장
     if global_rank == 0:
-        print("\n학습 완료!")
+        os.makedirs(args.save_dir, exist_ok=True)
+        final_path = os.path.join(args.save_dir, f"editor_{args.size}_final.pt")
+        torch.save({
+            "step": args.max_steps,
+            "total_chars": int(total_chars),
+            "config": asdict(config),
+            "model": raw_model.state_dict(),
+        }, final_path)
+        print(f"\n최종 모델 저장: {final_path}")
+        print(f"학습 완료! (총 {args.max_steps} 스텝, {format_chars(int(total_chars))} chars)")
+
+        if args.gdrive_remote:
+            upload_and_cleanup(final_path, args.log_file, args.gdrive_remote, keep_latest_n=1)
 
     if is_distributed:
         dist.destroy_process_group()
@@ -412,21 +619,44 @@ def main():
     parser.add_argument("--max_seq_len", type=int, default=512)
 
     # 학습
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=6)
     parser.add_argument("--grad_accum_steps", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--min_lr_ratio", type=float, default=0.1,
+                        help="최소 LR = lr × min_lr_ratio (default 0.1)")
+    parser.add_argument("--schedule", type=str, default="cosine",
+                        choices=["cosine", "wsd"],
+                        help="LR 스케줄: cosine 또는 wsd (Warmup-Stable-Decay)")
     parser.add_argument("--max_steps", type=int, default=100000)
-    parser.add_argument("--warmup_steps", type=int, default=1000)
+    parser.add_argument("--warmup_steps", type=int, default=2000)
     parser.add_argument("--bf16", action="store_true")
+    parser.add_argument("--int8", action="store_true",
+                        help="INT8 텐서코어 BitLinear (dp4a/cublasLt)")
+    parser.add_argument("--int8_backend", default="cuda", choices=["triton", "cuda"],
+                        help="INT8 backend 선택")
     parser.add_argument("--grad_ckpt", action="store_true")
+    parser.add_argument("--compile", action="store_true",
+                        help="torch.compile 적용 (커널 fusion, 첫 step 느림)")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
+
+    # 검증
+    parser.add_argument("--val_corpus", type=str, nargs="+", default=None,
+                        help="검증 코퍼스 파일 경로")
+    parser.add_argument("--val_every", type=int, default=500,
+                        help="검증 주기 (스텝)")
+    parser.add_argument("--val_steps", type=int, default=20,
+                        help="검증 시 평가할 배치 수")
 
     # 로깅/저장
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--save_interval", type=int, default=5000)
     parser.add_argument("--save_dir", type=str, default="checkpoints")
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--gdrive_remote", default=None,
+                        help="체크포인트 업로드용 rclone 대상 폴더 (예: 'gdrive:my_checkpoints/')")
+    parser.add_argument("--log_file", default=None,
+                        help="동기화할 로그 파일명")
 
     args = parser.parse_args()
     train(args)

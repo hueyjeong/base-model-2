@@ -48,10 +48,9 @@ class BiRWKV(nn.Module):
         fwd_out = self.forward_rwkv(x)
 
         # Backward 방향: 우 → 좌 (시간 축 역순)
-        rev_idx = torch.arange(x.size(1) - 1, -1, -1, device=x.device)
-        x_rev = x[:, rev_idx]
+        x_rev = x.flip(1)
         bwd_out = self.backward_rwkv(x_rev)
-        bwd_out = bwd_out[:, rev_idx]
+        bwd_out = bwd_out.flip(1)
 
         # 융합: element-wise addition
         out = fwd_out + bwd_out

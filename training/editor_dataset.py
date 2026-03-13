@@ -24,7 +24,32 @@ from torch.utils.data import IterableDataset
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from tokenizer_base import BaseTokenizer
 from training.noising import DenoisingNoiser
-from model.edit_tags import compute_edit_tags, TAG_KEEP
+from model.edit_tags import compute_edit_tags as _compute_edit_tags_py, TAG_KEEP
+
+# C++ Levenshtein 가속 (DataLoader 워커에서도 사용 가능)
+_lev_ext = None
+_compute_edit_tags_cpp = None
+try:
+    from torch.utils.cpp_extension import load as _cpp_load
+    _ext_src = os.path.join(os.path.dirname(__file__), "..", "model", "levenshtein_ext.cpp")
+    if os.path.exists(_ext_src):
+        _lev_ext = _cpp_load(
+            name="levenshtein_ext",
+            sources=[_ext_src],
+            extra_cflags=["-O3", "-fopenmp"],
+            extra_ldflags=["-fopenmp"],
+            verbose=False,
+        )
+        _compute_edit_tags_cpp = _lev_ext.compute_edit_tags
+except Exception:
+    pass
+
+
+def compute_edit_tags(source_ids, target_ids, vocab_size):
+    """C++ 가속 compute_edit_tags (폴백: Python)"""
+    if _compute_edit_tags_cpp is not None:
+        return list(_compute_edit_tags_cpp(source_ids, target_ids, vocab_size))
+    return _compute_edit_tags_py(source_ids, target_ids, vocab_size)
 
 
 class EditorDataset(IterableDataset):
