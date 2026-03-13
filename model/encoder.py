@@ -1,17 +1,10 @@
-"""Encoder — Mamba SSM + BitNet FFN 인코더
+"""공통 빌딩 블록 — RMSNorm, BitNetFFN
 
-인코더 구조 (per layer):
-    x → Mamba → (+residual) → RMSNorm → BitNet FFN → (+residual) → RMSNorm
-
-Mamba 버전 선택:
-    mamba_version=1: Mamba-1 (selective scan, d_state=16)
-    mamba_version=2: Mamba-2 SSD (chunk-parallel, d_state=128)
+BitEditor의 여러 모듈에서 재사용되는 기본 구성 요소.
 """
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint
 
-from model.mamba_block import MambaBlock
 from model.bitlinear import BitLinear
 
 
@@ -30,19 +23,14 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # bf16/f16: exponent 범위 충분, float32 캐스팅 생략하여 커널 2회 절감
         rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        # weight를 입력 dtype으로 캐스팅하여 BF16 → FP32 promotion 방지
         return (x * rms) * self.weight.to(x.dtype)
 
 
 class BitNetFFN(nn.Module):
-    """BitNet Feed-Forward Network
+    """BitNet Feed-Forward Network (SwiGLU)
 
-    x → BitLinear(d_model → d_ff) → SiLU → BitLinear(d_ff → d_model)
-    
-    SwiGLU variant:
-    x → [BitLinear(gate), BitLinear(up)] → gate*SiLU(up) → BitLinear(down)
+    x → [BitLinear(gate), BitLinear(up)] → sigmoid(gate)*up → BitLinear(down)
     """
 
     def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1):
@@ -58,127 +46,4 @@ class BitNetFFN(nn.Module):
         x = gate * up
         x = self.dropout(x)
         x = self.down_proj(x)
-        return x
-
-
-class EncoderLayer(nn.Module):
-    """인코더 레이어: Mamba → RMSNorm → BitNet FFN → RMSNorm"""
-
-    def __init__(
-        self,
-        d_model: int,
-        d_inner: int,
-        d_state: int,
-        d_conv: int,
-        dt_rank: int,
-        d_ff: int,
-        dropout: float = 0.1,
-        rms_norm_eps: float = 1e-6,
-        mamba_version: int = 1,
-        headdim: int = 64,
-        ngroups: int = 1,
-        chunk_size: int = 256,
-    ):
-        super().__init__()
-        if mamba_version == 2:
-            from model.mamba2_block import Mamba2Block
-            self.mamba = Mamba2Block(
-                d_model=d_model,
-                d_inner=d_inner,
-                d_state=d_state,
-                d_conv=d_conv,
-                headdim=headdim,
-                ngroups=ngroups,
-                chunk_size=chunk_size,
-            )
-        else:
-            self.mamba = MambaBlock(
-                d_model=d_model,
-                d_inner=d_inner,
-                d_state=d_state,
-                d_conv=d_conv,
-                dt_rank=dt_rank,
-            )
-        self.norm1 = RMSNorm(d_model, eps=rms_norm_eps)
-        self.ffn = BitNetFFN(d_model, d_ff, dropout=dropout)
-        self.norm2 = RMSNorm(d_model, eps=rms_norm_eps)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x: torch.Tensor, reset_mask: torch.Tensor | None = None) -> torch.Tensor:
-        """
-        Args:
-            x: (batch, seq_len, d_model)
-            reset_mask: (batch, seq_len) bool — True인 위치에서 SSM state 리셋
-        Returns:
-            (batch, seq_len, d_model)
-        """
-        # Mamba + residual
-        residual = x
-        x = self.mamba(x, reset_mask=reset_mask)
-        x = self.dropout(x)
-        x = self.norm1(residual + x)
-
-        # FFN + residual
-        residual = x
-        x = self.ffn(x)
-        x = self.dropout(x)
-        x = self.norm2(residual + x)
-
-        return x
-
-
-class Encoder(nn.Module):
-    """N-layer 인코더 스택"""
-
-    def __init__(
-        self,
-        n_layers: int,
-        d_model: int,
-        d_inner: int,
-        d_state: int,
-        d_conv: int,
-        dt_rank: int,
-        d_ff: int,
-        dropout: float = 0.1,
-        rms_norm_eps: float = 1e-6,
-        mamba_version: int = 1,
-        headdim: int = 64,
-        ngroups: int = 1,
-        chunk_size: int = 256,
-    ):
-        super().__init__()
-        self.gradient_checkpointing = False
-        # N 레이어마다 1개만 checkpoint (1=전체, 2=50%, 3=33% ...)
-        self.gradient_checkpointing_every: int = 1
-        self.layers = nn.ModuleList([
-            EncoderLayer(
-                d_model=d_model,
-                d_inner=d_inner,
-                d_state=d_state,
-                d_conv=d_conv,
-                dt_rank=dt_rank,
-                d_ff=d_ff,
-                dropout=dropout,
-                rms_norm_eps=rms_norm_eps,
-                mamba_version=mamba_version,
-                headdim=headdim,
-                ngroups=ngroups,
-                chunk_size=chunk_size,
-            )
-            for _ in range(n_layers)
-        ])
-
-    def forward(self, x: torch.Tensor, reset_mask: torch.Tensor | None = None) -> torch.Tensor:
-        """
-        Args:
-            x: (batch, seq_len, d_model)  — 임베딩 출력
-            reset_mask: (batch, seq_len) bool — True인 위치에서 SSM state 리셋
-        Returns:
-            (batch, seq_len, d_model)  — 인코더 최종 출력
-        """
-        for i, layer in enumerate(self.layers):
-            if self.gradient_checkpointing and self.training and (i % self.gradient_checkpointing_every == 0):
-                x = checkpoint(layer, x, reset_mask, use_reentrant=False)
-            else:
-                x = layer(x, reset_mask=reset_mask)
         return x

@@ -44,6 +44,7 @@ fn is_vowel(s: &str) -> bool {
     )
 }
 
+#[allow(dead_code)]
 fn is_basic_consonant(s: &str) -> bool {
     matches!(s, "ㄱ"|"ㄴ"|"ㄷ"|"ㄹ"|"ㅁ"|"ㅂ"|"ㅅ"|"ㅇ"|"ㅈ"|"ㅊ"|"ㅋ"|"ㅌ"|"ㅍ"|"ㅎ")
 }
