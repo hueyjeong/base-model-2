@@ -124,7 +124,7 @@ class MoEBitNetFFN(nn.Module):
         local_pos = torch.arange(N, device=x_flat.device) - offsets[sorted_idx]
 
         # 고정 capacity (Python int 연산, GPU sync 없음)
-        capacity = ((N + E - 1) // E) * 3  # 3× expected — expert collapse 초기에도 안전
+        capacity = ((N + E - 1) // E) * 2  # 2× expected — 메모리 절약, overflow는 clamp
 
         # Overflow 방지 (clamp → 초과 토큰은 마지막 슬롯에 머지, 학습 안정성용)
         local_pos = local_pos.clamp(max=capacity - 1)

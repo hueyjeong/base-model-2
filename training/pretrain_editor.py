@@ -19,6 +19,7 @@ import math
 import os
 import sys
 import time
+from contextlib import nullcontext
 from dataclasses import asdict
 
 import torch
@@ -413,6 +414,10 @@ def train(args):
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision("high")  # TF32 on Ampere+
 
+    # 메모리 진단 (step 1 후)
+    if global_rank == 0 and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
     data_iter = iter(loader)
     log_interval = args.log_interval
     save_interval = args.save_interval
@@ -455,7 +460,12 @@ def train(args):
             current_ids = input_ids
             _iter_loss.zero_()
 
-            for it in range(config.n_iterations):
+            # DDP: 마지막 accum step에서만 gradient sync (중간 step은 no_sync)
+            is_last_accum = (accum_step == args.grad_accum_steps - 1)
+            ctx = model.no_sync() if (is_distributed and not is_last_accum) else nullcontext()
+
+            with ctx:
+              for it in range(config.n_iterations):
                 if use_amp:
                     with torch.amp.autocast("cuda", dtype=amp_dtype):
                         tag_logits, aux_loss = model(current_ids, pad_mask)
@@ -535,9 +545,15 @@ def train(args):
             avg_aux = running_aux_t.item() / log_interval
             tok_s = running_tokens_t.item() / max(dt, 1e-6)
             _total_chars = total_chars.item()
+            # 메모리 정보 (첫 로그에만)
+            mem_str = ""
+            if step + 1 == log_interval and torch.cuda.is_available():
+                alloc = torch.cuda.max_memory_allocated() / 1024**3
+                resv = torch.cuda.max_memory_reserved() / 1024**3
+                mem_str = f" | mem {alloc:.1f}G/{resv:.1f}G"
             print(f"step {step + 1:>6d} | loss {avg_loss:.4f} | aux {avg_aux:.4f} | "
                   f"chars {format_chars(_total_chars)} | "
-                  f"lr {lr:.2e} | {tok_s:.0f} tok/s | {dt:.1f}s", flush=True)
+                  f"lr {lr:.2e} | {tok_s:.0f} tok/s | {dt:.1f}s{mem_str}", flush=True)
             running_loss_t.zero_()
             running_aux_t.zero_()
             running_tokens_t.zero_()
