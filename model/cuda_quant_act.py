@@ -49,9 +49,10 @@ class _CUDAQuantActFn(Function):
 
         x_quant_2d, x_scale_2d = _EXT.forward(x_2d)
 
-        # 원래 dtype 복원
+        # 원래 dtype 복원 (x_quant, x_scale 모두 — downstream dtype 전파 일관성)
         if orig_dtype != torch.float32:
             x_quant_2d = x_quant_2d.to(orig_dtype)
+            x_scale_2d = x_scale_2d.to(orig_dtype)
 
         # 원래 shape 복원
         x_quant = x_quant_2d.reshape(orig_shape)

@@ -3,26 +3,19 @@
 Switch Transformer 스타일의 MoE 라우팅:
 - n_experts개의 BitNetFFN expert 중 top_k개만 활성화
 - Load balancing auxiliary loss로 expert collapse 방지
-- Batched expert forward: 16회 sequential → 1회 bmm
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model.encoder import BatchedBitNetFFN
-
-# CUDA MoE dispatch 비활성화
-# scatter/gather가 raw CUDA 커널이라 autograd 미지원 → expert gradient 차단
-# TODO: torch.autograd.Function으로 scatter/gather backward 구현 후 재활성화
-_CUDA_MOE_AVAILABLE = False
-_moe_dispatch_forward = None
+from model.encoder import BitNetFFN
 
 
 class MoEBitNetFFN(nn.Module):
-    """Mixture of Experts with Batched BitNet FFN
+    """Mixture of Experts with BitNet FFN experts
 
-    Batched expert: 모든 expert를 (E, capacity, D) 단일 텐서로 처리.
-    16회 sequential forward → 1회 batched bmm.
+    각 토큰을 softmax router로 top_k expert에 라우팅.
+    활성화되지 않은 expert는 연산하지 않음.
 
     Args:
         d_model: 입력/출력 차원
@@ -48,8 +41,11 @@ class MoEBitNetFFN(nn.Module):
         # 라우터 (FP — softmax 정밀도 필요)
         self.router = nn.Linear(d_model, n_experts, bias=False)
 
-        # Batched Expert FFN (E개를 단일 bmm으로 처리)
-        self.experts = BatchedBitNetFFN(n_experts, d_model, d_ff, dropout)
+        # Expert FFN 목록
+        self.experts = nn.ModuleList([
+            BitNetFFN(d_model, d_ff, dropout=dropout)
+            for _ in range(n_experts)
+        ])
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -72,7 +68,7 @@ class MoEBitNetFFN(nn.Module):
         # Renormalize
         top_probs = top_probs / (top_probs.sum(dim=-1, keepdim=True) + 1e-8)
 
-        # Expert dispatch
+        # Expert dispatch (토큰 단위 라우팅)
         x_flat = x.view(-1, D)              # (B*T, D)
         out_flat = torch.zeros_like(x_flat)  # (B*T, D)
         top_indices_flat = top_indices.view(-1, self.top_k)  # (B*T, top_k)
@@ -82,17 +78,27 @@ class MoEBitNetFFN(nn.Module):
             expert_idx = top_indices_flat[:, k_idx]   # (B*T,)
             expert_w = top_probs_flat[:, k_idx]       # (B*T,)
 
-            if _CUDA_MOE_AVAILABLE and x.is_cuda:
-                # CUDA dispatch: GPU-only scatter/gather + batched expert
-                out_flat = out_flat + _moe_dispatch_forward(
-                    x_flat, expert_idx, expert_w,
-                    self.experts, self.n_experts,
-                )
-            else:
-                # CPU/CUDA fallback: batched expert forward
-                out_flat = out_flat + self._batched_dispatch(
-                    x_flat, expert_idx, expert_w,
-                )
+            # argsort로 expert별 연속 배치 구성 (GPU sync 1회만)
+            sorted_order = expert_idx.argsort()
+            sorted_x = x_flat[sorted_order]
+            counts = torch.bincount(expert_idx, minlength=self.n_experts)
+            splits = counts.tolist()
+
+            # expert별 연속 chunk 처리
+            chunks = sorted_x.split(splits)
+            out_chunks = []
+            for e_idx, chunk in enumerate(chunks):
+                if chunk.shape[0] > 0:
+                    out_chunks.append(self.experts[e_idx](chunk))
+                else:
+                    out_chunks.append(chunk)
+
+            sorted_out = torch.cat(out_chunks)
+            sorted_out = sorted_out * expert_w[sorted_order].unsqueeze(-1)
+
+            # 원래 순서로 복원
+            inv_order = sorted_order.argsort()
+            out_flat = out_flat + sorted_out[inv_order]
 
         output = out_flat.view(B, T, D)
 
@@ -100,48 +106,6 @@ class MoEBitNetFFN(nn.Module):
         aux_loss = self._aux_loss(router_probs, top_indices)
 
         return output, aux_loss
-
-    def _batched_dispatch(
-        self, x_flat: torch.Tensor, expert_idx: torch.Tensor, expert_w: torch.Tensor,
-    ) -> torch.Tensor:
-        """Batched expert dispatch
-
-        토큰을 expert별로 정렬 → (E, max_count, D)로 패딩 → batched forward → unpad.
-        """
-        N, D = x_flat.shape
-
-        sorted_order = expert_idx.argsort()
-        sorted_x = x_flat[sorted_order]
-        counts = torch.bincount(expert_idx, minlength=self.n_experts)
-        max_count = counts.max().item()
-
-        # (E, max_count, D) — zero-padding
-        padded = torch.zeros(
-            self.n_experts, max_count, D,
-            device=x_flat.device, dtype=x_flat.dtype,
-        )
-        offset = 0
-        splits = counts.tolist()
-        for e_idx, c in enumerate(splits):
-            if c > 0:
-                padded[e_idx, :c] = sorted_x[offset:offset + c]
-            offset += c
-
-        # Batched expert forward: 1회 호출
-        expert_out = self.experts(padded)  # (E, max_count, D)
-
-        # Unpad + weight + reorder
-        out_chunks = []
-        for e_idx, c in enumerate(splits):
-            if c > 0:
-                out_chunks.append(expert_out[e_idx, :c])
-            else:
-                out_chunks.append(x_flat[:0])  # empty tensor
-        sorted_out = torch.cat(out_chunks)
-        sorted_out = sorted_out * expert_w[sorted_order].unsqueeze(-1)
-
-        inv_order = sorted_order.argsort()
-        return sorted_out[inv_order]
 
     def _aux_loss(self, router_probs: torch.Tensor, top_indices: torch.Tensor) -> torch.Tensor:
         """Load balancing auxiliary loss
