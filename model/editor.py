@@ -109,6 +109,9 @@ class BitEditor(nn.Module):
         ])
         self.attn_insertion_set = set(cfg.attn_insertion_points)
 
+        # 삽입점 인덱스 매핑 (forward에서 반복 생성 회피)
+        self._insertion_map = {pt: idx for idx, pt in enumerate(cfg.attn_insertion_points)}
+
         # Final norm + tag head
         self.final_norm = RMSNorm(cfg.d_model, eps=cfg.rms_norm_eps)
         self.tag_head = nn.Linear(cfg.d_model, cfg.n_tags)
@@ -150,10 +153,7 @@ class BitEditor(nn.Module):
         x = self.embedding(input_ids) * self.embed_scale
         x = self.embed_dropout(x)
 
-        total_aux_loss = torch.tensor(0.0, device=x.device, dtype=torch.float32)
-
-        # 삽입점 인덱스 매핑
-        insertion_map = {pt: idx for idx, pt in enumerate(self.cfg.attn_insertion_points)}
+        total_aux_loss = x.new_zeros(())
 
         # 레이어 순회
         for i, layer in enumerate(self.layers):
@@ -166,8 +166,8 @@ class BitEditor(nn.Module):
             total_aux_loss = total_aux_loss + aux_loss
 
             # Shared Attention 삽입점 확인
-            if i in insertion_map:
-                ins_idx = insertion_map[i]
+            if i in self._insertion_map:
+                ins_idx = self._insertion_map[i]
                 residual = x
                 attn_out = self.shared_attn(x, insertion_idx=ins_idx, pad_mask=pad_mask)
                 attn_out = self.attn_dropouts[ins_idx](attn_out)

@@ -274,15 +274,14 @@ def train(args):
         if global_rank == 0:
             print(f"  INT8 backend: {args.int8_backend}")
 
-    if is_distributed:
-        model = DDP(model, device_ids=[local_rank])
-    raw_model = model.module if is_distributed else model
+    # raw_model 참조 저장 (wrapping 전 — state_dict, grad_ckpt, validate에서 사용)
+    raw_model = model
 
     # Gradient checkpointing
     if args.grad_ckpt:
         raw_model.gradient_checkpointing = True
 
-    # torch.compile
+    # torch.compile (DDP 전에 — compile은 로컬 계산만 최적화, DDP는 통신을 독립 관리)
     if args.compile:
         torch._dynamo.config.capture_scalar_outputs = True
         torch._dynamo.config.recompile_limit = 64
@@ -290,6 +289,15 @@ def train(args):
         if global_rank == 0:
             print("torch.compile 적용 중... (첫 step 느림, 이후 빠름)")
         model = torch.compile(model)
+
+    # DDP (compile 후에)
+    if is_distributed:
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            gradient_as_bucket_view=True,  # gradient 복사 제거 → 메모리 절약 + 속도
+            static_graph=True,             # 통신/계산 오버랩 최적화 (MoE 모듈 set 고정)
+        )
 
     # 노이즈 설정 (토큰 레벨 비활성화)
     noise_cfg = NoiseConfig(
@@ -538,41 +546,60 @@ def train(args):
         running_loss_t += _total_loss / args.grad_accum_steps
         running_aux_t += aux_loss.detach()
 
-        # 로깅 (GPU sync는 로깅 시점에만 1회)
-        if (step + 1) % log_interval == 0 and global_rank == 0:
-            dt = time.time() - t0
-            avg_loss = running_loss_t.item() / log_interval
-            avg_aux = running_aux_t.item() / log_interval
-            tok_s = running_tokens_t.item() / max(dt, 1e-6)
-            _total_chars = total_chars.item()
-            # 메모리 정보 (첫 로그에만)
-            mem_str = ""
-            if step + 1 == log_interval and torch.cuda.is_available():
-                alloc = torch.cuda.max_memory_allocated() / 1024**3
-                resv = torch.cuda.max_memory_reserved() / 1024**3
-                mem_str = f" | mem {alloc:.1f}G/{resv:.1f}G"
-            print(f"step {step + 1:>6d} | loss {avg_loss:.4f} | aux {avg_aux:.4f} | "
-                  f"chars {format_chars(_total_chars)} | "
-                  f"lr {lr:.2e} | {tok_s:.0f} tok/s | {dt:.1f}s{mem_str}", flush=True)
+        # 로깅 (DDP: all_reduce로 global 통계 → 정확한 throughput 표시)
+        if (step + 1) % log_interval == 0:
+            # DDP: loss, aux, tokens를 한 번에 all_reduce (통신 1회)
+            if is_distributed:
+                log_stats = torch.stack([
+                    running_loss_t.squeeze(),
+                    running_aux_t.squeeze(),
+                    running_tokens_t.float().squeeze(),
+                ])
+                dist.all_reduce(log_stats)
+
+            if global_rank == 0:
+                dt = time.time() - t0
+                if is_distributed:
+                    avg_loss = log_stats[0].item() / (log_interval * world_size)
+                    avg_aux = log_stats[1].item() / (log_interval * world_size)
+                    tok_s = log_stats[2].item() / max(dt, 1e-6)
+                else:
+                    avg_loss = running_loss_t.item() / log_interval
+                    avg_aux = running_aux_t.item() / log_interval
+                    tok_s = running_tokens_t.item() / max(dt, 1e-6)
+                _total_chars = total_chars.item()
+                # 메모리 정보 (첫 로그에만)
+                mem_str = ""
+                if step + 1 == log_interval and torch.cuda.is_available():
+                    alloc = torch.cuda.max_memory_allocated() / 1024**3
+                    resv = torch.cuda.max_memory_reserved() / 1024**3
+                    mem_str = f" | mem {alloc:.1f}G/{resv:.1f}G"
+                gpu_str = f" ({world_size}GPU)" if world_size > 1 else ""
+                print(f"step {step + 1:>6d} | loss {avg_loss:.4f} | aux {avg_aux:.4f} | "
+                      f"chars {format_chars(_total_chars)} | "
+                      f"lr {lr:.2e} | {tok_s:.0f} tok/s{gpu_str} | {dt:.1f}s{mem_str}", flush=True)
             running_loss_t.zero_()
             running_aux_t.zero_()
             running_tokens_t.zero_()
             log_chars.zero_()
             t0 = time.time()
 
-        # 검증
+        # 검증 (DDP: 전체 GPU가 참여 → all_reduce로 평균)
         if (val_loader is not None and args.val_every
                 and (step + 1) >= args.warmup_steps
                 and (step + 1 - args.warmup_steps) % args.val_every == 0):
+            val_loss, tag_acc, edit_p, edit_r = validate_editor(
+                raw_model, val_loader, criterion, config, device,
+                use_amp, args.val_steps, amp_dtype=amp_dtype,
+            )
+            if is_distributed:
+                val_stats = torch.tensor([val_loss, tag_acc, edit_p, edit_r], device=device)
+                dist.all_reduce(val_stats)
+                val_stats /= world_size
+                val_loss, tag_acc, edit_p, edit_r = val_stats.tolist()
             if global_rank == 0:
-                val_loss, tag_acc, edit_p, edit_r = validate_editor(
-                    raw_model, val_loader, criterion, config, device,
-                    use_amp, args.val_steps, amp_dtype=amp_dtype,
-                )
                 print(f"  val step {step + 1:>6d} | val_loss {val_loss:.4f} | "
                       f"tag_acc {tag_acc:.2%} | edit_P {edit_p:.2%} | edit_R {edit_r:.2%}", flush=True)
-            if is_distributed:
-                dist.barrier()
 
         # 체크포인트
         if (step + 1) % save_interval == 0 and global_rank == 0:
