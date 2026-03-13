@@ -84,7 +84,7 @@ class Mamba2Block(nn.Module):
             # cumsum으로 True가 나올 때마다 ID 증가 → 자동 문서별 고유 ID
             seq_idx = (reset_mask.int().cumsum(dim=1) - 1).to(torch.int32)
 
-        return self.mamba2(x, seq_idx=seq_idx)
+        return self.mamba2(x, seq_idx=seq_idx).to(x.dtype)
 
     def extra_repr(self) -> str:
         nheads = self.d_inner // self.headdim

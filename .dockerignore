@@ -45,6 +45,8 @@ ENV/
 *.jsonl
 corpus/*
 !corpus/*.tar.gz.enc.*
+corpus/*.zip
+corpus/*.zst
 *.pt
 *.safetensors
 *.ckpt

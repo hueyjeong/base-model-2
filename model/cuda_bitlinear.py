@@ -58,21 +58,7 @@ def _load_cuda_ext():
 
 
 def _quantize_activations(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    if (
-        x.is_cuda
-        and _env_flag("BITLINEAR_CUDA_FUSED_ACT", "1")
-        and (not torch.cuda.is_current_stream_capturing())
-    ):
-        try:
-            ext = _load_cuda_ext()
-            x_2d = x.reshape(-1, x.shape[-1]).float().contiguous()
-            x_q_2d, x_scale_2d = ext.quantize_activations_int8(x_2d)
-            x_q = x_q_2d.reshape_as(x)
-            scale = x_scale_2d.reshape(*x.shape[:-1], 1)
-            return x_q, scale
-        except Exception:
-            pass
-
+    """활성화를 INT8 absmax 양자화 (순수 PyTorch, torch.compile 호환)"""
     eta = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5)
     x_q = (x * 127.0 / eta).round().clamp(-128, 127)
     scale = eta / 127.0
@@ -80,21 +66,7 @@ def _quantize_activations(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def _quantize_weights(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    if (
-        w.is_cuda
-        and _env_flag("BITLINEAR_CUDA_FUSED_WEIGHT", "1")
-        and (not torch.cuda.is_current_stream_capturing())
-    ):
-        try:
-            ext = _load_cuda_ext()
-            w_2d = w.float().contiguous()
-            w_q_i8, gamma_1 = ext.quantize_weights_ternary(w_2d)
-            w_q = w_q_i8.float()
-            gamma = gamma_1.reshape([])
-            return w_q, gamma
-        except Exception:
-            pass
-
+    """가중치를 ternary 양자화 (순수 PyTorch, torch.compile 호환)"""
     gamma = w.abs().mean().clamp(min=1e-5)
     w_q = (w / gamma).clamp(-1, 1).round()
     return w_q, gamma
@@ -242,15 +214,17 @@ def _pad_int8_mm_ab(a_int8: torch.Tensor, b_int8: torch.Tensor):
     return a_pad, b_pad, M, K
 
 
+@torch.compiler.allow_in_graph
 class _BitLinearCudaFn(torch.autograd.Function):
     @staticmethod
-    @torch.amp.custom_fwd(device_type="cuda", cast_inputs=torch.float32)
-    def forward(ctx, x_norm: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None):
+    @torch.amp.custom_fwd(device_type="cuda")
+    def forward(ctx, x_norm: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None, out_dtype: torch.dtype):
         if not x_norm.is_cuda:
             raise RuntimeError("BitLinearCuda는 CUDA 텐서에서만 동작합니다.")
 
-        x_q, x_scale = _quantize_activations(x_norm)
-        w_q, w_scale = _quantize_weights(weight)
+        # 양자화는 FP32로 수행 (scale 정밀도 보장), INT8 matmul은 dtype 무관
+        x_q, x_scale = _quantize_activations(x_norm.float())
+        w_q, w_scale = _quantize_weights(weight.float())
 
         batch_shape = x_norm.shape[:-1]
         M = x_q.reshape(-1, x_q.shape[-1]).shape[0]
@@ -272,22 +246,17 @@ class _BitLinearCudaFn(torch.autograd.Function):
             bias_1d = bias.contiguous().float() if bias is not None else None
             out_2d = ext.bitlinear_int8_forward(x_int8, w_int8, x_scale_2d, w_scale_1, bias_1d)
 
-        out = out_2d.reshape(*batch_shape, -1)
+        # 출력을 AMP dtype(BF16)으로 변환 → 후속 레이어 전체 BF16 동작
+        out = out_2d.to(out_dtype).reshape(*batch_shape, -1)
 
-        backward_mode = _get_backward_mode()
-        x_flat = x_norm.reshape(M, -1).contiguous()
-
-        if backward_mode == "fp16_tc":
-            x_saved = x_flat.half()
-        elif backward_mode == "bf16_tc":
-            x_saved = x_flat.to(torch.bfloat16)
-        else:
-            x_saved = x_flat.float()
+        # x_saved: AMP dtype으로 저장 (BF16 → 메모리 절반, backward 캐스팅 0회)
+        x_saved = x_norm.reshape(M, -1).to(out_dtype).contiguous()
 
         ctx.save_for_backward(x_saved, w_int8, w_scale_1)
         ctx.batch_shape = batch_shape
         ctx.has_bias = bias is not None
-        ctx.backward_mode = backward_mode
+        ctx.backward_mode = _get_backward_mode()
+        ctx.out_dtype = out_dtype
         return out
 
     @staticmethod
@@ -296,39 +265,49 @@ class _BitLinearCudaFn(torch.autograd.Function):
         x_saved, w_int8, w_scale_1 = ctx.saved_tensors
         batch_shape = ctx.batch_shape
         M = x_saved.shape[0]
+        orig_dtype = getattr(ctx, "out_dtype", torch.float32)
 
-        go_2d = grad_output.reshape(M, -1).float()
+        # grad_output을 원본 dtype으로 유지 (불필요한 FP32 캐스팅 제거)
+        go_2d = grad_output.reshape(M, -1)
         backward_mode = getattr(ctx, "backward_mode", "fp32_tf32")
         _enable_tf32_fast_matmul()
 
-        w_deq_fp32 = (w_int8.float() * w_scale_1).contiguous()
-
         if backward_mode == "auto":
-            backward_mode = _select_best_backward_mode(go_2d, x_saved, w_deq_fp32)
+            # auto 모드: FP32로 벤치마크
+            go_f32 = go_2d.float()
+            w_deq_fp32 = (w_int8.float() * w_scale_1).contiguous()
+            backward_mode = _select_best_backward_mode(go_f32, x_saved, w_deq_fp32)
 
         if backward_mode == "fp32_tf32":
-            w_fp32 = w_deq_fp32
-            x_fp32 = x_saved.float()
-            grad_x_2d = go_2d @ w_fp32
-            if not _should_use_gradw_lt(go_2d, x_fp32):
-                grad_w = go_2d.t() @ x_fp32
+            # FP32 + TF32 Tensor Core (정밀도 우선)
+            go_f = go_2d.float()
+            w_f = (w_int8.float() * w_scale_1).contiguous()
+            x_f = x_saved.float()
+            grad_x_2d = go_f @ w_f
+            if not _should_use_gradw_lt(go_f, x_f):
+                grad_w = go_f.t() @ x_f
             else:
                 try:
                     ext = _load_cuda_ext()
-                    grad_w = ext.bitlinear_grad_weight(go_2d, x_fp32)
+                    grad_w = ext.bitlinear_grad_weight(go_f, x_f)
                 except Exception:
-                    grad_w = go_2d.t() @ x_fp32
+                    grad_w = go_f.t() @ x_f
         elif backward_mode == "fp16_tc":
             go_h = go_2d.half()
-            grad_x_2d = (go_h @ w_deq_fp32.half()).float()
+            w_h = (w_int8.float() * w_scale_1).half().contiguous()
+            grad_x_2d = (go_h @ w_h).float()
             grad_w = (go_h.t() @ x_saved.half()).float()
         elif backward_mode == "bf16_tc":
+            # BF16 Tensor Core — go_2d가 이미 BF16이면 캐스팅 0회
             go_b = go_2d.to(torch.bfloat16)
-            grad_x_2d = (go_b @ w_deq_fp32.to(torch.bfloat16)).float()
+            w_b = (w_int8.float() * w_scale_1).to(torch.bfloat16).contiguous()
+            grad_x_2d = (go_b @ w_b).float()
             grad_w = (go_b.t() @ x_saved.to(torch.bfloat16)).float()
         else:
-            go_abs = go_2d.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5)
-            go_int8 = (go_2d * 127.0 / go_abs).round().clamp(-128, 127).to(torch.int8)
+            # INT8 backward (grad_x only, grad_w는 FP32)
+            go_f = go_2d.float()
+            go_abs = go_f.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5)
+            go_int8 = (go_f * 127.0 / go_abs).round().clamp(-128, 127).to(torch.int8)
             go_scale = (go_abs / 127.0).contiguous().float()
 
             go_pad, w_pad, M_orig, K_orig = _pad_int8_mm_ab(go_int8, w_int8)
@@ -341,19 +320,19 @@ class _BitLinearCudaFn(torch.autograd.Function):
                 grad_x_2d = ext.bitlinear_int8_backward_input(go_int8, w_int8, go_scale, w_scale_1)
 
             x_fp32 = x_saved.float()
-            if not _should_use_gradw_lt(go_2d, x_fp32):
-                grad_w = go_2d.t() @ x_saved.float()
+            if not _should_use_gradw_lt(go_f, x_fp32):
+                grad_w = go_f.t() @ x_fp32
             else:
                 try:
                     ext = _load_cuda_ext()
-                    grad_w = ext.bitlinear_grad_weight(go_2d, x_fp32)
+                    grad_w = ext.bitlinear_grad_weight(go_f, x_fp32)
                 except Exception:
-                    grad_w = go_2d.t() @ x_saved.float()
+                    grad_w = go_f.t() @ x_fp32
 
         grad_x = grad_x_2d.reshape(*batch_shape, -1)
-        grad_bias = go_2d.sum(dim=0) if ctx.has_bias else None
+        grad_bias = go_2d.float().sum(dim=0) if ctx.has_bias else None
 
-        return grad_x, grad_w, grad_bias
+        return grad_x, grad_w, grad_bias, None
 
 
 class BitLinearCuda(nn.Module):
@@ -376,6 +355,13 @@ class BitLinearCuda(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_norm = self.norm(x)
 
+        # AMP autocast dtype 감지: custom_fwd가 autocast를 비활성화하기 전에
+        # module level에서 감지하여 Function에 전달
+        if torch.is_autocast_enabled('cuda'):
+            out_dtype = torch.get_autocast_dtype('cuda')  # BF16 or FP16
+        else:
+            out_dtype = x_norm.dtype
+
         weight = self.weight
         bias = self.bias
         if weight.device != x_norm.device:
@@ -383,7 +369,7 @@ class BitLinearCuda(nn.Module):
         if bias is not None and bias.device != x_norm.device:
             bias = bias.to(x_norm.device)
 
-        return _BitLinearCudaFn.apply(x_norm, weight, bias)
+        return _BitLinearCudaFn.apply(x_norm, weight, bias, out_dtype)
 
     def extra_repr(self) -> str:
         return (

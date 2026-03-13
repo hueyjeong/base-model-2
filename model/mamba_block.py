@@ -113,7 +113,7 @@ class MambaBlock(nn.Module):
         #   x_branch=0 → x_proj 출력(dt,B,C)≈0 → dB×x=0 (입력 기여 제거)
         #   z=0 → gated output에서 BOS 위치의 SSM 출력도 0
         if reset_mask is not None:
-            keep = (~reset_mask).unsqueeze(-1).float()  # (B, L, 1)
+            keep = (~reset_mask).unsqueeze(-1).to(x_branch.dtype)  # (B, L, 1)
             x_branch = x_branch * keep
             z = z * keep
 

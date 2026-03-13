@@ -16,7 +16,13 @@ from model.bitlinear import BitLinear
 
 
 class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization"""
+    """Root Mean Square Layer Normalization
+
+    bf16 안전성:
+      - bf16 exponent = 8bit (f32과 동일) → overflow/underflow 없음
+      - rsqrt(eps) = rsqrt(1e-6) = 1000 → bf16 범위(~65504) 이내
+      - PAD 0-vector: rsqrt(0+eps) = 1000, weight*0*1000=0 → 안전
+    """
 
     def __init__(self, d_model: int, eps: float = 1e-6):
         super().__init__()
@@ -24,11 +30,10 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        orig_dtype = x.dtype
-        # Calculate in FP32 to prevent BF16 underflow on <PAD> 0-vectors
-        x_f32 = x.float()
-        rms = torch.rsqrt(x_f32.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        return (x_f32 * rms).to(orig_dtype) * self.weight
+        # bf16/f16: exponent 범위 충분, float32 캐스팅 생략하여 커널 2회 절감
+        rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        # weight를 입력 dtype으로 캐스팅하여 BF16 → FP32 promotion 방지
+        return (x * rms) * self.weight.to(x.dtype)
 
 
 class BitNetFFN(nn.Module):
@@ -143,6 +148,8 @@ class Encoder(nn.Module):
     ):
         super().__init__()
         self.gradient_checkpointing = False
+        # N 레이어마다 1개만 checkpoint (1=전체, 2=50%, 3=33% ...)
+        self.gradient_checkpointing_every: int = 1
         self.layers = nn.ModuleList([
             EncoderLayer(
                 d_model=d_model,
@@ -169,8 +176,8 @@ class Encoder(nn.Module):
         Returns:
             (batch, seq_len, d_model)  — 인코더 최종 출력
         """
-        for layer in self.layers:
-            if self.gradient_checkpointing and self.training:
+        for i, layer in enumerate(self.layers):
+            if self.gradient_checkpointing and self.training and (i % self.gradient_checkpointing_every == 0):
                 x = checkpoint(layer, x, reset_mask, use_reentrant=False)
             else:
                 x = layer(x, reset_mask=reset_mask)
