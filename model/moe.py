@@ -104,45 +104,44 @@ class MoEBitNetFFN(nn.Module):
     def _batched_dispatch(
         self, x_flat: torch.Tensor, expert_idx: torch.Tensor, expert_w: torch.Tensor,
     ) -> torch.Tensor:
-        """Batched expert dispatch — 순수 텐서 연산 (no .item(), no Python loop)
+        """Batched expert dispatch
 
-        1. expert별 정렬 → 2. vectorized scatter into (E, capacity, D)
-        → 3. batched expert forward → 4. vectorized gather + unsort
+        토큰을 expert별로 정렬 → (E, max_count, D)로 패딩 → batched forward → unpad.
         """
         N, D = x_flat.shape
-        E = self.n_experts
 
-        # 1. expert별 정렬
-        sorted_order = expert_idx.argsort(stable=True)
+        sorted_order = expert_idx.argsort()
         sorted_x = x_flat[sorted_order]
-        sorted_idx = expert_idx[sorted_order]
+        counts = torch.bincount(expert_idx, minlength=self.n_experts)
+        max_count = counts.max().item()
 
-        # 2. expert 내 위치 계산 (vectorized — GPU 완전 활용)
-        counts = torch.bincount(expert_idx, minlength=E)
-        offsets = torch.zeros(E, device=x_flat.device, dtype=torch.long)
-        offsets[1:] = counts[:-1].cumsum(0)
-        local_pos = torch.arange(N, device=x_flat.device) - offsets[sorted_idx]
+        # (E, max_count, D) — zero-padding
+        padded = torch.zeros(
+            self.n_experts, max_count, D,
+            device=x_flat.device, dtype=x_flat.dtype,
+        )
+        offset = 0
+        splits = counts.tolist()
+        for e_idx, c in enumerate(splits):
+            if c > 0:
+                padded[e_idx, :c] = sorted_x[offset:offset + c]
+            offset += c
 
-        # 고정 capacity (Python int 연산, GPU sync 없음)
-        capacity = ((N + E - 1) // E) * 2  # 2× expected — 메모리 절약, overflow는 clamp
+        # Batched expert forward: 1회 호출
+        expert_out = self.experts(padded)  # (E, max_count, D)
 
-        # Overflow 방지 (clamp → 초과 토큰은 마지막 슬롯에 머지, 학습 안정성용)
-        local_pos = local_pos.clamp(max=capacity - 1)
-
-        # 3. Scatter: sorted tokens → (E*capacity, D) flat buffer
-        flat_idx = sorted_idx * capacity + local_pos
-        padded = x_flat.new_zeros(E * capacity, D)
-        padded = padded.index_copy(0, flat_idx, sorted_x)
-
-        # 4. Batched expert forward
-        expert_out = self.experts(padded.view(E, capacity, D))
-
-        # 5. Gather + weight + unsort
-        gathered = expert_out.view(-1, D)[flat_idx]
-        weighted = gathered * expert_w[sorted_order].unsqueeze(-1)
+        # Unpad + weight + reorder
+        out_chunks = []
+        for e_idx, c in enumerate(splits):
+            if c > 0:
+                out_chunks.append(expert_out[e_idx, :c])
+            else:
+                out_chunks.append(x_flat[:0])  # empty tensor
+        sorted_out = torch.cat(out_chunks)
+        sorted_out = sorted_out * expert_w[sorted_order].unsqueeze(-1)
 
         inv_order = sorted_order.argsort()
-        return weighted[inv_order]
+        return sorted_out[inv_order]
 
     def _aux_loss(self, router_probs: torch.Tensor, top_indices: torch.Tensor) -> torch.Tensor:
         """Load balancing auxiliary loss
