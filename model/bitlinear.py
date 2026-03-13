@@ -11,9 +11,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# CUDA fused quantize_activations — 미검증, 비활성화
-# TODO: 단독 검증 완료 후 활성화 (torch.compile + autograd.Function NaN 가능성)
+# CUDA fused quantize_activations — 5+ PyTorch ops → 1 CUDA 커널
+# autograd.Function backward에서 amax gradient 무시 → torch.compile NaN 방지
 _CUDA_QUANT_ACT = False
+try:
+    from model.cuda_quant_act import cuda_quantize_activations_8bit, is_available as _quant_act_available
+    if _quant_act_available():
+        _CUDA_QUANT_ACT = True
+except (ImportError, Exception):
+    pass
 
 
 def _ste_round(x: torch.Tensor) -> torch.Tensor:
