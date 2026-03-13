@@ -274,7 +274,8 @@ def train(args):
             print(f"  INT8 backend: {args.int8_backend}")
 
     if is_distributed:
-        model = DDP(model, device_ids=[local_rank])
+        # MoE top_k < n_experts → 비활성 expert 파라미터가 gradient 미수신
+        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
     raw_model = model.module if is_distributed else model
 
     # Gradient checkpointing
