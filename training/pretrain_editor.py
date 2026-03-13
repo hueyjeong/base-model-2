@@ -191,7 +191,8 @@ def train(args):
         use_korean_errors=True,
     )
 
-    # 데이터셋
+    # 데이터셋 — n_iterations > 1이면 패킹 비활성 (per-doc original_ids 필요)
+    use_pack = (config.n_iterations <= 1)
     dataset = EditorDataset(
         args.corpus, tokenizer, noiser,
         vocab_size=tokenizer.vocab_size,
@@ -201,6 +202,7 @@ def train(args):
         seed=args.seed,
         rank=global_rank,
         world_size=world_size,
+        pack=use_pack,
     )
     loader = DataLoader(
         dataset,

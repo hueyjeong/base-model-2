@@ -8,9 +8,10 @@ Levenshtein 정렬로 편집 태그를 계산한다.
 - 삭제/인필링은 인위적 패턴 생성
 - 텍스트 레벨 노이즈만으로 실제 오류 학습에 충분
 
-패킹 대신 개별 시퀀스 패딩 사용:
-- BiRWKV의 backward 스캔이 문서 경계를 넘지 않도록
-- max_seq_len까지 패딩, 초과 시 truncate
+패킹 모드 (기본):
+- 여러 문장을 max_seq_len까지 연결하여 PAD 낭비 제거
+- 인코더-only 모델이므로 문서 경계 무시해도 안전
+- n_iterations > 1 시 자동으로 개별 패딩 모드로 전환
 """
 import json
 import os
@@ -44,6 +45,7 @@ class EditorDataset(IterableDataset):
         seed: 랜덤 시드
         rank: DDP rank
         world_size: DDP 프로세스 수
+        pack: 패킹 활성화 (여러 문장을 연결하여 PAD 제거)
     """
 
     def __init__(
@@ -60,6 +62,7 @@ class EditorDataset(IterableDataset):
         seed: int = 42,
         rank: int = 0,
         world_size: int = 1,
+        pack: bool = True,
     ):
         self.file_paths = [file_paths] if isinstance(file_paths, str) else list(file_paths)
         self.tokenizer = tokenizer
@@ -74,6 +77,7 @@ class EditorDataset(IterableDataset):
         self.rank = rank
         self.world_size = world_size
         self._line_counter = 0
+        self.pack = pack
 
     def state_dict(self) -> dict:
         return {
@@ -124,50 +128,56 @@ class EditorDataset(IterableDataset):
                     yield text, lang
                     line_idx += 1
 
-    def _process_text(self, text: str, lang: str | None) -> dict | None:
-        """텍스트 → 편집 태그 샘플 변환
-
-        텍스트 레벨 노이즈만 적용, 토큰 레벨 노이즈 없음.
-        """
+    def _tokenize_pair(self, text: str, lang: str | None):
+        """텍스트 → (noised_ids, edit_tags, original_ids) 변환 (패딩 없음)"""
         if lang is None:
             lang = self.noiser._detect_lang(text)
 
-        # 원본 토크나이징
         original_ids = self.tokenizer.encode(text, add_special=False)
         if not original_ids:
             return None
 
-        # 텍스트 노이즈 적용
         noised_text = self.noiser._apply_text_noise(text, lang)
         noised_ids = self.tokenizer.encode(noised_text, add_special=False)
         if not noised_ids:
             return None
 
-        # max_seq_len으로 truncate
+        # 최대 길이 제한 (개별 문장이 max_seq_len 초과 시)
         noised_ids = noised_ids[:self.max_seq_len]
         original_ids = original_ids[:self.max_seq_len]
 
-        # Levenshtein → 편집 태그
         tags = compute_edit_tags(noised_ids, original_ids, self.vocab_size)
+        return noised_ids, tags, original_ids
 
+    def _make_padded_sample(self, noised_ids, tags, original_ids, text_len):
+        """개별 시퀀스를 max_seq_len으로 패딩하여 dict 반환"""
         seq_len = len(noised_ids)
         pad_len = self.max_seq_len - seq_len
-
-        # 패딩
         pad_id = self.tokenizer.pad_id
-        input_ids = noised_ids + [pad_id] * pad_len
-        edit_tags = tags + [TAG_KEEP] * pad_len  # PAD 위치는 KEEP (loss에서 무시)
-        pad_mask = [True] * seq_len + [False] * pad_len
 
         return {
-            "input_ids": torch.tensor(input_ids, dtype=torch.long),
-            "edit_tags": torch.tensor(edit_tags, dtype=torch.long),
-            "pad_mask": torch.tensor(pad_mask, dtype=torch.bool),
+            "input_ids": torch.tensor(noised_ids + [pad_id] * pad_len, dtype=torch.long),
+            "edit_tags": torch.tensor(tags + [TAG_KEEP] * pad_len, dtype=torch.long),
+            "pad_mask": torch.tensor([True] * seq_len + [False] * pad_len, dtype=torch.bool),
             "original_ids": torch.tensor(
                 original_ids + [pad_id] * (self.max_seq_len - len(original_ids)),
                 dtype=torch.long,
             ),
-            "n_chars": len(text),
+            "n_chars": text_len,
+        }
+
+    def _make_packed_sample(self, buf_input, buf_tags):
+        """패킹된 버퍼를 max_seq_len으로 패딩하여 dict 반환"""
+        seq_len = len(buf_input)
+        pad_len = self.max_seq_len - seq_len
+        pad_id = self.tokenizer.pad_id
+
+        return {
+            "input_ids": torch.tensor(buf_input + [pad_id] * pad_len, dtype=torch.long),
+            "edit_tags": torch.tensor(buf_tags + [TAG_KEEP] * pad_len, dtype=torch.long),
+            "pad_mask": torch.tensor([True] * seq_len + [False] * pad_len, dtype=torch.bool),
+            "original_ids": torch.zeros(self.max_seq_len, dtype=torch.long),  # 패킹 시 미사용
+            "n_chars": 0,
         }
 
     def __iter__(self):
@@ -178,12 +188,51 @@ class EditorDataset(IterableDataset):
         total_workers = self.world_size * num_workers
         global_worker_id = (self.rank * num_workers) + worker_id
 
+        if self.pack:
+            yield from self._iter_packed(global_worker_id, total_workers)
+        else:
+            yield from self._iter_padded(global_worker_id, total_workers)
+
+    def _iter_padded(self, global_worker_id, total_workers):
+        """개별 패딩 모드 (n_iterations > 1 용)"""
         for i, (text, lang) in enumerate(self._iter_lines(
                 skip_worker_id=global_worker_id, skip_total=total_workers)):
             self._line_counter = i * total_workers + global_worker_id + 1
-            sample = self._process_text(text, lang)
-            if sample is not None:
-                yield sample
+            result = self._tokenize_pair(text, lang)
+            if result is not None:
+                noised_ids, tags, original_ids = result
+                yield self._make_padded_sample(noised_ids, tags, original_ids, len(text))
+
+    def _iter_packed(self, global_worker_id, total_workers):
+        """패킹 모드: 여러 문장을 연결하여 max_seq_len 채움"""
+        buf_input = []
+        buf_tags = []
+
+        for i, (text, lang) in enumerate(self._iter_lines(
+                skip_worker_id=global_worker_id, skip_total=total_workers)):
+            self._line_counter = i * total_workers + global_worker_id + 1
+            result = self._tokenize_pair(text, lang)
+            if result is None:
+                continue
+
+            noised_ids, tags, _ = result
+            remaining = self.max_seq_len - len(buf_input)
+
+            if len(noised_ids) > remaining:
+                # 버퍼 방출
+                if buf_input:
+                    yield self._make_packed_sample(buf_input, buf_tags)
+                buf_input = []
+                buf_tags = []
+
+            # 버퍼에 추가 (max_seq_len 초과 시 truncate)
+            remaining = self.max_seq_len - len(buf_input)
+            buf_input.extend(noised_ids[:remaining])
+            buf_tags.extend(tags[:remaining])
+
+        # 잔여 버퍼 방출
+        if buf_input:
+            yield self._make_packed_sample(buf_input, buf_tags)
 
 
 if __name__ == "__main__":
