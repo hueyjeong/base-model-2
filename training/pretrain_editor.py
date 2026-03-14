@@ -412,7 +412,8 @@ def train(args):
 
     # 학습 루프
     if global_rank == 0:
-        print(f"\n학습 시작: step {start_step} → {args.max_steps}")
+        epoch_str = f", epochs={args.epochs}" if args.epochs is not None else ""
+        print(f"\n학습 시작: step {start_step} → {args.max_steps}{epoch_str}")
         print(f"  batch_size={args.batch_size}, grad_accum={args.grad_accum_steps}")
         print(f"  lr={args.lr}, warmup={args.warmup_steps}")
         print(f"  n_iterations={config.n_iterations}")
@@ -440,11 +441,15 @@ def train(args):
     _iter_loss = torch.zeros(1, device=device)
     _ignore_idx = torch.tensor(-100, dtype=torch.long, device=device)
     _max_line_counter = 0  # worker→main _line_counter 추적
+    _current_epoch = 0
+    _steps_per_epoch = None
+    _epoch_done = False
+    effective_max_steps = args.max_steps
     t0 = time.time()
 
     for step in range(start_step, args.max_steps):
         # LR 스케줄
-        lr = get_lr(step, args.warmup_steps, args.lr, args.max_steps,
+        lr = get_lr(step, args.warmup_steps, args.lr, effective_max_steps,
                     min_lr_ratio=args.min_lr_ratio, schedule=args.schedule)
         for pg in optimizer.param_groups:
             pg["lr"] = lr
@@ -457,6 +462,25 @@ def train(args):
             try:
                 batch = next(data_iter)
             except StopIteration:
+                _current_epoch += 1
+                if _steps_per_epoch is None:
+                    _steps_per_epoch = step - start_step
+                    if global_rank == 0:
+                        print(f"\n에포크 {_current_epoch} 완료: {_steps_per_epoch} steps/epoch")
+                    if args.epochs is not None:
+                        effective_max_steps = min(
+                            args.max_steps,
+                            start_step + _steps_per_epoch * args.epochs,
+                        )
+                        if global_rank == 0:
+                            print(f"  → lr schedule 보정: effective_max_steps = {effective_max_steps}")
+                else:
+                    if global_rank == 0:
+                        print(f"\n에포크 {_current_epoch} 완료")
+
+                if args.epochs is not None and _current_epoch >= args.epochs:
+                    _epoch_done = True
+                    break
                 data_iter = iter(loader)
                 batch = next(data_iter)
 
@@ -541,6 +565,9 @@ def train(args):
             # total_chars는 log_interval마다 all_reduce 후 갱신 (DDP 정확도)
             if "_line_counter" in batch:
                 _max_line_counter = max(_max_line_counter, batch["_line_counter"].max().item())
+
+        if _epoch_done:
+            break
 
         # Gradient step
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -657,17 +684,23 @@ def train(args):
         total_chars += log_chars
     log_chars.zero_()
 
+    final_step = step + 1 if _epoch_done else args.max_steps
+
     if global_rank == 0:
         os.makedirs(args.save_dir, exist_ok=True)
         final_path = os.path.join(args.save_dir, f"editor_{args.size}_final.pt")
         torch.save({
-            "step": args.max_steps,
+            "step": final_step,
             "total_chars": int(total_chars),
             "config": asdict(config),
             "model": raw_model.state_dict(),
         }, final_path)
         print(f"\n최종 모델 저장: {final_path}")
-        print(f"학습 완료! (총 {args.max_steps} 스텝, {format_chars(int(total_chars))} chars)")
+        print(f"학습 완료! (총 {final_step} 스텝, {format_chars(int(total_chars))} chars)")
+        if _steps_per_epoch is not None:
+            print(f"  steps_per_epoch = {_steps_per_epoch}")
+            if args.epochs == 1:
+                print(f"  → 다음 실행 시 --max_steps {_steps_per_epoch} 으로 설정하면 cosine decay 적용됨")
 
         if args.gdrive_remote:
             upload_and_cleanup(final_path, args.log_file, args.gdrive_remote, keep_latest_n=1)
@@ -703,6 +736,8 @@ def main():
                         choices=["cosine", "wsd"],
                         help="LR 스케줄: cosine 또는 wsd (Warmup-Stable-Decay)")
     parser.add_argument("--max_steps", type=int, default=100000)
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="에포크 수 (미지정 시 max_steps로만 제어)")
     parser.add_argument("--warmup_steps", type=int, default=2000)
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--int8", action="store_true",
