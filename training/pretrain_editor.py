@@ -435,7 +435,7 @@ def train(args):
     running_aux_t = torch.zeros(1, device=device)
     running_tokens_t = torch.zeros(1, dtype=torch.long, device=device)
     log_chars = torch.zeros(1, dtype=torch.long, device=device)
-    total_chars = torch.tensor(restored_total_chars, dtype=torch.long, device=device)
+    total_chars = torch.zeros(1, dtype=torch.long, device=device) + restored_total_chars
     _total_loss = torch.zeros(1, device=device)
     _iter_loss = torch.zeros(1, device=device)
     _ignore_idx = torch.tensor(-100, dtype=torch.long, device=device)
