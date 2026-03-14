@@ -102,23 +102,35 @@ class EditorDataset(IterableDataset):
         self.rank = rank
         self.world_size = world_size
         self._line_counter = 0
+        self._resume_line = 0
+        self._last_file_order: list[str] = []
+        self._resume_file_order: list[str] | None = None
         self.pack = pack
 
     def state_dict(self) -> dict:
         return {
             "rng_state": self.rng.getstate(),
             "line_counter": self._line_counter,
+            "file_order": list(self._last_file_order),
         }
 
     def load_state_dict(self, state: dict) -> None:
         self.rng.setstate(state["rng_state"])
-        self._line_counter = state.get("line_counter", 0)
+        self._resume_line = state.get("line_counter", 0)
+        self._line_counter = self._resume_line
+        self._resume_file_order = state.get("file_order") or None
 
     def _iter_lines(self, skip_worker_id=None, skip_total=None):
         """파일에서 (text, lang) 스트리밍"""
-        files = list(self.file_paths)
-        if self.shuffle_files:
-            self.rng.shuffle(files)
+        if self._resume_file_order is not None:
+            # 복원 모드: 저장된 파일 순서 사용 (re-shuffle 방지)
+            files = self._resume_file_order
+            self._resume_file_order = None
+        else:
+            files = list(self.file_paths)
+            if self.shuffle_files:
+                self.rng.shuffle(files)
+        self._last_file_order = list(files)
 
         line_idx = 0
         for fpath in files:
@@ -189,6 +201,7 @@ class EditorDataset(IterableDataset):
                 dtype=torch.long,
             ),
             "n_chars": text_len,
+            "_line_counter": self._line_counter,
         }
 
     def _make_packed_sample(self, buf_input, buf_tags, n_chars):
@@ -203,6 +216,7 @@ class EditorDataset(IterableDataset):
             "pad_mask": torch.tensor([True] * seq_len + [False] * pad_len, dtype=torch.bool),
             "original_ids": torch.zeros(self.max_seq_len, dtype=torch.long),  # 패킹 시 미사용
             "n_chars": n_chars,
+            "_line_counter": self._line_counter,
         }
 
     def __iter__(self):
@@ -220,9 +234,18 @@ class EditorDataset(IterableDataset):
 
     def _iter_padded(self, global_worker_id, total_workers):
         """개별 패딩 모드 (n_iterations > 1 용)"""
+        resume_line = self._resume_line
+        if resume_line > 0:
+            self._resume_line = 0  # 다음 에폭에서는 정상 동작
+
         for i, (text, lang) in enumerate(self._iter_lines(
                 skip_worker_id=global_worker_id, skip_total=total_workers)):
-            self._line_counter = i * total_workers + global_worker_id + 1
+            abs_line = i * total_workers + global_worker_id
+            self._line_counter = abs_line + 1
+
+            if abs_line < resume_line:
+                continue  # fast-forward: 파일만 읽고 tokenize/tag 건너뜀
+
             result = self._tokenize_pair(text, lang)
             if result is not None:
                 noised_ids, tags, original_ids = result
@@ -230,13 +253,22 @@ class EditorDataset(IterableDataset):
 
     def _iter_packed(self, global_worker_id, total_workers):
         """패킹 모드: 여러 문장을 연결하여 max_seq_len 채움"""
+        resume_line = self._resume_line
+        if resume_line > 0:
+            self._resume_line = 0  # 다음 에폭에서는 정상 동작
+
         buf_input = []
         buf_tags = []
         buf_chars = 0
 
         for i, (text, lang) in enumerate(self._iter_lines(
                 skip_worker_id=global_worker_id, skip_total=total_workers)):
-            self._line_counter = i * total_workers + global_worker_id + 1
+            abs_line = i * total_workers + global_worker_id
+            self._line_counter = abs_line + 1
+
+            if abs_line < resume_line:
+                continue  # fast-forward: 파일만 읽고 tokenize/tag 건너뜀
+
             result = self._tokenize_pair(text, lang)
             if result is None:
                 continue

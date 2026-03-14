@@ -439,6 +439,7 @@ def train(args):
     _total_loss = torch.zeros(1, device=device)
     _iter_loss = torch.zeros(1, device=device)
     _ignore_idx = torch.tensor(-100, dtype=torch.long, device=device)
+    _max_line_counter = 0  # worker→main _line_counter 추적
     t0 = time.time()
 
     for step in range(start_step, args.max_steps):
@@ -537,7 +538,9 @@ def train(args):
             running_tokens_t += batch["pad_mask"].sum()
             batch_chars = batch["n_chars"].sum().to(device)
             log_chars += batch_chars
-            total_chars += batch_chars
+            # total_chars는 log_interval마다 all_reduce 후 갱신 (DDP 정확도)
+            if "_line_counter" in batch:
+                _max_line_counter = max(_max_line_counter, batch["_line_counter"].max().item())
 
         # Gradient step
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -554,8 +557,12 @@ def train(args):
                     running_loss_t.squeeze(),
                     running_aux_t.squeeze(),
                     running_tokens_t.float().squeeze(),
+                    log_chars.float().squeeze(),
                 ])
                 dist.all_reduce(log_stats)
+                total_chars += log_stats[3].long()
+            else:
+                total_chars += log_chars
 
             if global_rank == 0:
                 dt = time.time() - t0
@@ -601,30 +608,55 @@ def train(args):
                 print(f"  val step {step + 1:>6d} | val_loss {val_loss:.4f} | "
                       f"tag_acc {tag_acc:.2%} | edit_P {edit_p:.2%} | edit_R {edit_r:.2%}", flush=True)
 
-        # 체크포인트
-        if (step + 1) % save_interval == 0 and global_rank == 0:
-            ckpt_path = os.path.join(
-                args.save_dir,
-                f"editor_{args.size}_step_{step + 1}.pt"
-            )
-            os.makedirs(args.save_dir, exist_ok=True)
-            torch.save({
-                "step": step + 1,
-                "total_chars": int(total_chars),
-                "config": asdict(config),
-                "model": raw_model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "data_state": {
-                    "noiser_state": noiser.state_dict(),
-                    "dataset_state": dataset.state_dict(),
-                },
-            }, ckpt_path)
-            print(f"  체크포인트 저장: {ckpt_path}", flush=True)
+        # 체크포인트 (DDP: all_reduce는 모든 rank 참여 필요)
+        if (step + 1) % save_interval == 0:
+            # 잔여 log_chars flush (save_interval ≠ log_interval 배수일 때 대비)
+            if is_distributed:
+                flush = log_chars.float().clone()
+                dist.all_reduce(flush)
+                total_chars += flush.long()
+            else:
+                total_chars += log_chars
+            log_chars.zero_()
 
-            if args.gdrive_remote:
-                upload_and_cleanup(ckpt_path, args.log_file, args.gdrive_remote, keep_latest_n=1)
+            # _line_counter: worker→main 전파 (DDP: 모든 rank의 max)
+            if is_distributed:
+                lc_t = torch.tensor(_max_line_counter, dtype=torch.long, device=device)
+                dist.all_reduce(lc_t, op=dist.ReduceOp.MAX)
+                _max_line_counter = lc_t.item()
+            dataset._line_counter = _max_line_counter
 
-    # 최종 저장
+            if global_rank == 0:
+                ckpt_path = os.path.join(
+                    args.save_dir,
+                    f"editor_{args.size}_step_{step + 1}.pt"
+                )
+                os.makedirs(args.save_dir, exist_ok=True)
+                torch.save({
+                    "step": step + 1,
+                    "total_chars": int(total_chars),
+                    "config": asdict(config),
+                    "model": raw_model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "data_state": {
+                        "noiser_state": noiser.state_dict(),
+                        "dataset_state": dataset.state_dict(),
+                    },
+                }, ckpt_path)
+                print(f"  체크포인트 저장: {ckpt_path}", flush=True)
+
+                if args.gdrive_remote:
+                    upload_and_cleanup(ckpt_path, args.log_file, args.gdrive_remote, keep_latest_n=1)
+
+    # 최종 저장 전 잔여 chars flush
+    if is_distributed:
+        flush = log_chars.float().clone()
+        dist.all_reduce(flush)
+        total_chars += flush.long()
+    else:
+        total_chars += log_chars
+    log_chars.zero_()
+
     if global_rank == 0:
         os.makedirs(args.save_dir, exist_ok=True)
         final_path = os.path.join(args.save_dir, f"editor_{args.size}_final.pt")
