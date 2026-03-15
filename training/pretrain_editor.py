@@ -444,13 +444,21 @@ def train(args):
     _current_epoch = 0
     _steps_per_epoch = None
     _epoch_done = False
-    effective_max_steps = args.max_steps
+    _lr_decay_start = None  # 에포크 1 종료 후 cosine decay 시작점
+    _lr_decay_end = None
     t0 = time.time()
 
     for step in range(start_step, args.max_steps):
         # LR 스케줄
-        lr = get_lr(step, args.warmup_steps, args.lr, effective_max_steps,
-                    min_lr_ratio=args.min_lr_ratio, schedule=args.schedule)
+        if _lr_decay_start is not None and step >= _lr_decay_start:
+            # 에포크 1 이후: decay_start → decay_end 구간에서 cosine decay
+            min_lr = args.lr * args.min_lr_ratio
+            progress = (step - _lr_decay_start) / max(_lr_decay_end - _lr_decay_start, 1)
+            progress = min(progress, 1.0)
+            lr = min_lr + (args.lr - min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
+        else:
+            lr = get_lr(step, args.warmup_steps, args.lr, args.max_steps,
+                        min_lr_ratio=args.min_lr_ratio, schedule=args.schedule)
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
@@ -465,18 +473,15 @@ def train(args):
                 _current_epoch += 1
                 if _steps_per_epoch is None:
                     _steps_per_epoch = step - start_step
+                if global_rank == 0:
+                    print(f"\n에포크 {_current_epoch} 완료 ({_steps_per_epoch} steps/epoch)")
+
+                # 에포크 1 종료 시: 나머지 에포크에 대한 cosine decay 설정
+                if _lr_decay_start is None and args.epochs is not None and args.epochs > 1:
+                    _lr_decay_start = step
+                    _lr_decay_end = step + _steps_per_epoch // 3
                     if global_rank == 0:
-                        print(f"\n에포크 {_current_epoch} 완료: {_steps_per_epoch} steps/epoch")
-                    if args.epochs is not None:
-                        effective_max_steps = min(
-                            args.max_steps,
-                            start_step + _steps_per_epoch * args.epochs,
-                        )
-                        if global_rank == 0:
-                            print(f"  → lr schedule 보정: effective_max_steps = {effective_max_steps}")
-                else:
-                    if global_rank == 0:
-                        print(f"\n에포크 {_current_epoch} 완료")
+                        print(f"  → cosine decay: step {_lr_decay_start} → {_lr_decay_end}")
 
                 if args.epochs is not None and _current_epoch >= args.epochs:
                     _epoch_done = True
