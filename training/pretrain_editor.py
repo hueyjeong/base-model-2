@@ -387,6 +387,7 @@ def train(args):
     # 체크포인트 복원
     start_step = 0
     restored_total_chars = 0
+    _restored_epoch_state = None
     if args.resume and os.path.exists(args.resume):
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         raw_model.load_state_dict(ckpt["model"])
@@ -406,6 +407,13 @@ def train(args):
         else:
             if global_rank == 0:
                 print(f"\n체크포인트 복원: step {start_step}, chars {format_chars(restored_total_chars)} (data state 없음 — 데이터 처음부터)")
+
+        # 에포크 상태 복원
+        epoch_state = ckpt.get("epoch_state")
+        if isinstance(epoch_state, dict):
+            _restored_epoch_state = epoch_state
+        else:
+            _restored_epoch_state = None
 
         del ckpt
         gc.collect()
@@ -446,6 +454,17 @@ def train(args):
     _epoch_done = False
     _lr_decay_start = None  # 에포크 1 종료 후 cosine decay 시작점
     _lr_decay_end = None
+
+    # 에포크 상태 복원
+    if _restored_epoch_state is not None:
+        _current_epoch = _restored_epoch_state.get("current_epoch", 0)
+        _steps_per_epoch = _restored_epoch_state.get("steps_per_epoch")
+        _lr_decay_start = _restored_epoch_state.get("lr_decay_start")
+        _lr_decay_end = _restored_epoch_state.get("lr_decay_end")
+        if global_rank == 0 and _steps_per_epoch is not None:
+            print(f"  에포크 상태 복원: epoch={_current_epoch}, steps_per_epoch={_steps_per_epoch}")
+            if _lr_decay_start is not None:
+                print(f"  lr decay: step {_lr_decay_start} → {_lr_decay_end}")
     t0 = time.time()
 
     for step in range(start_step, args.max_steps):
@@ -673,6 +692,12 @@ def train(args):
                     "data_state": {
                         "noiser_state": noiser.state_dict(),
                         "dataset_state": dataset.state_dict(),
+                    },
+                    "epoch_state": {
+                        "current_epoch": _current_epoch,
+                        "steps_per_epoch": _steps_per_epoch,
+                        "lr_decay_start": _lr_decay_start,
+                        "lr_decay_end": _lr_decay_end,
                     },
                 }, ckpt_path)
                 print(f"  체크포인트 저장: {ckpt_path}", flush=True)
