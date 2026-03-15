@@ -490,8 +490,9 @@ def train(args):
                 batch = next(data_iter)
             except StopIteration:
                 _current_epoch += 1
+
                 if _steps_per_epoch is None:
-                    _steps_per_epoch = step - start_step
+                    _steps_per_epoch = step  # step 0부터의 절대 스텝 = 에포크 길이
                 if global_rank == 0:
                     print(f"\n에포크 {_current_epoch} 완료 ({_steps_per_epoch} steps/epoch)")
 
