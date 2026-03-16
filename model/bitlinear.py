@@ -238,29 +238,37 @@ class Int8Linear(nn.Linear):
     def __init__(self, in_features: int, out_features: int, bias: bool = False):
         super().__init__(in_features, out_features, bias=bias)
         self.norm = nn.LayerNorm(in_features, elementwise_affine=False)
+        # weight 양자화 캐시 (optimizer.step() 전까지 불변)
+        self._weight_version: int = -1
+        self._w_quant_cache: torch.Tensor | None = None
+        self._w_scale_cache: torch.Tensor | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # LayerNorm (BitLinear과 동일한 sub-layer norm)
         x = self.norm(x)
 
         # Activation: per-token absmax → INT8 + STE
-        Qb = 127.0
-        x_eta = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5)
-        x_scaled = x * Qb / x_eta
-        x_quant = _ste_round(x_scaled.clamp(-128.0, 127.0))
-        x_scale = x_eta / Qb
+        x_quant, x_scale = quantize_activations_8bit(x)
 
-        # Weight: per-tensor absmax → INT8 + STE
-        w_eta = self.weight.abs().max().clamp(min=1e-5)
-        w_scaled = self.weight * Qb / w_eta
-        w_quant = _ste_round(w_scaled.clamp(-128.0, 127.0))
-        w_scale = w_eta / Qb
+        # Weight: per-tensor absmax → INT8 + STE (캐시)
+        Qb = 127.0
+        v = self.weight._version
+        if v != self._weight_version:
+            with torch.no_grad():
+                w_eta = self.weight.abs().max().clamp(min=1e-5)
+                w_scaled = self.weight * Qb / w_eta
+                if self.training:
+                    self._w_quant_cache = _ste_round(w_scaled.clamp(-128.0, 127.0))
+                else:
+                    self._w_quant_cache = w_scaled.clamp(-128.0, 127.0).round()
+                self._w_scale_cache = w_eta / Qb
+                self._weight_version = v
 
         # STE 재연결
-        w_ste = self.weight + (w_quant * w_scale - self.weight).detach()
-        x_ste = x + (x_quant * x_scale - x).detach()
+        w_quant = self.weight + (self._w_quant_cache * self._w_scale_cache - self.weight).detach()
 
-        return F.linear(x_ste, w_ste, self.bias)
+        out = F.linear(x_quant, w_quant, self.bias)
+        return out * x_scale
 
     def extra_repr(self) -> str:
         return (

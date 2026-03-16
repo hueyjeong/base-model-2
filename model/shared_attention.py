@@ -147,44 +147,42 @@ class SharedLinearSelfAttention(nn.Module):
         v: torch.Tensor,
         doc_ids: torch.Tensor,  # (B, T)
     ) -> torch.Tensor:
-        """문서별 분리 Linear Self-Attention
+        """문서별 분리 Linear Self-Attention — scatter_add 기반 (loop 없음)
 
-        각 토큰은 같은 문서 내 토큰의 context만 참조.
-        scatter_add로 문서별 K^T@V, sum(K) 계산 후 gather로 매핑.
+        1. k⊗v outer product를 (B*H*T, d*d)로 평탄화
+        2. scatter_add로 문서별 context 누적
+        3. gather로 각 토큰에 자기 문서 context 매핑
+        4. Q @ context 계산
         """
         B, H, T, d = q.shape
         max_docs = doc_ids.max().item() + 1
 
-        # doc_ids를 (B, H, T, 1) 형태로 확장
-        did = doc_ids.view(B, 1, T, 1).expand(B, H, T, 1)  # (B, H, T, 1)
+        # doc index: (B, H, T) → scatter/gather용
+        did = doc_ids.view(B, 1, T).expand(B, H, T)  # (B, H, T)
 
-        # 문서별 context: K^T @ V → (B, H, max_docs, d, d)
-        # scatter_add는 1차원 인덱스에만 작동하므로, 문서별 loop 사용
-        # (max_docs는 보통 10~30 — 루프 비용 미미)
-        doc_ctx = q.new_zeros(B, H, max_docs, d, d)
+        # k⊗v outer product: (B, H, T, d, 1) × (B, H, T, 1, d) → (B, H, T, d, d)
+        kv = k.unsqueeze(-1) * v.unsqueeze(-2)  # (B, H, T, d, d)
+
+        # scatter_add: 문서별 context 누적 — (B, H, max_docs, d*d)
+        kv_flat = kv.reshape(B, H, T, d * d)  # (B, H, T, d²)
+        did_flat = did.unsqueeze(-1).expand_as(kv_flat)  # (B, H, T, d²)
+        doc_ctx = q.new_zeros(B, H, max_docs, d * d)
+        doc_ctx.scatter_add_(2, did_flat, kv_flat)
+
+        # scatter_add: 문서별 key 합 — (B, H, max_docs, d)
+        did_k = did.unsqueeze(-1).expand_as(k)  # (B, H, T, d)
         doc_z = q.new_zeros(B, H, max_docs, d)
+        doc_z.scatter_add_(2, did_k, k)
 
-        for doc in range(max_docs):
-            mask = (doc_ids == doc).view(B, 1, T, 1)  # (B, 1, T, 1)
-            k_d = k * mask.to(k.dtype)   # 다른 문서 토큰 0으로 마스킹
-            v_d = v * mask.to(v.dtype)
-            doc_ctx[:, :, doc] = torch.matmul(k_d.transpose(-1, -2), v_d)
-            doc_z[:, :, doc] = k_d.sum(dim=-2)
+        # gather: 각 토큰의 문서 context — (B, H, T, d²)
+        tok_ctx = doc_ctx.gather(2, did_flat)  # (B, H, T, d²)
+        tok_ctx = tok_ctx.view(B, H, T, d, d)
 
-        # 각 토큰이 자기 문서의 context를 참조
-        # did_flat: (B, H, T) — 각 토큰의 문서 ID
-        did_flat = doc_ids.view(B, 1, T).expand(B, H, T)
-
-        # gather context: (B, H, T, d, d) — 각 토큰의 문서별 context
-        ctx_idx = did_flat.view(B, H, T, 1, 1).expand(B, H, T, d, d)
-        tok_ctx = doc_ctx.gather(2, ctx_idx)  # (B, H, T, d, d)
-
-        # gather z: (B, H, T, d)
-        z_idx = did_flat.view(B, H, T, 1).expand(B, H, T, d)
-        tok_z = doc_z.gather(2, z_idx)  # (B, H, T, d)
+        # gather: 각 토큰의 문서 key 합 — (B, H, T, d)
+        tok_z = doc_z.gather(2, did_k)  # (B, H, T, d)
 
         # Q @ context: (B, H, T, d)
         num = torch.einsum("bhtd,bhtde->bhte", q, tok_ctx)
-        den = torch.einsum("bhtd,bhtd->bht", q, tok_z)
+        den = (q * tok_z).sum(dim=-1)  # (B, H, T)
 
         return num / (den.unsqueeze(-1) + self.eps)

@@ -86,14 +86,14 @@ EDITOR_CONFIGS = {
     "128M": dict(
         d_model=384, n_rwkv_layers=10,
         d_inner=384, n_heads=12, headdim=32,
-        d_ff=512, n_experts=16, top_k=4, capacity_factor=3.0,
+        d_ff=512, n_experts=16, top_k=4, capacity_factor=2.0,
         n_attn_heads=24, attn_insertion_points=(3, 7, 9),
         lora_rank=16,
     ),
     "256M": dict(
         d_model=512, n_rwkv_layers=12,
         d_inner=512, n_heads=8, headdim=64,
-        d_ff=768, n_experts=16, top_k=4, capacity_factor=3.0,
+        d_ff=768, n_experts=16, top_k=4, capacity_factor=2.0,
         n_attn_heads=32, attn_insertion_points=(3, 6, 9, 11),
         lora_rank=24,
     ),
