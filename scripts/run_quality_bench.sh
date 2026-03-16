@@ -40,7 +40,7 @@ echo "d_model=${D_MODEL}, seq_len=${SEQ_LEN}, batch=${BATCH_SIZE}×${GRAD_ACCUM}
 echo "max_steps=${MAX_STEPS}, lr=${LR}"
 echo ""
 
-for MIXING in xlstm retnet mamba rwkv tcn; do
+for MIXING in xlstm retnet mamba rwkv tcn fnet mlstm; do
     echo "===== ${MIXING^^} ====="
     LOG_FILE="${SAVE_DIR}/${MIXING}_d${D_MODEL}.log"
     mkdir -p "${SAVE_DIR}"
