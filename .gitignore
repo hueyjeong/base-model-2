@@ -42,6 +42,7 @@ exported/
 
 # Rust build artifacts
 inference/target/
+inference_dense/target/
 
 # Zone.Identifier (WSL)
 *.Zone.Identifier
