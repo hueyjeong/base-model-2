@@ -294,7 +294,7 @@ def train(args):
             model,
             device_ids=[local_rank],
             gradient_as_bucket_view=True,  # gradient 복사 제거 → 메모리 절약 + 속도
-            static_graph=True,             # 통신/계산 오버랩 최적화 (MoE 모듈 set 고정)
+            static_graph=not args.compile,  # compile 시 DDPOptimizer가 static_graph 역할 대체
         )
 
     # torch.compile (DDP 후에 — DDP 래핑 후 compile해야 reducer hook 충돌 방지)
