@@ -22,7 +22,7 @@ MIXING_TYPES = ["xlstm", "mlstm", "rwkv", "retnet", "mamba", "fnet", "tcn"]
 
 def bench_one(mixing_type: str, d_model: int, seq_len: int, batch_size: int,
               max_steps: int, warmup: int, use_bf16: bool, grad_ckpt: bool,
-              target_params: int):
+              target_params: int, use_int8: bool = False):
     """단일 아키텍처 학습 속도 벤치마크"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -31,6 +31,13 @@ def bench_one(mixing_type: str, d_model: int, seq_len: int, batch_size: int,
     model = DenseEditor(cfg).to(device)
     if grad_ckpt:
         model.gradient_checkpointing = True
+    if use_int8:
+        try:
+            from model.cuda_bitlinear import replace_bitlinear_with_cuda
+            model = replace_bitlinear_with_cuda(model)
+        except Exception:
+            from model.triton_bitlinear import replace_bitlinear_with_triton
+            model = replace_bitlinear_with_triton(model)
 
     n_params = sum(p.numel() for p in model.parameters())
 
@@ -102,12 +109,13 @@ def main():
     parser.add_argument("--bf16", action="store_true", default=True)
     parser.add_argument("--grad_ckpt", action="store_true")
     parser.add_argument("--target_params", type=int, default=128_000_000)
+    parser.add_argument("--int8", action="store_true", help="INT8 CUDA BitLinear")
     parser.add_argument("--mixing_types", nargs="+", default=MIXING_TYPES)
     args = parser.parse_args()
 
     print(f"=== DenseEditor GPU 학습 속도 벤치마크 ===")
     print(f"d_model={args.d_model}, seq_len={args.seq_len}, batch={args.batch_size}")
-    print(f"bf16={args.bf16}, grad_ckpt={args.grad_ckpt}, warmup={args.warmup}, steps={args.max_steps}\n")
+    print(f"bf16={args.bf16}, int8={args.int8}, grad_ckpt={args.grad_ckpt}, warmup={args.warmup}, steps={args.max_steps}\n")
 
     print(f"{'Arch':<10} {'d':>4} {'Layers':>6} {'Params':>7} {'Step(ms)':>10} {'tok/s':>8} {'Mem(GB)':>8}")
     print("-" * 60)
@@ -116,7 +124,7 @@ def main():
         try:
             r = bench_one(mt, args.d_model, args.seq_len, args.batch_size,
                           args.max_steps, args.warmup, args.bf16, args.grad_ckpt,
-                          args.target_params)
+                          args.target_params, use_int8=args.int8)
             print(f"{r['mixing_type']:<10} {r['d_model']:>4} {r['n_layers']:>6} "
                   f"{r['n_params']/1e6:>6.1f}M {r['step_ms']:>10.1f} {r['tok_s']:>8.0f} "
                   f"{r['peak_mem_gb']:>8.2f}")

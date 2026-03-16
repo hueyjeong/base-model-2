@@ -57,22 +57,37 @@ class RMSNorm(nn.Module):
 
 
 class BitNetFFN(nn.Module):
-    """BitNet Feed-Forward Network (SwiGLU)
+    """BitNet Feed-Forward Network (ReLU gating)
 
     x → [BitLinear(gate), BitLinear(up)] → relu(gate)*up → BitLinear(down)
-    ReLU gating: sigmoid 대비 CPU 인퍼런스 빠름, ternary weight와 궁합 좋음.
+
+    fused_gate_up=True: gate+up을 1개 BitLinear(d, 2*d_ff)로 처리
+    → 양자화+RMSNorm 1회로 ~30% 가속 (DenseEditor 전용)
     """
 
-    def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1):
+    def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1,
+                 fused_gate_up: bool = False):
         super().__init__()
-        self.gate_proj = BitLinear(d_model, d_ff)
-        self.up_proj = BitLinear(d_model, d_ff)
+        self.d_ff = d_ff
+        self.fused = fused_gate_up
+
+        if fused_gate_up:
+            self.gate_up_proj = BitLinear(d_model, 2 * d_ff)
+        else:
+            self.gate_proj = BitLinear(d_model, d_ff)
+            self.up_proj = BitLinear(d_model, d_ff)
+
         self.down_proj = BitLinear(d_ff, d_model)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_out = self.gate_proj(x)
-        up = self.up_proj(x)
+        if self.fused:
+            gu = self.gate_up_proj(x)
+            gate_out, up = gu.split(self.d_ff, dim=-1)
+        else:
+            gate_out = self.gate_proj(x)
+            up = self.up_proj(x)
+
         x = F.relu(gate_out) * up
         x = self.dropout(x)
         x = self.down_proj(x)

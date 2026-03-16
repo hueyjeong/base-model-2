@@ -45,13 +45,11 @@ class RetentionScan(nn.Module):
         self.n_heads = n_heads
         self.headdim = headdim
 
-        self.q_proj = BitLinear(d_model, d_model)
-        self.k_proj = BitLinear(d_model, d_model)
-        self.v_proj = BitLinear(d_model, d_model)
+        # Fused q,k,v projection (양자화 1회)
+        self.qkv_proj = BitLinear(d_model, 3 * d_model)
         self.o_proj = BitLinear(d_model, d_model)
         self.g_proj = nn.Linear(d_model, d_model, bias=False)
 
-        # Per-head decay (고정)
         gammas = torch.linspace(gamma_min, gamma_max, n_heads)
         self.register_buffer("gammas", gammas)
 
@@ -59,9 +57,11 @@ class RetentionScan(nn.Module):
         B, T, _ = x.shape
         H, D = self.n_heads, self.headdim
 
-        q = self.q_proj(x).view(B, T, H, D)
-        k = self.k_proj(x).view(B, T, H, D)
-        v = self.v_proj(x).view(B, T, H, D)
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.split(H * D, dim=-1)
+        q = q.view(B, T, H, D)
+        k = k.view(B, T, H, D)
+        v = v.view(B, T, H, D)
         g = F.silu(self.g_proj(x)).view(B, T, H, D)
 
         if _FLA_RETENTION and x.is_cuda:
