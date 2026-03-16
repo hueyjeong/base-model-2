@@ -98,7 +98,9 @@ def calc_layer_params(d_model: int, mixing_type: str) -> tuple[int, int, int]:
         (mix_params, ffn_params, total_per_layer)
     """
     d = d_model
-    dff = int(d * 8 / 3) if mixing_type != "fnet" else d * 8  # FNet은 FFN 키움
+    # 전 아키텍처 동일 FFN 비율 (8/3 ≈ 2.66x)
+    # FNet은 mixing=0이므로 FFN을 키우는 대신 레이어를 늘려 FFT 반복이 더 효과적
+    dff = int(d * 8 / 3)
 
     nmix = MIXING_PROJ_COUNT[mixing_type]
     if mixing_type == "mamba":
@@ -133,7 +135,7 @@ def make_config(
 ) -> DenseEditorConfig:
     """d_model과 mixing_type으로 128M 설정 자동 생성"""
     n_layers = calc_n_layers(d_model, mixing_type, target_params)
-    dff = int(d_model * 8 / 3) if mixing_type != "fnet" else d_model * 8
+    dff = int(d_model * 8 / 3)
     n_heads = d_model // 32
     headdim = 32
 
