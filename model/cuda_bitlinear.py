@@ -533,24 +533,27 @@ class Int8LinearCuda(nn.Module):
 
 
 def replace_bitlinear_with_cuda(model: nn.Module) -> nn.Module:
-    from model.bitlinear import BitLinear, Int8Linear
+    """BitLinear → BitLinearCuda 교체 (INT8 matmul 가속)
 
-    bit_replacements = []
-    int8_replacements = []
+    Int8Linear는 교체하지 않음 — torch.compile이 순수 PyTorch ops를 자동 최적화.
+    DDP + compile 환경에서 custom autograd.Function 충돌 방지.
+    """
+    from model.bitlinear import BitLinear
+
+    replacements = []
     for name, module in model.named_modules():
-        if isinstance(module, Int8Linear):
-            int8_replacements.append(name)
-        elif isinstance(module, BitLinear):
-            bit_replacements.append(name)
+        if isinstance(module, BitLinear):
+            replacements.append(name)
 
-    def _replace(name, cls_new):
+    for name in replacements:
         parts = name.split(".")
         parent = model
         for part in parts[:-1]:
             parent = getattr(parent, part)
+
         old = getattr(parent, parts[-1])
         old_device = old.weight.device
-        new = cls_new(old.in_features, old.out_features, bias=old.bias is not None)
+        new = BitLinearCuda(old.in_features, old.out_features, bias=old.bias is not None)
         new.weight.data.copy_(old.weight.data)
         if old.bias is not None:
             new.bias.data.copy_(old.bias.data)
@@ -558,12 +561,5 @@ def replace_bitlinear_with_cuda(model: nn.Module) -> nn.Module:
         new = new.to(old_device)
         setattr(parent, parts[-1], new)
 
-    for name in bit_replacements:
-        _replace(name, BitLinearCuda)
-    for name in int8_replacements:
-        _replace(name, Int8LinearCuda)
-
-    print(f"[BitLinearCuda] Replaced {len(bit_replacements)} BitLinear layers")
-    if int8_replacements:
-        print(f"[Int8LinearCuda] Replaced {len(int8_replacements)} Int8Linear layers")
+    print(f"[BitLinearCuda] Replaced {len(replacements)} BitLinear layers")
     return model
