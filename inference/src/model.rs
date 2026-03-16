@@ -178,10 +178,9 @@ fn softplus_scalar(x: f32) -> f32 {
 }
 
 #[inline(always)]
-fn gelu1p_scalar(x: f32) -> f32 {
-    let x3 = x * x * x;
-    let inner = (x + 0.044715 * x3) * 0.7978845608;
-    x * 0.5 * (1.0 + inner.tanh()) + 1.0
+fn relu1p_scalar(x: f32) -> f32 {
+    // relu(x) + 1.0 — Linear attention feature map (양수 보장)
+    if x > 0.0 { x + 1.0 } else { 1.0 }
 }
 
 #[inline(always)]
@@ -215,16 +214,19 @@ impl RMSNorm {
     }
 }
 
-// ── RMSNorm (elementwise_affine=False, BitLinear 내부용) ─
+// ── LayerNorm (elementwise_affine=False, BitLinear/Int8Linear 내부용) ─
 
 #[inline]
-fn rms_norm_no_affine_vec(x: &[f32], out: &mut [f32], eps: f32) {
+fn layer_norm_no_affine_vec(x: &[f32], out: &mut [f32], eps: f32) {
     let n = x.len();
-    let mut sq_sum = 0.0f32;
-    for &v in x { sq_sum += v * v; }
-    let rms_inv = (sq_sum / n as f32 + eps).sqrt().recip();
+    let mut mean = 0.0f32;
+    for &v in x { mean += v; }
+    mean /= n as f32;
+    let mut var = 0.0f32;
+    for &v in x { let d = v - mean; var += d * d; }
+    let inv_std = (var / n as f32 + eps).sqrt().recip();
     for i in 0..n {
-        out[i] = x[i] * rms_inv;
+        out[i] = (x[i] - mean) * inv_std;
     }
 }
 
@@ -272,7 +274,7 @@ impl BitLinear {
         let n = self.in_dim;
 
         // 1. RMSNorm (BitLinear 내부 — 평균 빼기 없이 RMS만)
-        rms_norm_no_affine_vec(x, &mut x_norm[..n], 1e-5);
+        layer_norm_no_affine_vec(x, &mut x_norm[..n], 1e-5);
 
         // 2. f32 → u8 양자화
         let x_scale = unsafe {
@@ -314,7 +316,7 @@ impl BitLinear {
         // 1. 토큰별 RMSNorm
         x_norm_buf.resize(seq_len * k, 0.0);
         for t in 0..seq_len {
-            rms_norm_no_affine_vec(
+            layer_norm_no_affine_vec(
                 &x[t * k..(t + 1) * k],
                 &mut x_norm_buf[t * k..(t + 1) * k],
                 1e-5,
@@ -360,10 +362,20 @@ pub struct Linear {
     row_sums: Vec<i32>,
     out_dim: usize,
     in_dim: usize,
+    with_norm: bool,  // Int8Linear → true (내부 LayerNorm 적용)
 }
 
 impl Linear {
     pub fn load_bmmq(tensors: &mut HashMap<String, TensorData>, prefix: &str) -> Result<Self> {
+        Self::load_bmmq_opt(tensors, prefix, false)
+    }
+
+    /// Int8Linear로 로드 (내부 LayerNorm 포함)
+    pub fn load_bmmq_normed(tensors: &mut HashMap<String, TensorData>, prefix: &str) -> Result<Self> {
+        Self::load_bmmq_opt(tensors, prefix, true)
+    }
+
+    fn load_bmmq_opt(tensors: &mut HashMap<String, TensorData>, prefix: &str, with_norm: bool) -> Result<Self> {
         let key = format!("{}.weight", prefix);
         match tensors.remove(&key).context(format!("Linear weight 없음: {}", key))? {
             TensorData::I8Quantized { data, row_scales, row_sums, rows, cols } => {
@@ -373,6 +385,7 @@ impl Linear {
                     row_sums,
                     out_dim: rows,
                     in_dim: cols,
+                    with_norm,
                 })
             }
             _ => bail!("Linear은 I8Quantized 타입이어야 함: {}", key),
@@ -384,6 +397,16 @@ impl Linear {
         let n = self.in_dim;
         let x_scale = unsafe {
             quantize_f32_to_u8(x.as_ptr(), x_u8.as_mut_ptr(), n as c_int)
+        };
+        self.matmul_preq(x_u8, x_scale, out);
+    }
+
+    /// Int8Linear용: LayerNorm → quantize → matmul (norm 버퍼 필요)
+    fn forward_vec_normed(&self, x: &[f32], out: &mut [f32], x_norm: &mut [f32], x_u8: &mut [u8]) {
+        let n = self.in_dim;
+        layer_norm_no_affine_vec(x, &mut x_norm[..n], 1e-5);
+        let x_scale = unsafe {
+            quantize_f32_to_u8(x_norm.as_ptr(), x_u8.as_mut_ptr(), n as c_int)
         };
         self.matmul_preq(x_u8, x_scale, out);
     }
@@ -440,7 +463,7 @@ impl Linear {
     }
 }
 
-// ── BitNetFFN (Sigmoid-Gated) ────────────────────────
+// ── BitNetFFN (ReLU-Gated) ───────────────────────────
 
 pub struct BitNetFFN {
     gate_proj: BitLinear,
@@ -468,16 +491,16 @@ impl BitNetFFN {
         buf_ff2.resize(self.d_ff, 0.0);
 
         // gate/up은 같은 입력 → RMSNorm+quantize 1회 공유
-        rms_norm_no_affine_vec(x, &mut x_norm_buf[..n], 1e-5);
+        layer_norm_no_affine_vec(x, &mut x_norm_buf[..n], 1e-5);
         let x_scale = unsafe {
             quantize_f32_to_u8(x_norm_buf.as_ptr(), x_u8.as_mut_ptr(), n as c_int)
         };
         self.gate_proj.matmul_preq(&x_u8[..n], x_scale, buf_ff);
         self.up_proj.matmul_preq(&x_u8[..n], x_scale, buf_ff2);
 
-        // sigmoid(gate) * up → reuse buf_ff
+        // relu(gate) * up → reuse buf_ff
         for i in 0..self.d_ff {
-            buf_ff[i] = sigmoid_scalar(buf_ff[i]) * buf_ff2[i];
+            buf_ff[i] = buf_ff[i].max(0.0) * buf_ff2[i];
         }
 
         self.down_proj.forward_vec(buf_ff, out, x_norm_buf, x_u8);
@@ -491,7 +514,7 @@ struct RWKV6TimeMix {
     k_proj: BitLinear,
     v_proj: BitLinear,
     o_proj: BitLinear,
-    g_proj: Linear,       // gate
+    g_proj: Linear,       // gate (Int8Linear — 내부 LayerNorm)
     u: Vec<f32>,          // (n_heads * headdim,) in-context bonus
     w_base: Vec<f32>,     // (n_heads * headdim,)
     w_lora_down: Linear,  // (d_model -> w_lora_rank)
@@ -520,7 +543,7 @@ impl RWKV6TimeMix {
             k_proj: BitLinear::load_bmmq(tensors, &format!("{}.k_proj", prefix))?,
             v_proj: BitLinear::load_bmmq(tensors, &format!("{}.v_proj", prefix))?,
             o_proj: BitLinear::load_bmmq(tensors, &format!("{}.o_proj", prefix))?,
-            g_proj: Linear::load_bmmq(tensors, &format!("{}.g_proj", prefix))?,
+            g_proj: Linear::load_bmmq_normed(tensors, &format!("{}.g_proj", prefix))?,
             u: bmmq_take_f32(tensors, &format!("{}.u", prefix))?,
             w_base: bmmq_take_f32(tensors, &format!("{}.w_base", prefix))?,
             w_lora_down,
@@ -556,7 +579,7 @@ impl RWKV6TimeMix {
             let x_t = &x[t * d..(t + 1) * d];
 
             // r/k/v는 동일 입력에 대해 RMSNorm+quantize 1회만 수행 → matmul 3회 공유
-            rms_norm_no_affine_vec(x_t, &mut bufs.x_norm[..d], 1e-5);
+            layer_norm_no_affine_vec(x_t, &mut bufs.x_norm[..d], 1e-5);
             let x_scale = unsafe {
                 quantize_f32_to_u8(bufs.x_norm.as_ptr(), bufs.x_u8.as_mut_ptr(), d as c_int)
             };
@@ -564,9 +587,9 @@ impl RWKV6TimeMix {
             self.k_proj.matmul_preq(&bufs.x_u8[..d], x_scale, &mut bufs.k[t * d..(t + 1) * d]);
             self.v_proj.matmul_preq(&bufs.x_u8[..d], x_scale, &mut bufs.v[t * d..(t + 1) * d]);
 
-            // g_proj는 Linear (RMSNorm 없이 직접 quantize) — x_t로 별도 양자화
-            self.g_proj.forward_vec(x_t, &mut bufs.g[t * d..(t + 1) * d],
-                                    &mut bufs.x_u8);
+            // g_proj는 Int8Linear (내부 LayerNorm 포함)
+            self.g_proj.forward_vec_normed(x_t, &mut bufs.g[t * d..(t + 1) * d],
+                                            &mut bufs.x_norm, &mut bufs.x_u8);
         }
 
         // Data-dependent decay: 토큰별 (w_lora 입력 의존)
@@ -785,7 +808,7 @@ impl BiRWKV {
             self.forward_rwkv.r_proj.forward_vec(x_t, &mut fwd_bufs.r[t*d..(t+1)*d], &mut fwd_bufs.x_norm, &mut fwd_bufs.x_u8);
             self.forward_rwkv.k_proj.forward_vec(x_t, &mut fwd_bufs.k[t*d..(t+1)*d], &mut fwd_bufs.x_norm, &mut fwd_bufs.x_u8);
             self.forward_rwkv.v_proj.forward_vec(x_t, &mut fwd_bufs.v[t*d..(t+1)*d], &mut fwd_bufs.x_norm, &mut fwd_bufs.x_u8);
-            self.forward_rwkv.g_proj.forward_vec(x_t, &mut fwd_bufs.g[t*d..(t+1)*d], &mut fwd_bufs.x_u8);
+            self.forward_rwkv.g_proj.forward_vec_normed(x_t, &mut fwd_bufs.g[t*d..(t+1)*d], &mut fwd_bufs.x_norm, &mut fwd_bufs.x_u8);
             // w_lora
             fwd_bufs.lora_down.resize(self.forward_rwkv.w_lora_rank, 0.0);
             self.forward_rwkv.w_lora_down.forward_vec(x_t, &mut fwd_bufs.lora_down, &mut fwd_bufs.x_u8);
@@ -859,14 +882,14 @@ impl BiRWKV {
         for t in 0..seq_len {
             let x_t = &x_rev[t * d..(t + 1) * d];
             // r/k/v 양자화 공유
-            rms_norm_no_affine_vec(x_t, &mut bwd_bufs.x_norm[..d], 1e-5);
+            layer_norm_no_affine_vec(x_t, &mut bwd_bufs.x_norm[..d], 1e-5);
             let x_scale = unsafe {
                 quantize_f32_to_u8(bwd_bufs.x_norm.as_ptr(), bwd_bufs.x_u8.as_mut_ptr(), d as c_int)
             };
             self.backward_rwkv.r_proj.matmul_preq(&bwd_bufs.x_u8[..d], x_scale, &mut bwd_bufs.r[t*d..(t+1)*d]);
             self.backward_rwkv.k_proj.matmul_preq(&bwd_bufs.x_u8[..d], x_scale, &mut bwd_bufs.k[t*d..(t+1)*d]);
             self.backward_rwkv.v_proj.matmul_preq(&bwd_bufs.x_u8[..d], x_scale, &mut bwd_bufs.v[t*d..(t+1)*d]);
-            self.backward_rwkv.g_proj.forward_vec(x_t, &mut bwd_bufs.g[t*d..(t+1)*d], &mut bwd_bufs.x_u8);
+            self.backward_rwkv.g_proj.forward_vec_normed(x_t, &mut bwd_bufs.g[t*d..(t+1)*d], &mut bwd_bufs.x_norm, &mut bwd_bufs.x_u8);
             bwd_bufs.lora_down.resize(self.backward_rwkv.w_lora_rank, 0.0);
             self.backward_rwkv.w_lora_down.forward_vec(x_t, &mut bwd_bufs.lora_down, &mut bwd_bufs.x_u8);
             for v in bwd_bufs.lora_down.iter_mut() { *v = v.tanh(); }
@@ -1006,7 +1029,7 @@ impl MoEBitNetFFN {
 
             // gate/up 입력 양자화 1회 → 별도 버퍼에 저장 (down_proj가 덮어쓰지 않도록)
             let n = d_model;
-            rms_norm_no_affine_vec(x_t, &mut bufs.x_norm[..n], 1e-5);
+            layer_norm_no_affine_vec(x_t, &mut bufs.x_norm[..n], 1e-5);
             bufs.x_scale_shared = unsafe {
                 quantize_f32_to_u8(bufs.x_norm.as_ptr(), bufs.x_u8_shared.as_mut_ptr(), n as c_int)
             };
@@ -1022,7 +1045,7 @@ impl MoEBitNetFFN {
                 expert.up_proj.matmul_preq(&bufs.x_u8_shared[..n], bufs.x_scale_shared, &mut bufs.ff2);
 
                 for i in 0..expert.d_ff {
-                    bufs.ff1[i] = sigmoid_scalar(bufs.ff1[i]) * bufs.ff2[i];
+                    bufs.ff1[i] = bufs.ff1[i].max(0.0) * bufs.ff2[i];
                 }
 
                 // down_proj는 x_u8(일반 버퍼)를 사용 — x_u8_shared는 보존됨
@@ -1119,10 +1142,10 @@ impl SharedLinearSelfAttention {
         n_layers: usize,  // LoRA 레이어 수 (삽입 포인트 수)
     ) -> Result<Self> {
         let d_model = n_heads * d_head;
-        let q_proj = Linear::load_bmmq(tensors, &format!("{}.q_proj", prefix))?;
-        let k_proj = Linear::load_bmmq(tensors, &format!("{}.k_proj", prefix))?;
-        let v_proj = Linear::load_bmmq(tensors, &format!("{}.v_proj", prefix))?;
-        let o_proj = Linear::load_bmmq(tensors, &format!("{}.o_proj", prefix))?;
+        let q_proj = Linear::load_bmmq_normed(tensors, &format!("{}.q_proj", prefix))?;
+        let k_proj = Linear::load_bmmq_normed(tensors, &format!("{}.k_proj", prefix))?;
+        let v_proj = Linear::load_bmmq_normed(tensors, &format!("{}.v_proj", prefix))?;
+        let o_proj = Linear::load_bmmq_normed(tensors, &format!("{}.o_proj", prefix))?;
 
         let mut lora_q = Vec::with_capacity(n_layers);
         let mut lora_k = Vec::with_capacity(n_layers);
@@ -1165,9 +1188,10 @@ impl SharedLinearSelfAttention {
         for t in 0..seq_len {
             let x_t = &x[t * d..(t + 1) * d];
 
-            // q/k/v는 같은 입력 → quantize 1회 공유
+            // q/k/v는 Int8Linear → LayerNorm+quantize 1회 공유
+            layer_norm_no_affine_vec(x_t, &mut bufs.x_norm[..d], 1e-5);
             let x_scale = unsafe {
-                quantize_f32_to_u8(x_t.as_ptr(), bufs.x_u8.as_mut_ptr(), d as c_int)
+                quantize_f32_to_u8(bufs.x_norm.as_ptr(), bufs.x_u8.as_mut_ptr(), d as c_int)
             };
             self.q_proj.matmul_preq(&bufs.x_u8[..d], x_scale, &mut bufs.q[t * d..(t + 1) * d]);
             self.k_proj.matmul_preq(&bufs.x_u8[..d], x_scale, &mut bufs.k[t * d..(t + 1) * d]);
@@ -1189,8 +1213,8 @@ impl SharedLinearSelfAttention {
         }
 
         // gelu1p feature map on Q and K
-        for v in bufs.q.iter_mut() { *v = gelu1p_scalar(*v); }
-        for v in bufs.k.iter_mut() { *v = gelu1p_scalar(*v); }
+        for v in bufs.q.iter_mut() { *v = relu1p_scalar(*v); }
+        for v in bufs.k.iter_mut() { *v = relu1p_scalar(*v); }
 
         // O(N) linear self-attention per head:
         // context[h] = K[h]^T @ V[h]  →  (dh, dh)
@@ -1261,7 +1285,8 @@ impl SharedLinearSelfAttention {
         bufs.final_out.resize(seq_len * d, 0.0);
         for t in 0..seq_len {
             let o_t = &bufs.output[t * d..(t + 1) * d];
-            self.o_proj.forward_vec(o_t, &mut bufs.final_out[t * d..(t + 1) * d], &mut bufs.x_u8);
+            self.o_proj.forward_vec_normed(o_t, &mut bufs.final_out[t * d..(t + 1) * d],
+                                            &mut bufs.x_norm, &mut bufs.x_u8);
 
             if lora_idx < self.lora_o.len() {
                 bufs.lora_out.resize(d, 0.0);
@@ -1285,6 +1310,7 @@ struct AttnBufs {
     z: Vec<f32>,
     lora_out: Vec<f32>,
     lora_buf: Vec<f32>,
+    x_norm: Vec<f32>,  // Int8Linear 내부 LayerNorm용
     x_u8: Vec<u8>,
 }
 
@@ -1300,6 +1326,7 @@ impl AttnBufs {
             z: Vec::new(),
             lora_out: Vec::new(),
             lora_buf: Vec::new(),
+            x_norm: vec![0.0; max_in_dim],
             x_u8: vec![0u8; max_in_dim],
         }
     }
@@ -1564,16 +1591,19 @@ impl BitEditor {
             }
 
             // 4. Tag head: 토큰별 tag logits 계산
+            // tag_head는 Int8Linear → LayerNorm 적용 필요
             let mut x_u8 = vec![0u8; d];
+            let mut tag_norm = vec![0.0f32; d];
             let mut tag_logits = vec![0.0f32; n_tags];
             let mut tags = Vec::with_capacity(cur_len);
 
             for t in 0..cur_len {
                 let h_t = &normed[t * d..(t + 1) * d];
 
-                // i8 matmul for tag head
+                // Int8Linear 내부 LayerNorm → quantize → sgemv
+                layer_norm_no_affine_vec(h_t, &mut tag_norm, 1e-5);
                 let x_scale = unsafe {
-                    quantize_f32_to_u8(h_t.as_ptr(), x_u8.as_mut_ptr(), d as c_int)
+                    quantize_f32_to_u8(tag_norm.as_ptr(), x_u8.as_mut_ptr(), d as c_int)
                 };
                 unsafe {
                     i8_sgemv(
@@ -1712,11 +1742,13 @@ impl BitEditor {
             }
         }
         let mut x_u8 = vec![0u8; d];
+        let mut tag_norm = vec![0.0f32; d];
         let mut tag_logits = vec![0.0f32; n_tags];
         let mut tags = Vec::with_capacity(cur_len);
         for t in 0..cur_len {
             let h_t = &normed[t * d..(t + 1) * d];
-            let x_scale = unsafe { quantize_f32_to_u8(h_t.as_ptr(), x_u8.as_mut_ptr(), d as c_int) };
+            layer_norm_no_affine_vec(h_t, &mut tag_norm, 1e-5);
+            let x_scale = unsafe { quantize_f32_to_u8(tag_norm.as_ptr(), x_u8.as_mut_ptr(), d as c_int) };
             unsafe {
                 i8_sgemv(self.tag_head_w.as_ptr(), x_u8.as_ptr(), tag_logits.as_mut_ptr(),
                          n_tags as c_int, d as c_int, self.tag_head_sums.as_ptr(),
