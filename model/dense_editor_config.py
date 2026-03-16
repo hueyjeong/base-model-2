@@ -1,8 +1,8 @@
 """DenseEditor 설정 (Config)
 
 Dense (MoE 없음) 인코더-only 편집 태깅 모델의 하이퍼파라미터 관리.
-d_model=256 고정 (L1 캐시 적중), mixing_type에 따라 depth 가변.
-CPU 인퍼런스 최적화 목적.
+mixing_type에 따라 depth 자동 계산 (128M 파라미터 타겟).
+CPU 인퍼런스 벤치마크 결과 d_model=640이 스위트스팟.
 """
 from __future__ import annotations
 
@@ -12,17 +12,7 @@ from dataclasses import dataclass, asdict, field
 
 @dataclass
 class DenseEditorConfig:
-    """DenseEditor 모델 설정
-
-    Attributes:
-        d_model: 모델 히든 차원 (256 고정 — 64KB weight → L1 적중)
-        n_layers: 레이어 수 (mixing_type별 가변)
-        d_ff: BitNetFFN 중간 차원
-        vocab_size: 토크나이저 어휘 크기
-        n_tags: 편집 태그 수 (2 + 2*vocab_size)
-        max_seq_len: 최대 시퀀스 길이
-        mixing_type: mixing layer 종류
-    """
+    """DenseEditor 모델 설정"""
     # 모델 차원
     d_model: int = 256
     n_layers: int = 46
@@ -82,51 +72,84 @@ class DenseEditorConfig:
             f"headdim({self.headdim})은 d_model//n_heads({self.d_model // self.n_heads})이어야 함"
         assert self.n_tags == 2 + 2 * self.vocab_size, \
             f"n_tags({self.n_tags})는 2 + 2*vocab_size({2 + 2 * self.vocab_size})이어야 함"
-        valid_types = {"mamba", "fnet", "tcn", "rwkv", "retnet", "xlstm"}
+        valid_types = {"mamba", "fnet", "tcn", "rwkv", "retnet", "xlstm", "mlstm"}
         assert self.mixing_type in valid_types, \
             f"mixing_type '{self.mixing_type}'은 {valid_types} 중 하나여야 함"
 
 
-# ── 128M 파라미터 프리셋 (d_model=256 고정, depth 가변) ──
+# ── mixing layer별 projection 수 (양방향 기준) ──
 
-DENSE_128M_PRESETS: dict[str, dict] = {
-    # per-layer: ~1.57M (FFN만, mixing 파라미터 없음)
-    "fnet": dict(
-        d_model=256, n_layers=80, d_ff=2048,
-        mixing_type="fnet",
-    ),
-    # per-layer: ~601K (depthwise conv + pointwise BitLinear + FFN)
-    "tcn": dict(
-        d_model=256, n_layers=213, d_ff=682,
-        mixing_type="tcn",
-        tcn_kernel_size=7, tcn_n_dilations=6,
-    ),
-    # per-layer: ~1.40M → 128M/1.40M ≈ 91 layers
-    "mamba": dict(
-        d_model=256, n_layers=91, d_ff=682,
-        mixing_type="mamba",
-        mamba_d_state=16, mamba_d_conv=4, mamba_expand=2,
-    ),
-    # per-layer: ~1.20M → 128M/1.20M ≈ 107 layers
-    "rwkv": dict(
-        d_model=256, n_layers=107, d_ff=682,
-        mixing_type="rwkv",
-    ),
-    # per-layer: ~1.18M → 128M/1.18M ≈ 108 layers
-    "retnet": dict(
-        d_model=256, n_layers=108, d_ff=682,
-        mixing_type="retnet",
-    ),
-    # per-layer: ~1.05M → 128M/1.05M ≈ 122 layers
-    "xlstm": dict(
-        d_model=256, n_layers=122, d_ff=682,
-        mixing_type="xlstm",
-    ),
+# (방향당 proj 수, output proj 포함 여부)
+MIXING_PROJ_COUNT: dict[str, int] = {
+    "fnet": 0,     # mixing 파라미터 없음
+    "tcn": 1,      # 1 pointwise proj (depthwise는 작음)
+    "rwkv": 5,     # r,k,v,o,g (양방향 각각)
+    "retnet": 5,   # q,k,v,o,g
+    "mamba": 0,    # 특수 (in_proj 2x width)
+    "xlstm": 4,    # i,f,z,o
+    "mlstm": 5,    # q,k,v,i,f
 }
 
 
+def calc_layer_params(d_model: int, mixing_type: str) -> tuple[int, int, int]:
+    """아키텍처별 레이어당 파라미터 수 계산
+
+    Returns:
+        (mix_params, ffn_params, total_per_layer)
+    """
+    d = d_model
+    dff = int(d * 8 / 3) if mixing_type != "fnet" else d * 8  # FNet은 FFN 키움
+
+    nmix = MIXING_PROJ_COUNT[mixing_type]
+    if mixing_type == "mamba":
+        di = d * 2  # expand=2
+        ds = 16
+        dtr = max(d // 16, 1)
+        # 양방향: 2 × (in_proj + out_proj + x_proj + dt_proj)
+        mix_params = 2 * (d * 2 * di + di * d + (dtr + 2 * ds) * di + dtr * di)
+    elif mixing_type == "tcn":
+        mix_params = d * 7 * 6 + d * d  # 6 depthwise + 1 pointwise
+    else:
+        # 양방향: 2 × nmix × d² + output d²
+        mix_params = 2 * nmix * d * d + d * d
+
+    ffn_params = 3 * d * dff  # gate + up + down
+    total = mix_params + ffn_params + 2 * d  # + norms
+    return mix_params, ffn_params, total
+
+
+def calc_n_layers(d_model: int, mixing_type: str, target_params: int = 128_000_000) -> int:
+    """128M 파라미터 타겟에 맞는 레이어 수 계산"""
+    overhead = 303 * d_model + 608 * d_model + d_model  # embedding + tag_head + norm
+    _, _, per_layer = calc_layer_params(d_model, mixing_type)
+    return max(1, (target_params - overhead) // per_layer)
+
+
+def make_config(
+    mixing_type: str,
+    d_model: int = 640,
+    target_params: int = 128_000_000,
+    **overrides,
+) -> DenseEditorConfig:
+    """d_model과 mixing_type으로 128M 설정 자동 생성"""
+    n_layers = calc_n_layers(d_model, mixing_type, target_params)
+    dff = int(d_model * 8 / 3) if mixing_type != "fnet" else d_model * 8
+    n_heads = d_model // 32
+    headdim = 32
+
+    kwargs = dict(
+        d_model=d_model,
+        n_layers=n_layers,
+        d_ff=dff,
+        mixing_type=mixing_type,
+        n_heads=n_heads,
+        headdim=headdim,
+    )
+    kwargs.update(overrides)
+    return DenseEditorConfig(**kwargs)
+
+
+# 하위 호환: d=256 프리셋
 def make_preset(mixing_type: str) -> DenseEditorConfig:
-    """미리 정의된 128M 프리셋에서 설정 생성"""
-    if mixing_type not in DENSE_128M_PRESETS:
-        raise ValueError(f"알 수 없는 프리셋: {mixing_type}. 가능: {list(DENSE_128M_PRESETS)}")
-    return DenseEditorConfig(**DENSE_128M_PRESETS[mixing_type])
+    """d=256 128M 프리셋 (하위 호환)"""
+    return make_config(mixing_type, d_model=256)
