@@ -36,20 +36,26 @@ class BiRWKV(nn.Module):
         self.forward_rwkv._init_weights()
         self.backward_rwkv._init_weights()
 
-    def forward(self, x: torch.Tensor, pad_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor,
+        pad_mask: torch.Tensor | None = None,
+        reset_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
         Args:
             x: (B, T, d_model)
             pad_mask: (B, T) bool — True가 유효 데이터 (PAD 위치 처리용)
+            reset_mask: (B, T) bool — True = BOS 위치 (RWKV state 리셋)
         Returns:
             (B, T, d_model)
         """
         # Forward 방향: 좌 → 우
-        fwd_out = self.forward_rwkv(x)
+        fwd_out = self.forward_rwkv(x, reset_mask=reset_mask)
 
         # Backward 방향: 우 → 좌 (시간 축 역순)
         x_rev = x.flip(1)
-        bwd_out = self.backward_rwkv(x_rev)
+        bwd_reset = reset_mask.flip(1) if reset_mask is not None else None
+        bwd_out = self.backward_rwkv(x_rev, reset_mask=bwd_reset)
         bwd_out = bwd_out.flip(1)
 
         # 융합: element-wise addition

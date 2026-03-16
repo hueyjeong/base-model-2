@@ -221,3 +221,51 @@ class BatchedBitLinear(nn.Module):
             f"out_features={self.out_features}, "
             f"quant=1.58bit_batched"
         )
+
+
+class Int8Linear(nn.Linear):
+    """INT8 Weight QAT Linear — CPU 인퍼런스 최적화
+
+    BitLinear(ternary 1.58bit)보다 정밀하지만 FP보다 빠른 중간 양자화.
+
+    학습 시:
+        - FP weight 유지, 순전파에서 INT8 양자화 + STE
+        - activation도 INT8 per-token absmax 양자화
+    CPU 인퍼런스 시:
+        - INT8 weight 고정 저장 → VNNI/AMX 가속
+    """
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = False):
+        super().__init__(in_features, out_features, bias=bias)
+        self.norm = nn.LayerNorm(in_features, elementwise_affine=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # LayerNorm (BitLinear과 동일한 sub-layer norm)
+        x = self.norm(x)
+
+        # Activation: per-token absmax → INT8 + STE
+        Qb = 127.0
+        x_eta = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-5)
+        x_scaled = x * Qb / x_eta
+        x_quant = _ste_round(x_scaled.clamp(-128.0, 127.0))
+        x_scale = x_eta / Qb
+
+        # Weight: per-tensor absmax → INT8 + STE
+        w_eta = self.weight.abs().max().clamp(min=1e-5)
+        w_scaled = self.weight * Qb / w_eta
+        w_quant = _ste_round(w_scaled.clamp(-128.0, 127.0))
+        w_scale = w_eta / Qb
+
+        # STE 재연결
+        w_ste = self.weight + (w_quant * w_scale - self.weight).detach()
+        x_ste = x + (x_quant * x_scale - x).detach()
+
+        return F.linear(x_ste, w_ste, self.bias)
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_features={self.in_features}, "
+            f"out_features={self.out_features}, "
+            f"bias={self.bias is not None}, "
+            f"quant=int8_qat"
+        )

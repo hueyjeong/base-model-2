@@ -166,7 +166,11 @@ class EditorDataset(IterableDataset):
                     line_idx += 1
 
     def _tokenize_pair(self, text: str, lang: str | None):
-        """텍스트 → (noised_ids, edit_tags, original_ids) 변환 (패딩 없음)"""
+        """텍스트 → (noised_ids, edit_tags, original_ids) 변환 (패딩 없음)
+
+        BOS/EOS로 감싸서 문서 경계를 표시한다.
+        RWKV state 리셋 + SharedLinearSelfAttention 문서 격리에 사용.
+        """
         if lang is None:
             lang = self.noiser._detect_lang(text)
 
@@ -179,11 +183,20 @@ class EditorDataset(IterableDataset):
         if not noised_ids:
             return None
 
-        # 최대 길이 제한 (개별 문장이 max_seq_len 초과 시)
-        noised_ids = noised_ids[:self.max_seq_len]
-        original_ids = original_ids[:self.max_seq_len]
+        # 최대 길이 제한 (BOS/EOS 2토큰 여유 확보)
+        max_content = self.max_seq_len - 2
+        noised_ids = noised_ids[:max_content]
+        original_ids = original_ids[:max_content]
 
         tags = compute_edit_tags(noised_ids, original_ids, self.vocab_size)
+
+        # BOS/EOS 감싸기 — 문서 경계 표시
+        bos_id = self.tokenizer.bos_id
+        eos_id = self.tokenizer.eos_id
+        noised_ids = [bos_id] + noised_ids + [eos_id]
+        tags = [TAG_KEEP] + tags + [TAG_KEEP]
+        original_ids = [bos_id] + original_ids + [eos_id]
+
         return noised_ids, tags, original_ids
 
     def _make_padded_sample(self, noised_ids, tags, original_ids, text_len):

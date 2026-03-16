@@ -22,6 +22,7 @@ from torch.utils.checkpoint import checkpoint
 
 from model.editor_config import BitEditorConfig
 from model.encoder import RMSNorm
+from model.bitlinear import Int8Linear
 from model.bi_rwkv import BiRWKV
 from model.moe import MoEBitNetFFN
 from model.shared_attention import SharedLinearSelfAttention
@@ -47,18 +48,20 @@ class BitEditorLayer(nn.Module):
             n_experts=cfg.n_experts,
             top_k=cfg.top_k,
             dropout=cfg.dropout,
+            capacity_factor=cfg.capacity_factor,
         )
         self.dropout = nn.Dropout(cfg.dropout)
 
     def forward(
-        self, x: torch.Tensor, pad_mask: torch.Tensor | None = None
+        self, x: torch.Tensor, pad_mask: torch.Tensor | None = None,
+        reset_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
             (output, aux_loss)
         """
         # pre-norm → BiRWKV → residual
-        x = x + self.dropout(self.bi_rwkv(self.norm1(x), pad_mask=pad_mask))
+        x = x + self.dropout(self.bi_rwkv(self.norm1(x), pad_mask=pad_mask, reset_mask=reset_mask))
 
         # pre-norm → MoE FFN → residual
         normed = self.norm2(x)
@@ -112,9 +115,9 @@ class BitEditor(nn.Module):
         # 삽입점 인덱스 매핑 (forward에서 반복 생성 회피)
         self._insertion_map = {pt: idx for idx, pt in enumerate(cfg.attn_insertion_points)}
 
-        # Final norm + tag head
+        # Final norm + tag head (INT8 QAT — CPU 인퍼런스 가속)
         self.final_norm = RMSNorm(cfg.d_model, eps=cfg.rms_norm_eps)
-        self.tag_head = nn.Linear(cfg.d_model, cfg.n_tags)
+        self.tag_head = Int8Linear(cfg.d_model, cfg.n_tags, bias=True)
 
         # 가중치 초기화
         self._init_weights()
@@ -153,23 +156,27 @@ class BitEditor(nn.Module):
         x = self.embedding(input_ids) * self.embed_scale
         x = self.embed_dropout(x)
 
+        # 문서 경계 탐지 (BOS 위치 기반)
+        reset_mask = (input_ids == self.cfg.bos_id)        # (B, T) — BOS 위치
+        doc_ids = reset_mask.int().cumsum(dim=1) - 1       # (B, T) — 문서별 ID
+
         total_aux_loss = x.new_zeros(())
 
         # 레이어 순회
         for i, layer in enumerate(self.layers):
             if self.gradient_checkpointing and self.training:
                 x, aux_loss = checkpoint(
-                    layer, x, pad_mask, use_reentrant=False
+                    layer, x, pad_mask, reset_mask, use_reentrant=False
                 )
             else:
-                x, aux_loss = layer(x, pad_mask=pad_mask)
+                x, aux_loss = layer(x, pad_mask=pad_mask, reset_mask=reset_mask)
             total_aux_loss = total_aux_loss + aux_loss
 
             # Shared Attention 삽입점 확인
             if i in self._insertion_map:
                 ins_idx = self._insertion_map[i]
                 residual = x
-                attn_out = self.shared_attn(x, insertion_idx=ins_idx, pad_mask=pad_mask)
+                attn_out = self.shared_attn(x, insertion_idx=ins_idx, pad_mask=pad_mask, doc_ids=doc_ids)
                 attn_out = self.attn_dropouts[ins_idx](attn_out)
                 x = self.attn_norms[ins_idx](residual + attn_out)
 
