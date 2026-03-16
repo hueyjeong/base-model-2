@@ -50,3 +50,5 @@ inference/target/
 .DS_Store
 Thumbs.db
 corpus/sample_10g.zip
+
+*.bmmq
