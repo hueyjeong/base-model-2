@@ -267,8 +267,12 @@ def train(args):
         model = DDP(
             model,
             device_ids=[local_rank],
-            gradient_as_bucket_view=True,  # gradient 복사 제거 → 메모리 절약 + 속도
-            static_graph=not args.compile,  # compile 시 DDPOptimizer가 static_graph 역할 대체
+            gradient_as_bucket_view=True,
+            # Triton/CUDA custom kernel (@torch.compiler.disable)이 autograd graph를
+            # 변형하므로 static_graph=False + find_unused_parameters=True 필요.
+            # static_graph=True는 PyTorch 2.10에서 custom autograd와 충돌 가능.
+            static_graph=False,
+            find_unused_parameters=True,
         )
 
     # torch.compile (DDP 후에 — DDP 래핑 후 compile해야 reducer hook 충돌 방지)
