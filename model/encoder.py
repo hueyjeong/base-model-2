@@ -5,6 +5,7 @@ Triton fused 커널 자동 감지 → 폴백: 순수 PyTorch.
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from model.bitlinear import BitLinear, BatchedBitLinear
 
@@ -58,8 +59,8 @@ class RMSNorm(nn.Module):
 class BitNetFFN(nn.Module):
     """BitNet Feed-Forward Network (SwiGLU)
 
-    x → [BitLinear(gate), BitLinear(up)] → sigmoid(gate)*up → BitLinear(down)
-    CUDA 사용 시 sigmoid*mul을 Triton fused 커널로 처리.
+    x → [BitLinear(gate), BitLinear(up)] → relu(gate)*up → BitLinear(down)
+    ReLU gating: sigmoid 대비 CPU 인퍼런스 빠름, ternary weight와 궁합 좋음.
     """
 
     def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1):
@@ -72,10 +73,7 @@ class BitNetFFN(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_out = self.gate_proj(x)
         up = self.up_proj(x)
-        if _TRITON_KERNELS and x.is_cuda:
-            x = _triton_sigmoid_mul_wrapper(gate_out, up)
-        else:
-            x = torch.sigmoid(gate_out) * up
+        x = F.relu(gate_out) * up
         x = self.dropout(x)
         x = self.down_proj(x)
         return x
@@ -105,14 +103,7 @@ class BatchedBitNetFFN(nn.Module):
         """
         gate = self.gate_proj(x)   # (E, C, d_ff)
         up = self.up_proj(x)       # (E, C, d_ff)
-        # Triton fused sigmoid_mul은 2D 전용이므로 reshape 후 적용
-        if _TRITON_KERNELS and x.is_cuda:
-            E, C, F = gate.shape
-            x = _triton_sigmoid_mul_wrapper(
-                gate.reshape(E * C, F), up.reshape(E * C, F),
-            ).reshape(E, C, F)
-        else:
-            x = torch.sigmoid(gate) * up
+        x = F.relu(gate) * up
         x = self.dropout(x)
         x = self.down_proj(x)      # (E, C, d_model)
         return x

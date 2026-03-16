@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model.bitlinear import BitLinear
+from model.bitlinear import BitLinear, Int8Linear
 
 # fla (최우선, 고도로 최적화된 Triton) → CUDA 커널 → Python 순차
 _FLA_AVAILABLE = False
@@ -134,8 +134,8 @@ class RWKV6TimeMix(nn.Module):
         self.v_proj = BitLinear(d_model, d_model)
         self.o_proj = BitLinear(d_model, d_model)
 
-        # 게이트 (FP — sigmoid 활성화이므로 정밀도 유지)
-        self.g_proj = nn.Linear(d_model, d_model, bias=False)
+        # 게이트 (INT8 QAT — sigmoid 활성화, CPU 인퍼런스 가속)
+        self.g_proj = Int8Linear(d_model, d_model, bias=False)
 
         # 데이터 의존 감쇄 (w)
         # w_base: 학습 가능한 기본 감쇄 (음수 → exp(w) < 1)
@@ -159,10 +159,17 @@ class RWKV6TimeMix(nn.Module):
         """LoRA up을 zero-init → 초기 w = w_base"""
         nn.init.zeros_(self.w_lora_up.weight)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    # BOS 위치에서 state 완전 리셋용 decay 값
+    # exp(-100) ≈ 3.7e-44 ≈ 0 → diag(exp(w)) @ state ≈ 0
+    _RESET_DECAY = -100.0
+
+    def forward(
+        self, x: torch.Tensor, reset_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """
         Args:
             x: (B, T, d_model)
+            reset_mask: (B, T) bool — True = 문서 경계 (state 리셋)
         Returns:
             (B, T, d_model)
         """
@@ -177,6 +184,16 @@ class RWKV6TimeMix(nn.Module):
         w = self.w_base + self.w_lora_up(torch.tanh(self.w_lora_down(x)))
         w = -F.softplus(w)   # 음수 보장 → exp(w) ∈ (0, 1)
         w = w.view(B, T, self.n_heads, self.headdim)
+
+        # 문서 경계에서 state 리셋: k,v 제로링 + decay 극대화
+        # state = diag(exp(w)) @ state + k ⊗ v
+        # → k=0, v=0: 새 정보 주입 차단
+        # → exp(-100) ≈ 0: 기존 state 소멸
+        if reset_mask is not None:
+            mask = reset_mask.unsqueeze(-1).unsqueeze(-1)  # (B, T, 1, 1)
+            k = k.masked_fill(mask, 0.0)
+            v = v.masked_fill(mask, 0.0)
+            w = w.masked_fill(mask, self._RESET_DECAY)
 
         # 게이트
         g = torch.sigmoid(self.g_proj(x))  # (B, T, D)

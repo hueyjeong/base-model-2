@@ -48,6 +48,7 @@ class BitEditorConfig:
     d_ff: int = 512             # expert FFN 중간 차원
     n_experts: int = 16
     top_k: int = 1
+    capacity_factor: float = 1.5  # MoE expert 버퍼 용량 계수
 
     # Shared Linear Self-Attention 파라미터
     n_attn_heads: int = 24
