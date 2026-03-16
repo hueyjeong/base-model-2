@@ -21,13 +21,13 @@ export NCCL_P2P_DISABLE=1
 CORPUS="corpus/sample_full.jsonl"
 VAL_CORPUS="corpus/val_50k.jsonl"
 TEXT_KEY="text"
-NGPU=8
+NGPU=4
 D_MODEL=640
 SEQ_LEN=2048      # 패킹: BOS..EOS BOS..EOS → 2048 토큰 (GPU 활용 극대화)
-BATCH_SIZE=2      # per-GPU micro batch (16GB + seq=2048)
+BATCH_SIZE=4      # per-GPU micro batch (16GB + seq=2048)
 GRAD_ACCUM=4      # effective batch = 2 * 4 * 8 = 64
 MAX_STEPS=10000
-WARMUP=500
+WARMUP=1000
 LR=1e-3
 SAVE_DIR="checkpoints/quality_bench"
 LOG_INTERVAL=50
@@ -60,7 +60,7 @@ for MIXING in xlstm retnet mamba rwkv tcn fnet mlstm; do
         --warmup_steps ${WARMUP} \
         --max_steps ${MAX_STEPS} \
         --bf16 \
-        --num_workers 4 \
+        --num_workers 16 \
         --log_interval ${LOG_INTERVAL} \
         --save_interval ${SAVE_INTERVAL} \
         --save_dir "${SAVE_DIR}" \
