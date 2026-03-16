@@ -152,19 +152,26 @@ class MoEBitNetFFN(nn.Module):
         # Renormalize
         top_probs = top_probs / (top_probs.sum(dim=-1, keepdim=True) + 1e-8)
 
-        # Expert dispatch
-        x_flat = x.view(-1, D)              # (B*T, D)
-        out_flat = torch.zeros_like(x_flat)  # (B*T, D)
-        top_indices_flat = top_indices.view(-1, self.top_k)  # (B*T, top_k)
-        top_probs_flat = top_probs.view(-1, self.top_k)      # (B*T, top_k)
+        # Expert dispatch — top_k 선택을 한 번에 처리
+        N = B * T
+        x_flat = x.view(N, D)
 
-        for k_idx in range(self.top_k):
-            expert_idx = top_indices_flat[:, k_idx]   # (B*T,)
-            expert_w = top_probs_flat[:, k_idx]       # (B*T,)
-
-            out_flat = out_flat + self._dispatch(
-                x_flat, expert_idx, expert_w,
+        if self.top_k == 1:
+            # top_k=1: 단일 dispatch (기존 최적 경로)
+            out_flat = self._dispatch(
+                x_flat,
+                top_indices.view(N),
+                top_probs.view(N),
             )
+        else:
+            # top_k > 1: 토큰을 top_k번 복제 → 1회 dispatch
+            # (N, D) → (N*top_k, D), expert_idx (N*top_k,)
+            x_expanded = x_flat.unsqueeze(1).expand(N, self.top_k, D).reshape(N * self.top_k, D)
+            idx_all = top_indices.view(N * self.top_k)
+            w_all = top_probs.view(N * self.top_k)
+
+            out_expanded = self._dispatch(x_expanded, idx_all, w_all)
+            out_flat = out_expanded.view(N, self.top_k, D).sum(dim=1)
 
         output = out_flat.view(B, T, D)
 
