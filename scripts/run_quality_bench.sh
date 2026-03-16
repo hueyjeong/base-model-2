@@ -18,7 +18,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export OMP_NUM_THREADS=4
 export NCCL_P2P_DISABLE=1
 
-CORPUS="corpus/sample_10g.jsonl"
+CORPUS="corpus/sample_full.jsonl"
 VAL_CORPUS="corpus/val_50k.jsonl"
 TEXT_KEY="text"
 NGPU=8
