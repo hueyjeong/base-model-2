@@ -73,25 +73,38 @@ class MambaBlock(nn.Module):
         # out_proj
         self.out_proj = BitLinear(self.d_inner, d_model)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, reset_mask: Tensor | None = None) -> Tensor:
         B, T, _ = x.shape
 
         # in_proj
         xz = self.in_proj(x)
         x_branch, z = xz.split(self.d_inner, dim=-1)
 
+        # BOS 리셋: x_branch와 z를 0으로 → state 자연소멸
+        # (selective_scan에서 x=0이면 dB=dt*B*0=0 → state에 새 정보 안 들어감)
+        # (dt를 크게 하면 exp(A*dt) ≈ 0 → 기존 state도 flush)
+        if reset_mask is not None:
+            rst = reset_mask.unsqueeze(-1).to(x_branch.dtype)  # (B, T, 1)
+            x_branch = x_branch * (1 - rst)
+            z = z * (1 - rst)
+
         # conv1d
         x_conv = x_branch.transpose(1, 2)  # (B, d_inner, T)
         x_conv = self.conv1d(x_conv)[:, :, :T]
-        x_conv = F.silu(x_conv)  # (B, d_inner, T) — keep transposed for selective_scan
+        x_conv = F.silu(x_conv)
 
         # SSM 파라미터
-        x_for_proj = x_conv.transpose(1, 2)  # (B, T, d_inner)
+        x_for_proj = x_conv.transpose(1, 2)
         x_ssm = self.x_proj(x_for_proj)
         dt, B_ssm, C_ssm = x_ssm.split(
             [self.dt_rank, self.d_state, self.d_state], dim=-1
         )
         dt = self.dt_proj(dt)  # (B, T, d_inner) — softplus는 selective_scan 내부에서
+
+        # BOS에서 dt를 크게 → exp(A*dt) ≈ 0 → 기존 state 완전 flush
+        if reset_mask is not None:
+            rst = reset_mask.unsqueeze(-1).to(dt.dtype)
+            dt = dt + rst * 1e4  # softplus(1e4) ≈ 1e4 → exp(-1e4) ≈ 0
 
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
 
@@ -146,9 +159,11 @@ class BiMambaMixing(MixingLayer):
         self.fwd = MambaBlock(cfg.d_model, cfg.mamba_d_state, cfg.mamba_d_conv, cfg.mamba_expand)
         self.bwd = MambaBlock(cfg.d_model, cfg.mamba_d_state, cfg.mamba_d_conv, cfg.mamba_expand)
 
-    def forward(self, x: Tensor, pad_mask: Tensor | None = None) -> Tensor:
-        fwd_out = self.fwd(x)
-        bwd_out = self.bwd(x.flip(1)).flip(1)
+    def forward(self, x: Tensor, pad_mask: Tensor | None = None,
+                reset_mask: Tensor | None = None) -> Tensor:
+        fwd_out = self.fwd(x, reset_mask=reset_mask)
+        bwd_reset = reset_mask.flip(1) if reset_mask is not None else None
+        bwd_out = self.bwd(x.flip(1), reset_mask=bwd_reset).flip(1)
         out = fwd_out + bwd_out
         if pad_mask is not None:
             out = out * pad_mask.unsqueeze(-1).to(out.dtype)

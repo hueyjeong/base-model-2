@@ -46,7 +46,7 @@ class TCNMixing(MixingLayer):
         # Pointwise projection (ternary)
         self.proj = BitLinear(d, d)
 
-    def forward(self, x: Tensor, pad_mask: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, pad_mask: Tensor | None = None, reset_mask: Tensor | None = None) -> Tensor:
         # x: (B, T, d) → (B, d, T) for Conv1d
         h = x.transpose(1, 2)
 

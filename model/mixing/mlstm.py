@@ -119,7 +119,7 @@ class BiMLSTMMixing(MixingLayer):
         self.fwd = MLSTMScan(cfg.d_model, cfg.n_heads, cfg.headdim)
         self.bwd = MLSTMScan(cfg.d_model, cfg.n_heads, cfg.headdim)
 
-    def forward(self, x: Tensor, pad_mask: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, pad_mask: Tensor | None = None, reset_mask: Tensor | None = None) -> Tensor:
         fwd_out = self.fwd(x, reverse=False)
         bwd_out = self.bwd(x, reverse=True)
         out = fwd_out + bwd_out

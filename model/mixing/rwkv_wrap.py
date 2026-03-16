@@ -22,5 +22,6 @@ class BiRWKVMixing(MixingLayer):
     def _init_weights(self):
         self.bi_rwkv._init_weights()
 
-    def forward(self, x: Tensor, pad_mask: Tensor | None = None) -> Tensor:
-        return self.bi_rwkv(x, pad_mask=pad_mask, reset_mask=None)
+    def forward(self, x: Tensor, pad_mask: Tensor | None = None,
+                reset_mask: Tensor | None = None) -> Tensor:
+        return self.bi_rwkv(x, pad_mask=pad_mask, reset_mask=reset_mask)
