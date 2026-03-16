@@ -70,6 +70,53 @@ extern "C" {
         out: *mut u8,
         n: c_int,
     ) -> f32;
+
+    /// 2-bit packed → i8 배치 언팩 (모델 로드 시 1회 호출)
+    fn unpack_2bit_rows(
+        packed: *const u8,
+        out: *mut i8,
+        rows: c_int,
+        cols: c_int,
+        packed_stride: c_int,
+    );
+
+    /// 배치 f32 → u8 양자화 (seq_len 토큰을 한 번에)
+    fn batch_quantize_f32_to_u8(
+        x: *const f32,
+        out: *mut u8,
+        scales: *mut f32,
+        seq_len: c_int,
+        d: c_int,
+    );
+
+    /// i8 sgemm: X_u8[n,k] × W_i8[m,k]^T → Y[n,m]
+    fn i8_sgemm(
+        w: *const i8,
+        x_u8: *const u8,
+        y: *mut f32,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        row_sums: *const i32,
+        row_scales: *const f32,
+        x_scales: *const f32,
+        w_scale: f32,
+    );
+
+    /// WKV-6 순차 스캔 (AVX2 FMA, headdim=32 전용)
+    fn wkv6_scan_avx2(
+        r: *const f32,
+        k: *const f32,
+        v: *const f32,
+        w: *const f32,
+        u_param: *const f32,
+        output: *mut f32,
+        state: *mut f32,
+        seq_len: c_int,
+        n_heads: c_int,
+        headdim: c_int,
+        d_model: c_int,
+    );
 }
 
 // ── BMMQ 헬퍼 ────────────────────────────────────────
@@ -168,21 +215,17 @@ impl RMSNorm {
     }
 }
 
-// ── LayerNorm (elementwise_affine=False) ─────────────
+// ── RMSNorm (elementwise_affine=False, BitLinear 내부용) ─
 
 #[inline]
-fn layer_norm_no_affine_vec(x: &[f32], out: &mut [f32], eps: f32) {
+fn rms_norm_no_affine_vec(x: &[f32], out: &mut [f32], eps: f32) {
     let n = x.len();
-    let inv_n = 1.0 / n as f32;
-    let mean: f32 = x.iter().sum::<f32>() * inv_n;
-    let mut var = 0.0f32;
+    let mut sq_sum = 0.0f32;
+    for &v in x { sq_sum += v * v; }
+    let rms_inv = (sq_sum / n as f32 + eps).sqrt().recip();
     for i in 0..n {
-        let d = x[i] - mean;
-        out[i] = d;
-        var += d * d;
+        out[i] = x[i] * rms_inv;
     }
-    let inv_std = (var * inv_n + eps).sqrt().recip();
-    for v in out.iter_mut().take(n) { *v *= inv_std; }
 }
 
 // ── BitLinear (i8 ternary + AVX-VNNI) ───────────────
@@ -191,9 +234,7 @@ pub struct BitLinear {
     gamma: f32,
     out_dim: usize,
     in_dim: usize,
-    w_i8: Vec<i8>,
-    w_packed: Vec<u8>,
-    packed_stride: usize,
+    w_i8: Vec<i8>,       // 사전 언팩된 ternary 가중치 (로드 시 캐시)
     row_sums: Vec<i32>,
 }
 
@@ -202,13 +243,22 @@ impl BitLinear {
         let key = format!("{}.weight", prefix);
         match tensors.remove(&key).context(format!("BitLinear weight 없음: {}", key))? {
             TensorData::Packed2Bit { data, gamma, row_sums, rows, cols, packed_stride } => {
+                // 로드 시 2-bit → i8 사전 언팩 (추론 중 반복 언팩 제거)
+                let mut w_i8 = vec![0i8; rows * cols];
+                unsafe {
+                    unpack_2bit_rows(
+                        data.as_ptr(),
+                        w_i8.as_mut_ptr(),
+                        rows as c_int,
+                        cols as c_int,
+                        packed_stride as c_int,
+                    );
+                }
                 Ok(Self {
                     gamma,
                     out_dim: rows,
                     in_dim: cols,
-                    w_i8: Vec::new(),
-                    w_packed: data,
-                    packed_stride,
+                    w_i8,
                     row_sums,
                 })
             }
@@ -216,48 +266,88 @@ impl BitLinear {
         }
     }
 
-    /// AVX-VNNI matmul (할당 없음 — 외부 버퍼)
+    /// i8 matmul (사전 언팩된 가중치 사용 — 할당 없음)
     fn forward_vec(&self, x: &[f32], out: &mut [f32], x_norm: &mut [f32], x_u8: &mut [u8]) {
         debug_assert_eq!(x.len(), self.in_dim);
         let n = self.in_dim;
 
-        // 1. LayerNorm
-        layer_norm_no_affine_vec(x, &mut x_norm[..n], 1e-5);
+        // 1. RMSNorm (BitLinear 내부 — 평균 빼기 없이 RMS만)
+        rms_norm_no_affine_vec(x, &mut x_norm[..n], 1e-5);
 
         // 2. f32 → u8 양자화
         let x_scale = unsafe {
             quantize_f32_to_u8(x_norm.as_ptr(), x_u8.as_mut_ptr(), n as c_int)
         };
 
-        // 3. matmul
-        if !self.w_packed.is_empty() {
-            unsafe {
-                ternary_sgemv(
-                    self.w_packed.as_ptr(),
-                    x_u8.as_ptr(),
-                    out.as_mut_ptr(),
-                    self.out_dim as c_int,
-                    n as c_int,
-                    self.packed_stride as c_int,
-                    self.row_sums.as_ptr(),
-                    self.gamma,
-                    x_scale,
-                );
-            }
-        } else {
-            unsafe {
-                i8_sgemv(
-                    self.w_i8.as_ptr(),
-                    x_u8.as_ptr(),
-                    out.as_mut_ptr(),
-                    self.out_dim as c_int,
-                    n as c_int,
-                    self.row_sums.as_ptr(),
-                    std::ptr::null(),
-                    x_scale,
-                    self.gamma,
-                );
-            }
+        // 3. i8 matmul
+        self.matmul_preq(x_u8, x_scale, out);
+    }
+
+    /// 이미 양자화된 입력으로 matmul만 수행 (RMSNorm+quantize 공유용)
+    #[inline]
+    fn matmul_preq(&self, x_u8: &[u8], x_scale: f32, out: &mut [f32]) {
+        unsafe {
+            i8_sgemv(
+                self.w_i8.as_ptr(),
+                x_u8.as_ptr(),
+                out.as_mut_ptr(),
+                self.out_dim as c_int,
+                self.in_dim as c_int,
+                self.row_sums.as_ptr(),
+                std::ptr::null(),
+                x_scale,
+                self.gamma,
+            );
+        }
+    }
+}
+
+impl BitLinear {
+    /// 배치 matmul: RMSNorm → quantize → sgemm (seq_len 토큰을 한 번에)
+    /// x: (seq_len * in_dim), out: (seq_len * out_dim)
+    fn forward_batch(&self, x: &[f32], seq_len: usize, out: &mut [f32],
+                      x_norm_buf: &mut Vec<f32>, x_u8_buf: &mut Vec<u8>,
+                      x_scales_buf: &mut Vec<f32>) {
+        let k = self.in_dim;
+        let m = self.out_dim;
+
+        // 1. 토큰별 RMSNorm
+        x_norm_buf.resize(seq_len * k, 0.0);
+        for t in 0..seq_len {
+            rms_norm_no_affine_vec(
+                &x[t * k..(t + 1) * k],
+                &mut x_norm_buf[t * k..(t + 1) * k],
+                1e-5,
+            );
+        }
+
+        // 2. 배치 양자화
+        x_u8_buf.resize(seq_len * k, 0);
+        x_scales_buf.resize(seq_len, 0.0);
+        unsafe {
+            batch_quantize_f32_to_u8(
+                x_norm_buf.as_ptr(),
+                x_u8_buf.as_mut_ptr(),
+                x_scales_buf.as_mut_ptr(),
+                seq_len as c_int,
+                k as c_int,
+            );
+        }
+
+        // 3. sgemm: X_u8 (seq_len, k) × W_i8^T (m, k) → Y (seq_len, m)
+        unsafe {
+            i8_sgemm(
+                self.w_i8.as_ptr(),
+                x_u8_buf.as_ptr(),
+                out.as_mut_ptr(),
+                m as c_int,
+                seq_len as c_int,
+                k as c_int,
+                self.row_sums.as_ptr(),
+                std::ptr::null(),
+                x_scales_buf.as_ptr(),
+                self.gamma,
+            );
         }
     }
 }
@@ -295,16 +385,55 @@ impl Linear {
         let x_scale = unsafe {
             quantize_f32_to_u8(x.as_ptr(), x_u8.as_mut_ptr(), n as c_int)
         };
+        self.matmul_preq(x_u8, x_scale, out);
+    }
+
+    /// 이미 양자화된 입력으로 matmul만 수행 (양자화 공유용)
+    #[inline]
+    fn matmul_preq(&self, x_u8: &[u8], x_scale: f32, out: &mut [f32]) {
         unsafe {
             i8_sgemv(
                 self.w_i8.as_ptr(),
                 x_u8.as_ptr(),
                 out.as_mut_ptr(),
                 self.out_dim as c_int,
-                n as c_int,
+                self.in_dim as c_int,
                 self.row_sums.as_ptr(),
                 self.row_scales.as_ptr(),
                 x_scale,
+                0.0,
+            );
+        }
+    }
+}
+
+impl Linear {
+    /// 배치 matmul: quantize → sgemm (seq_len 토큰을 한 번에)
+    fn forward_batch(&self, x: &[f32], seq_len: usize, out: &mut [f32],
+                      x_u8_buf: &mut Vec<u8>, x_scales_buf: &mut Vec<f32>) {
+        let k = self.in_dim;
+        let m = self.out_dim;
+
+        x_u8_buf.resize(seq_len * k, 0);
+        x_scales_buf.resize(seq_len, 0.0);
+        unsafe {
+            batch_quantize_f32_to_u8(
+                x.as_ptr(),
+                x_u8_buf.as_mut_ptr(),
+                x_scales_buf.as_mut_ptr(),
+                seq_len as c_int,
+                k as c_int,
+            );
+            i8_sgemm(
+                self.w_i8.as_ptr(),
+                x_u8_buf.as_ptr(),
+                out.as_mut_ptr(),
+                m as c_int,
+                seq_len as c_int,
+                k as c_int,
+                self.row_sums.as_ptr(),
+                self.row_scales.as_ptr(),
+                x_scales_buf.as_ptr(),
                 0.0,
             );
         }
@@ -334,15 +463,21 @@ impl BitNetFFN {
 
     fn forward_vec(&self, x: &[f32], buf_ff: &mut Vec<f32>, buf_ff2: &mut Vec<f32>,
                     x_norm_buf: &mut [f32], x_u8: &mut [u8], out: &mut [f32]) {
+        let n = x.len();
         buf_ff.resize(self.d_ff, 0.0);
         buf_ff2.resize(self.d_ff, 0.0);
-        self.gate_proj.forward_vec(x, buf_ff, x_norm_buf, x_u8);
-        self.up_proj.forward_vec(x, buf_ff2, x_norm_buf, x_u8);
+
+        // gate/up은 같은 입력 → RMSNorm+quantize 1회 공유
+        rms_norm_no_affine_vec(x, &mut x_norm_buf[..n], 1e-5);
+        let x_scale = unsafe {
+            quantize_f32_to_u8(x_norm_buf.as_ptr(), x_u8.as_mut_ptr(), n as c_int)
+        };
+        self.gate_proj.matmul_preq(&x_u8[..n], x_scale, buf_ff);
+        self.up_proj.matmul_preq(&x_u8[..n], x_scale, buf_ff2);
 
         // sigmoid(gate) * up → reuse buf_ff
         for i in 0..self.d_ff {
-            let sig = sigmoid_scalar(buf_ff[i]);
-            buf_ff[i] = sig * buf_ff2[i];
+            buf_ff[i] = sigmoid_scalar(buf_ff[i]) * buf_ff2[i];
         }
 
         self.down_proj.forward_vec(buf_ff, out, x_norm_buf, x_u8);
@@ -357,15 +492,16 @@ struct RWKV6TimeMix {
     v_proj: BitLinear,
     o_proj: BitLinear,
     g_proj: Linear,       // gate
+    u: Vec<f32>,          // (n_heads * headdim,) in-context bonus
     w_base: Vec<f32>,     // (n_heads * headdim,)
-    w_lora_down: Linear,  // (d_model -> lora_rank)
-    w_lora_up: Linear,    // (lora_rank -> d_model)
+    w_lora_down: Linear,  // (d_model -> w_lora_rank)
+    w_lora_up: Linear,    // (w_lora_rank -> d_model)
     output_norm_weight: Vec<f32>,  // LayerNorm per-head weight
     output_norm_bias: Vec<f32>,    // LayerNorm per-head bias
     n_heads: usize,
     headdim: usize,
     d_model: usize,
-    lora_rank: usize,
+    w_lora_rank: usize,   // w_lora_down의 실제 출력 차원
 }
 
 impl RWKV6TimeMix {
@@ -374,24 +510,27 @@ impl RWKV6TimeMix {
         prefix: &str,
         n_heads: usize,
         headdim: usize,
-        lora_rank: usize,
+        _lora_rank: usize,
     ) -> Result<Self> {
         let d_model = n_heads * headdim;
+        let w_lora_down = Linear::load_bmmq(tensors, &format!("{}.w_lora_down", prefix))?;
+        let w_lora_rank = w_lora_down.out_dim;  // 실제 차원 사용 (config 값 대신)
         Ok(Self {
             r_proj: BitLinear::load_bmmq(tensors, &format!("{}.r_proj", prefix))?,
             k_proj: BitLinear::load_bmmq(tensors, &format!("{}.k_proj", prefix))?,
             v_proj: BitLinear::load_bmmq(tensors, &format!("{}.v_proj", prefix))?,
             o_proj: BitLinear::load_bmmq(tensors, &format!("{}.o_proj", prefix))?,
             g_proj: Linear::load_bmmq(tensors, &format!("{}.g_proj", prefix))?,
+            u: bmmq_take_f32(tensors, &format!("{}.u", prefix))?,
             w_base: bmmq_take_f32(tensors, &format!("{}.w_base", prefix))?,
-            w_lora_down: Linear::load_bmmq(tensors, &format!("{}.w_lora_down", prefix))?,
+            w_lora_down,
             w_lora_up: Linear::load_bmmq(tensors, &format!("{}.w_lora_up", prefix))?,
             output_norm_weight: bmmq_take_f32(tensors, &format!("{}.output_norm.weight", prefix))?,
             output_norm_bias: bmmq_take_f32(tensors, &format!("{}.output_norm.bias", prefix))?,
             n_heads,
             headdim,
             d_model,
-            lora_rank,
+            w_lora_rank,
         })
     }
 
@@ -406,7 +545,7 @@ impl RWKV6TimeMix {
         let nh = self.n_heads;
         let hd = self.headdim;
 
-        // R, K, V, G 프로젝션: 토큰별 순회
+        // R, K, V, G 프로젝션: 토큰별 sgemv (384×384에서 L2 캐시 활용 최적)
         bufs.r.resize(seq_len * d, 0.0);
         bufs.k.resize(seq_len * d, 0.0);
         bufs.v.resize(seq_len * d, 0.0);
@@ -415,17 +554,25 @@ impl RWKV6TimeMix {
 
         for t in 0..seq_len {
             let x_t = &x[t * d..(t + 1) * d];
-            self.r_proj.forward_vec(x_t, &mut bufs.r[t * d..(t + 1) * d],
-                                    &mut bufs.x_norm, &mut bufs.x_u8);
-            self.k_proj.forward_vec(x_t, &mut bufs.k[t * d..(t + 1) * d],
-                                    &mut bufs.x_norm, &mut bufs.x_u8);
-            self.v_proj.forward_vec(x_t, &mut bufs.v[t * d..(t + 1) * d],
-                                    &mut bufs.x_norm, &mut bufs.x_u8);
+
+            // r/k/v는 동일 입력에 대해 RMSNorm+quantize 1회만 수행 → matmul 3회 공유
+            rms_norm_no_affine_vec(x_t, &mut bufs.x_norm[..d], 1e-5);
+            let x_scale = unsafe {
+                quantize_f32_to_u8(bufs.x_norm.as_ptr(), bufs.x_u8.as_mut_ptr(), d as c_int)
+            };
+            self.r_proj.matmul_preq(&bufs.x_u8[..d], x_scale, &mut bufs.r[t * d..(t + 1) * d]);
+            self.k_proj.matmul_preq(&bufs.x_u8[..d], x_scale, &mut bufs.k[t * d..(t + 1) * d]);
+            self.v_proj.matmul_preq(&bufs.x_u8[..d], x_scale, &mut bufs.v[t * d..(t + 1) * d]);
+
+            // g_proj는 Linear (RMSNorm 없이 직접 quantize) — x_t로 별도 양자화
             self.g_proj.forward_vec(x_t, &mut bufs.g[t * d..(t + 1) * d],
                                     &mut bufs.x_u8);
+        }
 
-            // Data-dependent decay: w = w_base + w_lora_up(tanh(w_lora_down(x)))
-            bufs.lora_down.resize(self.lora_rank, 0.0);
+        // Data-dependent decay: 토큰별 (w_lora 입력 의존)
+        for t in 0..seq_len {
+            let x_t = &x[t * d..(t + 1) * d];
+            bufs.lora_down.resize(self.w_lora_rank, 0.0);
             self.w_lora_down.forward_vec(x_t, &mut bufs.lora_down, &mut bufs.x_u8);
             for v in bufs.lora_down.iter_mut() { *v = v.tanh(); }
             bufs.lora_up.resize(d, 0.0);
@@ -435,54 +582,25 @@ impl RWKV6TimeMix {
             }
         }
 
-        // WKV sequential scan
-        // state: (n_heads, headdim, headdim) — state[h][i][j]
+        // WKV sequential scan (AVX2 FMA 벡터화)
         bufs.state.resize(nh * hd * hd, 0.0);
         bufs.state.fill(0.0);
         bufs.output.resize(seq_len * d, 0.0);
 
-        for t in 0..seq_len {
-            let k_t = &bufs.k[t * d..];
-            let v_t = &bufs.v[t * d..];
-            let r_t = &bufs.r[t * d..];
-
-            for h in 0..nh {
-                let h_off = h * hd;
-                let s_off = h * hd * hd;
-
-                // state[h] = diag(exp(w_t[h])) @ state[h] + k[t,h] ⊗ v[t,h]
-                // Python: w = -softplus(w_raw) → exp(w) = 1/(1+exp(w_raw))
-                for i in 0..hd {
-                    let w_raw = bufs.w[t * d + h_off + i];
-                    let decay = 1.0 / (1.0 + w_raw.exp());
-                    let k_val = k_t[h_off + i];
-                    let si = s_off + i * hd;
-                    for j in 0..hd {
-                        bufs.state[si + j] = decay * bufs.state[si + j]
-                            + k_val * v_t[h_off + j];
-                    }
-                }
-
-                // out[t,h] = state[h] @ r[t,h]  via cblas_sgemv
-                // state[h] is (headdim, headdim) row-major
-                // out[d] = sum_i state[h][i][d] * r[h][i]  →  state^T @ r
-                unsafe {
-                    cblas_sgemv(
-                        CBLAS_ROW_MAJOR,
-                        112, // CblasTrans
-                        hd as c_int,
-                        hd as c_int,
-                        1.0,
-                        bufs.state[s_off..].as_ptr(),
-                        hd as c_int,
-                        r_t[h_off..].as_ptr(),
-                        1,
-                        0.0,
-                        bufs.output[t * d + h_off..].as_mut_ptr(),
-                        1,
-                    );
-                }
-            }
+        unsafe {
+            wkv6_scan_avx2(
+                bufs.r.as_ptr(),
+                bufs.k.as_ptr(),
+                bufs.v.as_ptr(),
+                bufs.w.as_ptr(),
+                self.u.as_ptr(),
+                bufs.output.as_mut_ptr(),
+                bufs.state.as_mut_ptr(),
+                seq_len as c_int,
+                nh as c_int,
+                hd as c_int,
+                d as c_int,
+            );
         }
 
         // Per-head LayerNorm + gate + output projection
@@ -512,14 +630,15 @@ impl RWKV6TimeMix {
                 for i in 0..hd {
                     let idx = off + i;
                     let normed = (out_t[idx] - mean) * inv_std;
-                    bufs.normed_head[idx] = normed * self.output_norm_weight[idx]
-                        + self.output_norm_bias[idx];
+                    // output_norm은 (headdim,) 크기로 head 간 공유
+                    bufs.normed_head[idx] = normed * self.output_norm_weight[i]
+                        + self.output_norm_bias[i];
                 }
             }
 
-            // Gate: silu(g) * normed
+            // Gate: sigmoid(g) * normed (Python: g = torch.sigmoid(g_proj(x)))
             for i in 0..d {
-                bufs.gated[i] = silu_scalar(g_t[i]) * bufs.normed_head[i];
+                bufs.gated[i] = sigmoid_scalar(g_t[i]) * bufs.normed_head[i];
             }
 
             // Output projection
@@ -537,6 +656,7 @@ struct RWKVBufs {
     g: Vec<f32>,
     w: Vec<f32>,
     state: Vec<f32>,
+    kv_bonus: Vec<f32>,
     output: Vec<f32>,
     normed_head: Vec<f32>,
     gated: Vec<f32>,
@@ -545,6 +665,10 @@ struct RWKVBufs {
     lora_up: Vec<f32>,
     x_norm: Vec<f32>,
     x_u8: Vec<u8>,
+    // 배치 프로젝션용 버퍼
+    batch_norm: Vec<f32>,
+    batch_u8: Vec<u8>,
+    batch_scales: Vec<f32>,
 }
 
 impl RWKVBufs {
@@ -556,6 +680,7 @@ impl RWKVBufs {
             g: Vec::new(),
             w: Vec::new(),
             state: Vec::new(),
+            kv_bonus: Vec::new(),
             output: Vec::new(),
             normed_head: Vec::new(),
             gated: Vec::new(),
@@ -564,6 +689,9 @@ impl RWKVBufs {
             lora_up: Vec::new(),
             x_norm: vec![0.0; max_in_dim],
             x_u8: vec![0u8; max_in_dim],
+            batch_norm: Vec::new(),
+            batch_u8: Vec::new(),
+            batch_scales: Vec::new(),
         }
     }
 }
@@ -618,7 +746,6 @@ impl BiRWKV {
         self.backward_rwkv.forward_batch(x_rev, seq_len, bwd_bufs);
 
         // 역방향 결과를 다시 뒤집어서 순방향 결과에 합산
-        // fwd_bufs.final_out에 결과 누적
         for t in 0..seq_len {
             let fwd_off = t * d_model;
             let bwd_off = (seq_len - 1 - t) * d_model;
@@ -626,6 +753,179 @@ impl BiRWKV {
                 fwd_bufs.final_out[fwd_off + i] += bwd_bufs.final_out[bwd_off + i];
             }
         }
+    }
+
+    /// 프로파일링 버전: 내부 구간별 시간 측정 (static 누적)
+    fn forward_batch_profiled(
+        &self,
+        x: &[f32],
+        seq_len: usize,
+        d_model: usize,
+        fwd_bufs: &mut RWKVBufs,
+        bwd_bufs: &mut RWKVBufs,
+        x_rev: &mut Vec<f32>,
+        timings: &mut [u128; 6], // [fwd_proj, fwd_wkv, fwd_post, bwd_proj, bwd_wkv, bwd_post]
+    ) {
+        use std::time::Instant;
+
+        // 순방향 프로젝션
+        let t0 = Instant::now();
+        let d = self.forward_rwkv.d_model;
+        let nh = self.forward_rwkv.n_heads;
+        let hd = self.forward_rwkv.headdim;
+
+        fwd_bufs.r.resize(seq_len * d, 0.0);
+        fwd_bufs.k.resize(seq_len * d, 0.0);
+        fwd_bufs.v.resize(seq_len * d, 0.0);
+        fwd_bufs.g.resize(seq_len * d, 0.0);
+        fwd_bufs.w.resize(seq_len * d, 0.0);
+
+        for t in 0..seq_len {
+            let x_t = &x[t * d..(t + 1) * d];
+            self.forward_rwkv.r_proj.forward_vec(x_t, &mut fwd_bufs.r[t*d..(t+1)*d], &mut fwd_bufs.x_norm, &mut fwd_bufs.x_u8);
+            self.forward_rwkv.k_proj.forward_vec(x_t, &mut fwd_bufs.k[t*d..(t+1)*d], &mut fwd_bufs.x_norm, &mut fwd_bufs.x_u8);
+            self.forward_rwkv.v_proj.forward_vec(x_t, &mut fwd_bufs.v[t*d..(t+1)*d], &mut fwd_bufs.x_norm, &mut fwd_bufs.x_u8);
+            self.forward_rwkv.g_proj.forward_vec(x_t, &mut fwd_bufs.g[t*d..(t+1)*d], &mut fwd_bufs.x_u8);
+            // w_lora
+            fwd_bufs.lora_down.resize(self.forward_rwkv.w_lora_rank, 0.0);
+            self.forward_rwkv.w_lora_down.forward_vec(x_t, &mut fwd_bufs.lora_down, &mut fwd_bufs.x_u8);
+            for v in fwd_bufs.lora_down.iter_mut() { *v = v.tanh(); }
+            fwd_bufs.lora_up.resize(d, 0.0);
+            self.forward_rwkv.w_lora_up.forward_vec(&fwd_bufs.lora_down, &mut fwd_bufs.lora_up, &mut fwd_bufs.x_u8);
+            for i in 0..d { fwd_bufs.w[t*d+i] = self.forward_rwkv.w_base[i] + fwd_bufs.lora_up[i]; }
+        }
+        timings[0] += t0.elapsed().as_micros();
+
+        // 순방향 WKV scan (AVX2 FMA)
+        let t0 = Instant::now();
+        fwd_bufs.state.resize(nh * hd * hd, 0.0);
+        fwd_bufs.state.fill(0.0);
+        fwd_bufs.output.resize(seq_len * d, 0.0);
+        unsafe {
+            wkv6_scan_avx2(
+                fwd_bufs.r.as_ptr(), fwd_bufs.k.as_ptr(),
+                fwd_bufs.v.as_ptr(), fwd_bufs.w.as_ptr(),
+                self.forward_rwkv.u.as_ptr(),
+                fwd_bufs.output.as_mut_ptr(), fwd_bufs.state.as_mut_ptr(),
+                seq_len as c_int, nh as c_int, hd as c_int, d as c_int,
+            );
+        }
+        timings[1] += t0.elapsed().as_micros();
+
+        // 순방향 후처리 (LayerNorm + gate + o_proj)
+        let t0 = Instant::now();
+        fwd_bufs.normed_head.resize(d, 0.0);
+        fwd_bufs.gated.resize(d, 0.0);
+        fwd_bufs.final_out.resize(seq_len * d, 0.0);
+        for t in 0..seq_len {
+            let out_t = &fwd_bufs.output[t*d..];
+            let g_t = &fwd_bufs.g[t*d..];
+            for h in 0..nh {
+                let off = h * hd;
+                let mut mean = 0.0f32;
+                for i in 0..hd { mean += out_t[off+i]; }
+                mean /= hd as f32;
+                let mut var = 0.0f32;
+                for i in 0..hd { let dv = out_t[off+i] - mean; var += dv*dv; }
+                let inv_std = (var / hd as f32 + 1e-5f32).sqrt().recip();
+                for i in 0..hd {
+                    let idx = off + i;
+                    let normed = (out_t[idx] - mean) * inv_std;
+                    fwd_bufs.normed_head[idx] = normed * self.forward_rwkv.output_norm_weight[i]
+                        + self.forward_rwkv.output_norm_bias[i];
+                }
+            }
+            for i in 0..d { fwd_bufs.gated[i] = sigmoid_scalar(g_t[i]) * fwd_bufs.normed_head[i]; }
+            self.forward_rwkv.o_proj.forward_vec(&fwd_bufs.gated, &mut fwd_bufs.final_out[t*d..(t+1)*d],
+                                                  &mut fwd_bufs.x_norm, &mut fwd_bufs.x_u8);
+        }
+        timings[2] += t0.elapsed().as_micros();
+
+        // 역방향: 입력 반전
+        x_rev.resize(seq_len * d_model, 0.0);
+        for t in 0..seq_len {
+            let src = (seq_len - 1 - t) * d_model;
+            let dst = t * d_model;
+            x_rev[dst..dst + d_model].copy_from_slice(&x[src..src + d_model]);
+        }
+
+        // 역방향 프로젝션
+        let t0 = Instant::now();
+        bwd_bufs.r.resize(seq_len * d, 0.0);
+        bwd_bufs.k.resize(seq_len * d, 0.0);
+        bwd_bufs.v.resize(seq_len * d, 0.0);
+        bwd_bufs.g.resize(seq_len * d, 0.0);
+        bwd_bufs.w.resize(seq_len * d, 0.0);
+        for t in 0..seq_len {
+            let x_t = &x_rev[t * d..(t + 1) * d];
+            // r/k/v 양자화 공유
+            rms_norm_no_affine_vec(x_t, &mut bwd_bufs.x_norm[..d], 1e-5);
+            let x_scale = unsafe {
+                quantize_f32_to_u8(bwd_bufs.x_norm.as_ptr(), bwd_bufs.x_u8.as_mut_ptr(), d as c_int)
+            };
+            self.backward_rwkv.r_proj.matmul_preq(&bwd_bufs.x_u8[..d], x_scale, &mut bwd_bufs.r[t*d..(t+1)*d]);
+            self.backward_rwkv.k_proj.matmul_preq(&bwd_bufs.x_u8[..d], x_scale, &mut bwd_bufs.k[t*d..(t+1)*d]);
+            self.backward_rwkv.v_proj.matmul_preq(&bwd_bufs.x_u8[..d], x_scale, &mut bwd_bufs.v[t*d..(t+1)*d]);
+            self.backward_rwkv.g_proj.forward_vec(x_t, &mut bwd_bufs.g[t*d..(t+1)*d], &mut bwd_bufs.x_u8);
+            bwd_bufs.lora_down.resize(self.backward_rwkv.w_lora_rank, 0.0);
+            self.backward_rwkv.w_lora_down.forward_vec(x_t, &mut bwd_bufs.lora_down, &mut bwd_bufs.x_u8);
+            for v in bwd_bufs.lora_down.iter_mut() { *v = v.tanh(); }
+            bwd_bufs.lora_up.resize(d, 0.0);
+            self.backward_rwkv.w_lora_up.forward_vec(&bwd_bufs.lora_down, &mut bwd_bufs.lora_up, &mut bwd_bufs.x_u8);
+            for i in 0..d { bwd_bufs.w[t*d+i] = self.backward_rwkv.w_base[i] + bwd_bufs.lora_up[i]; }
+        }
+        timings[3] += t0.elapsed().as_micros();
+
+        // 역방향 WKV scan (AVX2 FMA)
+        let t0 = Instant::now();
+        bwd_bufs.state.resize(nh * hd * hd, 0.0);
+        bwd_bufs.state.fill(0.0);
+        bwd_bufs.output.resize(seq_len * d, 0.0);
+        unsafe {
+            wkv6_scan_avx2(
+                bwd_bufs.r.as_ptr(), bwd_bufs.k.as_ptr(),
+                bwd_bufs.v.as_ptr(), bwd_bufs.w.as_ptr(),
+                self.backward_rwkv.u.as_ptr(),
+                bwd_bufs.output.as_mut_ptr(), bwd_bufs.state.as_mut_ptr(),
+                seq_len as c_int, nh as c_int, hd as c_int, d as c_int,
+            );
+        }
+        timings[4] += t0.elapsed().as_micros();
+
+        // 역방향 후처리 + 합산
+        let t0 = Instant::now();
+        bwd_bufs.normed_head.resize(d, 0.0);
+        bwd_bufs.gated.resize(d, 0.0);
+        bwd_bufs.final_out.resize(seq_len * d, 0.0);
+        for t in 0..seq_len {
+            let out_t = &bwd_bufs.output[t*d..];
+            let g_t = &bwd_bufs.g[t*d..];
+            for h in 0..nh {
+                let off = h * hd;
+                let mut mean = 0.0f32;
+                for i in 0..hd { mean += out_t[off+i]; }
+                mean /= hd as f32;
+                let mut var = 0.0f32;
+                for i in 0..hd { let dv = out_t[off+i] - mean; var += dv*dv; }
+                let inv_std = (var / hd as f32 + 1e-5f32).sqrt().recip();
+                for i in 0..hd {
+                    let idx = off + i;
+                    let normed = (out_t[idx] - mean) * inv_std;
+                    bwd_bufs.normed_head[idx] = normed * self.backward_rwkv.output_norm_weight[i]
+                        + self.backward_rwkv.output_norm_bias[i];
+                }
+            }
+            for i in 0..d { bwd_bufs.gated[i] = sigmoid_scalar(g_t[i]) * bwd_bufs.normed_head[i]; }
+            self.backward_rwkv.o_proj.forward_vec(&bwd_bufs.gated, &mut bwd_bufs.final_out[t*d..(t+1)*d],
+                                                   &mut bwd_bufs.x_norm, &mut bwd_bufs.x_u8);
+        }
+        // 역방향 결과를 뒤집어서 순방향에 합산
+        for t in 0..seq_len {
+            let fwd_off = t * d_model;
+            let bwd_off = (seq_len - 1 - t) * d_model;
+            for i in 0..d_model { fwd_bufs.final_out[fwd_off + i] += bwd_bufs.final_out[bwd_off + i]; }
+        }
+        timings[5] += t0.elapsed().as_micros();
     }
 }
 
@@ -704,12 +1004,31 @@ impl MoEBitNetFFN {
             bufs.expert_out.resize(d_model, 0.0);
             let out_t = &mut bufs.output[t * d_model..(t + 1) * d_model];
 
+            // gate/up 입력 양자화 1회 → 별도 버퍼에 저장 (down_proj가 덮어쓰지 않도록)
+            let n = d_model;
+            rms_norm_no_affine_vec(x_t, &mut bufs.x_norm[..n], 1e-5);
+            bufs.x_scale_shared = unsafe {
+                quantize_f32_to_u8(bufs.x_norm.as_ptr(), bufs.x_u8_shared.as_mut_ptr(), n as c_int)
+            };
+
             for &idx in &bufs.top_indices {
                 let weight = bufs.router_probs[idx] * inv_top;
-                self.experts[idx].forward_vec(
-                    x_t, &mut bufs.ff1, &mut bufs.ff2,
-                    &mut bufs.x_norm, &mut bufs.x_u8, &mut bufs.expert_out,
-                );
+                let expert = &self.experts[idx];
+
+                // gate/up: 공유 버퍼(x_u8_shared)에서 읽기 — 재계산 없음
+                bufs.ff1.resize(expert.d_ff, 0.0);
+                bufs.ff2.resize(expert.d_ff, 0.0);
+                expert.gate_proj.matmul_preq(&bufs.x_u8_shared[..n], bufs.x_scale_shared, &mut bufs.ff1);
+                expert.up_proj.matmul_preq(&bufs.x_u8_shared[..n], bufs.x_scale_shared, &mut bufs.ff2);
+
+                for i in 0..expert.d_ff {
+                    bufs.ff1[i] = sigmoid_scalar(bufs.ff1[i]) * bufs.ff2[i];
+                }
+
+                // down_proj는 x_u8(일반 버퍼)를 사용 — x_u8_shared는 보존됨
+                expert.down_proj.forward_vec(&bufs.ff1, &mut bufs.expert_out,
+                                              &mut bufs.x_norm, &mut bufs.x_u8);
+
                 for i in 0..d_model {
                     out_t[i] += weight * bufs.expert_out[i];
                 }
@@ -729,6 +1048,9 @@ struct MoEBufs {
     ff2: Vec<f32>,
     x_norm: Vec<f32>,
     x_u8: Vec<u8>,
+    // top-k > 1일 때 공유 양자화 저장용
+    x_u8_shared: Vec<u8>,
+    x_scale_shared: f32,
 }
 
 impl MoEBufs {
@@ -743,6 +1065,8 @@ impl MoEBufs {
             ff2: Vec::new(),
             x_norm: vec![0.0; max_in_dim],
             x_u8: vec![0u8; max_in_dim],
+            x_u8_shared: vec![0u8; max_in_dim],
+            x_scale_shared: 0.0,
         }
     }
 }
@@ -841,10 +1165,13 @@ impl SharedLinearSelfAttention {
         for t in 0..seq_len {
             let x_t = &x[t * d..(t + 1) * d];
 
-            // Base projection
-            self.q_proj.forward_vec(x_t, &mut bufs.q[t * d..(t + 1) * d], &mut bufs.x_u8);
-            self.k_proj.forward_vec(x_t, &mut bufs.k[t * d..(t + 1) * d], &mut bufs.x_u8);
-            self.v_proj.forward_vec(x_t, &mut bufs.v[t * d..(t + 1) * d], &mut bufs.x_u8);
+            // q/k/v는 같은 입력 → quantize 1회 공유
+            let x_scale = unsafe {
+                quantize_f32_to_u8(x_t.as_ptr(), bufs.x_u8.as_mut_ptr(), d as c_int)
+            };
+            self.q_proj.matmul_preq(&bufs.x_u8[..d], x_scale, &mut bufs.q[t * d..(t + 1) * d]);
+            self.k_proj.matmul_preq(&bufs.x_u8[..d], x_scale, &mut bufs.k[t * d..(t + 1) * d]);
+            self.v_proj.matmul_preq(&bufs.x_u8[..d], x_scale, &mut bufs.v[t * d..(t + 1) * d]);
 
             // LoRA 보정
             if lora_idx < self.lora_q.len() {
@@ -900,9 +1227,7 @@ impl SharedLinearSelfAttention {
                 let z_off = h * dh;
                 let out_off = t * d + h_off;
 
-                // Q[t,h] @ context[h]  via cblas_sgemv
-                // context is (dh, dh) row-major
-                // want: out[d] = sum_i Q[i] * context[i][d]  →  context^T @ Q
+                // Q[t,h] @ context[h] via cblas_sgemv
                 unsafe {
                     cblas_sgemv(
                         CBLAS_ROW_MAJOR,
@@ -920,13 +1245,12 @@ impl SharedLinearSelfAttention {
                     );
                 }
 
-                // normalizer: Q[t,h] . z[h]
+                // normalizer
                 let mut den = 0.0f32;
                 for i in 0..dh {
                     den += bufs.q[t * d + h_off + i] * bufs.z[z_off + i];
                 }
                 den = (den + 1e-5f32).recip();
-
                 for i in 0..dh {
                     bufs.output[out_off + i] *= den;
                 }
@@ -1202,27 +1526,27 @@ impl BitEditor {
                 );
 
                 // Shared attention 삽입 (해당 레이어 이후)
+                // Python: x = attn_norm(x + shared_attn(x)) — post-norm
                 if self.attn_insertion_set.contains(&layer_idx) {
-                    // attention norm
-                    normed.resize(cur_len * d, 0.0);
-                    let mut norm_in = vec![0.0f32; d];
-                    for t in 0..cur_len {
-                        let off = t * d;
-                        norm_in.copy_from_slice(&x[off..off + d]);
-                        self.attn_norms[attn_insert_idx].forward_vec(
-                            &norm_in, &mut normed[off..off + d],
-                        );
-                    }
-
-                    // shared self-attention
+                    // shared self-attention (정규화 없이 x 직접 입력)
                     self.shared_attn.forward_batch(
-                        &normed, cur_len, attn_insert_idx, &mut attn_bufs,
+                        &x, cur_len, attn_insert_idx, &mut attn_bufs,
                     );
 
-                    // residual
+                    // x = x + attn_out
                     for i in 0..cur_len * d {
                         x[i] += attn_bufs.final_out[i];
                     }
+
+                    // post-norm: x = RMSNorm(x)
+                    for t in 0..cur_len {
+                        let off = t * d;
+                        // in-place 불가 → normed를 임시 버퍼로 사용
+                        self.attn_norms[attn_insert_idx].forward_vec(
+                            &x[off..off + d], &mut normed[off..off + d],
+                        );
+                    }
+                    x[..cur_len * d].copy_from_slice(&normed[..cur_len * d]);
 
                     attn_insert_idx += 1;
                 }
@@ -1287,6 +1611,142 @@ impl BitEditor {
                 break;
             }
         }
+
+        current_ids
+    }
+
+    /// 프로파일링 버전: 구간별 시간 측정
+    pub fn correct_profiled(&self, src_ids: &[u32]) -> Vec<u32> {
+        use std::time::Instant;
+
+        let d = self.cfg.d_model;
+        let scale = self.cfg.embed_scale();
+        let vocab_size = self.cfg.vocab_size;
+        let n_tags = self.cfg.n_tags;
+        let max_in_dim = d.max(self.cfg.d_ff).max(n_tags);
+
+        let mut fwd_bufs = RWKVBufs::new(max_in_dim);
+        let mut bwd_bufs = RWKVBufs::new(max_in_dim);
+        let mut moe_bufs = MoEBufs::new(max_in_dim);
+        let mut attn_bufs = AttnBufs::new(max_in_dim);
+        let mut x_rev = Vec::new();
+        let mut normed = Vec::new();
+
+        let mut current_ids = src_ids.to_vec();
+        let cur_len = current_ids.len();
+
+        // 타이머
+        let mut t_embed = 0u128;
+        let mut t_norm = 0u128;
+        let mut t_birwkv = 0u128;
+        let mut t_moe = 0u128;
+        let mut t_shared_attn = 0u128;
+        let mut t_final = 0u128;
+        let mut rwkv_detail = [0u128; 6]; // [fwd_proj, fwd_wkv, fwd_post, bwd_proj, bwd_wkv, bwd_post]
+
+        // 임베딩
+        let t0 = Instant::now();
+        let mut x = vec![0.0f32; cur_len * d];
+        for (t, &id) in current_ids.iter().enumerate() {
+            let emb_off = id as usize * d;
+            for i in 0..d { x[t * d + i] = self.embedding[emb_off + i] * scale; }
+        }
+        t_embed = t0.elapsed().as_micros();
+
+        // 레이어
+        let mut attn_insert_idx = 0usize;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            // pre-norm
+            let t0 = Instant::now();
+            normed.resize(cur_len * d, 0.0);
+            for t in 0..cur_len {
+                let off = t * d;
+                layer.norm1.forward_vec(&x[off..off + d], &mut normed[off..off + d]);
+            }
+            t_norm += t0.elapsed().as_micros();
+
+            // BiRWKV (세분화 프로파일링)
+            let t0 = Instant::now();
+            layer.bi_rwkv.forward_batch_profiled(&normed, cur_len, d, &mut fwd_bufs, &mut bwd_bufs, &mut x_rev, &mut rwkv_detail);
+            for i in 0..(cur_len * d) { x[i] += fwd_bufs.final_out[i]; }
+            t_birwkv += t0.elapsed().as_micros();
+
+            // pre-norm → MoE
+            let t0 = Instant::now();
+            for t in 0..cur_len {
+                let off = t * d;
+                layer.norm2.forward_vec(&x[off..off + d], &mut normed[off..off + d]);
+            }
+            t_norm += t0.elapsed().as_micros();
+
+            let t0 = Instant::now();
+            layer.moe_ffn.forward_batch(&normed, cur_len, d, &mut moe_bufs);
+            for i in 0..(cur_len * d) { x[i] += moe_bufs.output[i]; }
+            t_moe += t0.elapsed().as_micros();
+
+            // Shared attention
+            if self.attn_insertion_set.contains(&layer_idx) {
+                let t0 = Instant::now();
+                self.shared_attn.forward_batch(&x, cur_len, attn_insert_idx, &mut attn_bufs);
+                for i in 0..cur_len * d { x[i] += attn_bufs.final_out[i]; }
+                for t in 0..cur_len {
+                    let off = t * d;
+                    self.attn_norms[attn_insert_idx].forward_vec(
+                        &x[off..off + d], &mut normed[off..off + d]);
+                }
+                x[..cur_len * d].copy_from_slice(&normed[..cur_len * d]);
+                t_shared_attn += t0.elapsed().as_micros();
+                attn_insert_idx += 1;
+            }
+        }
+
+        // Final norm + tag head
+        let t0 = Instant::now();
+        normed.resize(cur_len * d, 0.0);
+        {
+            let mut norm_in = vec![0.0f32; d];
+            for t in 0..cur_len {
+                let off = t * d;
+                norm_in.copy_from_slice(&x[off..off + d]);
+                self.final_norm.forward_vec(&norm_in, &mut normed[off..off + d]);
+            }
+        }
+        let mut x_u8 = vec![0u8; d];
+        let mut tag_logits = vec![0.0f32; n_tags];
+        let mut tags = Vec::with_capacity(cur_len);
+        for t in 0..cur_len {
+            let h_t = &normed[t * d..(t + 1) * d];
+            let x_scale = unsafe { quantize_f32_to_u8(h_t.as_ptr(), x_u8.as_mut_ptr(), d as c_int) };
+            unsafe {
+                i8_sgemv(self.tag_head_w.as_ptr(), x_u8.as_ptr(), tag_logits.as_mut_ptr(),
+                         n_tags as c_int, d as c_int, self.tag_head_sums.as_ptr(),
+                         self.tag_head_scales.as_ptr(), x_scale, 0.0);
+            }
+            for i in 0..n_tags { tag_logits[i] += self.tag_head_bias[i]; }
+            let best_tag = tag_logits[..n_tags].iter().enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(idx, _)| idx as u32).unwrap_or(TAG_KEEP);
+            tags.push(best_tag);
+        }
+        t_final = t0.elapsed().as_micros();
+
+        current_ids = apply_edit_tags(&current_ids, &tags, vocab_size as u32);
+
+        let total = t_embed + t_norm + t_birwkv + t_moe + t_shared_attn + t_final;
+        eprintln!("\n──── 프로파일 ({} 토큰) ────", cur_len);
+        eprintln!("  임베딩:          {:>6}µs ({:.1}%)", t_embed, t_embed as f64 / total as f64 * 100.0);
+        eprintln!("  RMSNorm:         {:>6}µs ({:.1}%)", t_norm, t_norm as f64 / total as f64 * 100.0);
+        eprintln!("  BiRWKV:          {:>6}µs ({:.1}%)", t_birwkv, t_birwkv as f64 / total as f64 * 100.0);
+        eprintln!("    ├─ fwd proj:   {:>6}µs ({:.1}%)", rwkv_detail[0], rwkv_detail[0] as f64 / total as f64 * 100.0);
+        eprintln!("    ├─ fwd wkv:    {:>6}µs ({:.1}%)", rwkv_detail[1], rwkv_detail[1] as f64 / total as f64 * 100.0);
+        eprintln!("    ├─ fwd post:   {:>6}µs ({:.1}%)", rwkv_detail[2], rwkv_detail[2] as f64 / total as f64 * 100.0);
+        eprintln!("    ├─ bwd proj:   {:>6}µs ({:.1}%)", rwkv_detail[3], rwkv_detail[3] as f64 / total as f64 * 100.0);
+        eprintln!("    ├─ bwd wkv:    {:>6}µs ({:.1}%)", rwkv_detail[4], rwkv_detail[4] as f64 / total as f64 * 100.0);
+        eprintln!("    └─ bwd post:   {:>6}µs ({:.1}%)", rwkv_detail[5], rwkv_detail[5] as f64 / total as f64 * 100.0);
+        eprintln!("  MoE FFN:         {:>6}µs ({:.1}%)", t_moe, t_moe as f64 / total as f64 * 100.0);
+        eprintln!("  SharedAttention:  {:>6}µs ({:.1}%)", t_shared_attn, t_shared_attn as f64 / total as f64 * 100.0);
+        eprintln!("  Final+TagHead:   {:>6}µs ({:.1}%)", t_final, t_final as f64 / total as f64 * 100.0);
+        eprintln!("  합계:            {:>6}µs", total);
 
         current_ids
     }

@@ -1,0 +1,26 @@
+{
+  "d_model": 384,
+  "n_rwkv_layers": 10,
+  "d_inner": 384,
+  "n_heads": 12,
+  "headdim": 32,
+  "d_ff": 512,
+  "n_experts": 16,
+  "top_k": 1,
+  "n_attn_heads": 24,
+  "attn_insertion_points": [
+    3,
+    7,
+    9
+  ],
+  "lora_rank": 16,
+  "vocab_size": 303,
+  "n_tags": 608,
+  "max_seq_len": 2048,
+  "dropout": 0.1,
+  "rms_norm_eps": 1e-06,
+  "pad_id": 0,
+  "bos_id": 2,
+  "aux_loss_weight": 0.01,
+  "n_iterations": 1
+}
