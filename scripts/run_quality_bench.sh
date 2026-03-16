@@ -22,7 +22,7 @@ CORPUS="corpus/sample_full.jsonl"
 VAL_CORPUS="corpus/val_50k.jsonl"
 TEXT_KEY="text"
 NGPU=8
-D_MODEL=768
+D_MODEL=640
 SEQ_LEN=2048      # 패킹: BOS..EOS BOS..EOS → 2048 토큰 (GPU 활용 극대화)
 BATCH_SIZE=2      # per-GPU micro batch (16GB + seq=2048)
 GRAD_ACCUM=4      # effective batch = 2 * 4 * 8 = 64
