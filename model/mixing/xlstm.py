@@ -49,6 +49,11 @@ try:
 
     def triton_slstm_scan(i_gate, f_gate, z_gate, o_gate):
         B, T, D = i_gate.shape
+        # Triton sigmoid/exp/tanh는 fp32만 지원
+        i_gate = i_gate.float()
+        f_gate = f_gate.float()
+        z_gate = z_gate.float()
+        o_gate = o_gate.float()
         i_flat = i_gate.permute(0, 2, 1).contiguous().view(B * D, T)
         f_flat = f_gate.permute(0, 2, 1).contiguous().view(B * D, T)
         z_flat = z_gate.permute(0, 2, 1).contiguous().view(B * D, T)
