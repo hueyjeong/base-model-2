@@ -15,7 +15,7 @@ export BITLINEAR_CUDA_GRADW_LT=1
 export BITLINEAR_CUDA_FUSED_ACT=1
 export BITLINEAR_CUDA_FUSED_WEIGHT=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export OMP_NUM_THREADS=4
+export OMP_NUM_THREADS=16
 export NCCL_P2P_DISABLE=1
 
 CORPUS="corpus/sample_full.jsonl"
