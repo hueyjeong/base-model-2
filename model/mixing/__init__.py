@@ -33,5 +33,8 @@ def create_mixing_layer(cfg: "DenseEditorConfig") -> "MixingLayer":
     elif t == "xlstm":
         from model.mixing.xlstm import BiSLSTMMixing
         return BiSLSTMMixing(cfg)
+    elif t == "mlstm":
+        from model.mixing.mlstm import BiMLSTMMixing
+        return BiMLSTMMixing(cfg)
     else:
         raise ValueError(f"알 수 없는 mixing_type: {t}")

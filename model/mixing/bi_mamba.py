@@ -1,10 +1,7 @@
 """BiMamba Mixing Layer — 양방향 Mamba-1 Selective Scan
 
-Mamba (Gu & Dao, 2023) — selective state space model.
-GPU 학습: mamba_ssm CUDA 커널 자동 감지 → Python fallback
-CPU 추론: recurrent scan (O(T × d_inner × d_state))
-
-State: d_inner × d_state = 512×16 = 32KB → L1/L2 캐시 경계
+GPU 학습: mamba_ssm CUDA 커널 (selective_scan_fn) 자동 감지
+CPU 추론: Python sequential scan fallback
 """
 import math
 
@@ -16,13 +13,32 @@ from torch import Tensor
 from model.mixing.base import MixingLayer
 from model.bitlinear import BitLinear
 
+# mamba_ssm CUDA 커널 감지
+_MAMBA_CUDA = False
+_selective_scan_fn = None
+try:
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+    _MAMBA_CUDA = True
+    _selective_scan_fn = selective_scan_fn
+except ImportError:
+    pass
+
+
+@torch.compiler.disable
+def _selective_scan_wrapper(u, delta, A, B, C, D, z, delta_bias, delta_softplus):
+    """mamba_ssm selective_scan_fn 래퍼 — torch.compile 충돌 방지"""
+    return _selective_scan_fn(
+        u, delta, A, B, C, D=D, z=z,
+        delta_bias=delta_bias, delta_softplus=delta_softplus,
+        return_last_state=False,
+    )
+
 
 class MambaBlock(nn.Module):
     """Mamba-1 단방향 블록
 
-    구조: in_proj → conv1d → SSM scan → out_proj
-    in_proj: d → 2*d_inner (x_branch + z_branch)
-    SSM: h = exp(A·Δ)·h + Δ·B·x, y = C·h + D·x
+    GPU: mamba_ssm selective_scan_fn (fused CUDA kernel)
+    CPU: Python sequential scan fallback
     """
 
     def __init__(self, d_model: int, d_state: int = 16, d_conv: int = 4, expand: int = 2):
@@ -36,7 +52,7 @@ class MambaBlock(nn.Module):
         # in_proj: d → 2*d_inner (x + z branch)
         self.in_proj = BitLinear(d_model, 2 * self.d_inner)
 
-        # conv1d (작은 커널, float)
+        # conv1d
         self.conv1d = nn.Conv1d(
             self.d_inner, self.d_inner,
             kernel_size=d_conv, padding=d_conv - 1,
@@ -67,56 +83,59 @@ class MambaBlock(nn.Module):
         # conv1d
         x_conv = x_branch.transpose(1, 2)  # (B, d_inner, T)
         x_conv = self.conv1d(x_conv)[:, :, :T]
-        x_conv = F.silu(x_conv).transpose(1, 2)  # (B, T, d_inner)
+        x_conv = F.silu(x_conv)  # (B, d_inner, T) — keep transposed for selective_scan
 
         # SSM 파라미터
-        x_ssm = self.x_proj(x_conv)
+        x_for_proj = x_conv.transpose(1, 2)  # (B, T, d_inner)
+        x_ssm = self.x_proj(x_for_proj)
         dt, B_ssm, C_ssm = x_ssm.split(
             [self.dt_rank, self.d_state, self.d_state], dim=-1
         )
-        dt = F.softplus(self.dt_proj(dt))  # (B, T, d_inner)
-        B_ssm = B_ssm  # (B, T, d_state)
-        C_ssm = C_ssm  # (B, T, d_state)
+        dt = self.dt_proj(dt)  # (B, T, d_inner) — softplus는 selective_scan 내부에서
 
-        A = -torch.exp(self.A_log)  # (d_inner, d_state)
+        A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
 
-        # Sequential scan (CPU/학습 호환)
-        y = self._scan(x_conv, dt, A, B_ssm, C_ssm)
+        if _MAMBA_CUDA and x.is_cuda:
+            # selective_scan_fn은 모든 입력이 동일 dtype (float32) 필요
+            dt_t = dt.float().transpose(1, 2).contiguous()
+            B_t = B_ssm.float().transpose(1, 2).contiguous()
+            C_t = C_ssm.float().transpose(1, 2).contiguous()
+            z_t = z.float().transpose(1, 2).contiguous()
 
-        # skip + gate
-        y = y + self.D * x_conv
-        y = y * F.silu(z)
+            y = _selective_scan_wrapper(
+                x_conv.float().contiguous(), dt_t, A, B_t, C_t,
+                D=self.D.float(), z=z_t,
+                delta_bias=self.dt_proj.bias.float(),
+                delta_softplus=True,
+            )
+            y = y.to(x.dtype).transpose(1, 2)
+        else:
+            # Python fallback (CPU)
+            x_f = x_conv.transpose(1, 2)  # (B, T, d_inner)
+            dt_sp = F.softplus(dt)
+            y = self._scan_sequential(x_f, dt_sp, A, B_ssm, C_ssm)
+            y = y + self.D * x_f
+            y = y * F.silu(z)
 
-        # out_proj
         return self.out_proj(y)
 
-    def _scan(self, x: Tensor, dt: Tensor, A: Tensor, B: Tensor, C: Tensor) -> Tensor:
-        """Sequential selective scan
-
-        h[t] = exp(A * dt[t]) * h[t-1] + dt[t] * B[t] * x[t]
-        y[t] = C[t] @ h[t]
-        """
+    def _scan_sequential(self, x, dt, A, B, C):
+        """Python sequential scan fallback (CPU용)"""
         batch, T, d_inner = x.shape
         d_state = self.d_state
-
         h = x.new_zeros(batch, d_inner, d_state)
         ys = []
-
         for t in range(T):
-            dt_t = dt[:, t, :].unsqueeze(-1)  # (B, d_inner, 1)
-            x_t = x[:, t, :].unsqueeze(-1)    # (B, d_inner, 1)
-            B_t = B[:, t, :].unsqueeze(1)      # (B, 1, d_state)
-            C_t = C[:, t, :].unsqueeze(1)      # (B, 1, d_state)
-
-            # discretize
-            dA = torch.exp(A.unsqueeze(0) * dt_t)  # (B, d_inner, d_state)
-            dB = dt_t * B_t * x_t  # (B, d_inner, d_state)
-
+            dt_t = dt[:, t, :].unsqueeze(-1)
+            x_t = x[:, t, :].unsqueeze(-1)
+            B_t = B[:, t, :].unsqueeze(1)
+            C_t = C[:, t, :].unsqueeze(1)
+            dA = torch.exp(A.unsqueeze(0) * dt_t)
+            dB = dt_t * B_t * x_t
             h = dA * h + dB
-            y_t = (C_t * h).sum(dim=-1)  # (B, d_inner)
+            y_t = (C_t * h).sum(dim=-1)
             ys.append(y_t)
-
-        return torch.stack(ys, dim=1)  # (B, T, d_inner)
+        return torch.stack(ys, dim=1)
 
 
 class BiMambaMixing(MixingLayer):
@@ -124,19 +143,13 @@ class BiMambaMixing(MixingLayer):
 
     def __init__(self, cfg):
         super().__init__()
-        self.fwd = MambaBlock(
-            cfg.d_model, cfg.mamba_d_state, cfg.mamba_d_conv, cfg.mamba_expand,
-        )
-        self.bwd = MambaBlock(
-            cfg.d_model, cfg.mamba_d_state, cfg.mamba_d_conv, cfg.mamba_expand,
-        )
+        self.fwd = MambaBlock(cfg.d_model, cfg.mamba_d_state, cfg.mamba_d_conv, cfg.mamba_expand)
+        self.bwd = MambaBlock(cfg.d_model, cfg.mamba_d_state, cfg.mamba_d_conv, cfg.mamba_expand)
 
     def forward(self, x: Tensor, pad_mask: Tensor | None = None) -> Tensor:
         fwd_out = self.fwd(x)
         bwd_out = self.bwd(x.flip(1)).flip(1)
         out = fwd_out + bwd_out
-
         if pad_mask is not None:
             out = out * pad_mask.unsqueeze(-1).to(out.dtype)
-
         return out
