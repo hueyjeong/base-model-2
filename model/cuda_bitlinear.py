@@ -507,7 +507,6 @@ class Int8LinearCuda(nn.Module):
         self.norm = nn.LayerNorm(in_features, elementwise_affine=False)
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
-    @torch.compiler.disable
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_norm = self.norm(x)
 
