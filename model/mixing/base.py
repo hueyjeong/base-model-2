@@ -13,13 +13,13 @@ from torch import Tensor
 class MixingLayer(nn.Module, ABC):
     """교체 가능한 토큰 믹싱 레이어 추상 클래스
 
-    모든 mixing layer는 동일한 입출력 형태를 가진다:
-        입력: (B, T, d_model)
-        출력: (B, T, d_model)
-
-    pad_mask: (B, T) bool — True가 유효 데이터. PAD 위치의 출력을 0으로 마스킹.
+    Args:
+        x: (B, T, d_model) 입력
+        pad_mask: (B, T) bool — True가 유효 데이터
+        reset_mask: (B, T) bool — True = BOS 위치 (패킹 시 문서 경계 state 리셋)
     """
 
     @abstractmethod
-    def forward(self, x: Tensor, pad_mask: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, pad_mask: Tensor | None = None,
+                reset_mask: Tensor | None = None) -> Tensor:
         ...

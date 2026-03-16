@@ -41,9 +41,10 @@ class DenseEditorLayer(nn.Module):
 
     def forward(
         self, x: torch.Tensor, pad_mask: torch.Tensor | None = None,
+        reset_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # pre-norm → Mixing → residual
-        x = x + self.dropout(self.mixing(self.norm1(x), pad_mask=pad_mask))
+        # pre-norm → Mixing → residual (reset_mask로 문서 경계 state 리셋)
+        x = x + self.dropout(self.mixing(self.norm1(x), pad_mask=pad_mask, reset_mask=reset_mask))
         # pre-norm → FFN → residual
         x = x + self.dropout(self.ffn(self.norm2(x)))
         return x
@@ -105,11 +106,14 @@ class DenseEditor(nn.Module):
         x = self.embedding(input_ids) * self.embed_scale
         x = self.embed_dropout(x)
 
+        # 문서 경계 감지 (패킹 시 BOS 위치에서 state 리셋)
+        reset_mask = (input_ids == self.cfg.bos_id)
+
         for layer in self.layers:
             if self.gradient_checkpointing and self.training:
-                x = checkpoint(layer, x, pad_mask, use_reentrant=False)
+                x = checkpoint(layer, x, pad_mask, reset_mask, use_reentrant=False)
             else:
-                x = layer(x, pad_mask=pad_mask)
+                x = layer(x, pad_mask=pad_mask, reset_mask=reset_mask)
 
         x = self.final_norm(x)
         tag_logits = self.tag_head(x.float())

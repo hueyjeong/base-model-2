@@ -22,7 +22,7 @@ class FNetMixing(MixingLayer):
     def __init__(self, cfg):
         super().__init__()
 
-    def forward(self, x: Tensor, pad_mask: Tensor | None = None) -> Tensor:
+    def forward(self, x: Tensor, pad_mask: Tensor | None = None, reset_mask: Tensor | None = None) -> Tensor:
         # (B, T, d) — 시퀀스 차원(dim=1)에 1D FFT
         # FP32로 변환 후 FFT (bf16에서 FFT 불안정)
         orig_dtype = x.dtype

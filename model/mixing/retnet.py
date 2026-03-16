@@ -53,7 +53,8 @@ class RetentionScan(nn.Module):
         gammas = torch.linspace(gamma_min, gamma_max, n_heads)
         self.register_buffer("gammas", gammas)
 
-    def forward(self, x: Tensor, reverse: bool = False) -> Tensor:
+    def forward(self, x: Tensor, reverse: bool = False,
+                reset_mask: Tensor | None = None) -> Tensor:
         B, T, _ = x.shape
         H, D = self.n_heads, self.headdim
 
@@ -63,6 +64,12 @@ class RetentionScan(nn.Module):
         k = k.view(B, T, H, D)
         v = v.view(B, T, H, D)
         g = F.silu(self.g_proj(x)).view(B, T, H, D)
+
+        # BOS 리셋: k,v를 0으로 → state에 정보 유입 차단
+        if reset_mask is not None:
+            rst = reset_mask.unsqueeze(-1).unsqueeze(-1).to(k.dtype)  # (B, T, 1, 1)
+            k = k * (1 - rst)
+            v = v * (1 - rst)
 
         if _FLA_RETENTION and x.is_cuda:
             # fla 레이아웃: (B, H, T, D)
@@ -116,9 +123,11 @@ class BiRetentionMixing(MixingLayer):
             cfg.retnet_gamma_min, cfg.retnet_gamma_max,
         )
 
-    def forward(self, x: Tensor, pad_mask: Tensor | None = None) -> Tensor:
-        fwd_out = self.fwd(x, reverse=False)
-        bwd_out = self.bwd(x, reverse=True)
+    def forward(self, x: Tensor, pad_mask: Tensor | None = None,
+                reset_mask: Tensor | None = None) -> Tensor:
+        bwd_reset = reset_mask.flip(1) if reset_mask is not None else None
+        fwd_out = self.fwd(x, reverse=False, reset_mask=reset_mask)
+        bwd_out = self.bwd(x, reverse=True, reset_mask=bwd_reset)
         out = fwd_out + bwd_out
         if pad_mask is not None:
             out = out * pad_mask.unsqueeze(-1).to(out.dtype)
