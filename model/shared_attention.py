@@ -140,6 +140,7 @@ class SharedLinearSelfAttention(nn.Module):
 
         return out
 
+    @torch.compiler.disable
     def _doc_isolated_attention(
         self,
         q: torch.Tensor,  # (B, H, T, d_head)
