@@ -36,7 +36,7 @@ class DenseEditorLayer(nn.Module):
         self.norm1 = RMSNorm(cfg.d_model, eps=cfg.rms_norm_eps)
         self.mixing = create_mixing_layer(cfg)
         self.norm2 = RMSNorm(cfg.d_model, eps=cfg.rms_norm_eps)
-        self.ffn = BitNetFFN(cfg.d_model, cfg.d_ff, dropout=cfg.dropout)
+        self.ffn = BitNetFFN(cfg.d_model, cfg.d_ff, dropout=cfg.dropout, fused_gate_up=True)
         self.dropout = nn.Dropout(cfg.dropout)
 
     def forward(
