@@ -131,7 +131,6 @@ class MoEBitNetFFN(nn.Module):
         # Batched Expert FFN (E개를 단일 bmm으로 처리)
         self.experts = BatchedBitNetFFN(n_experts, d_model, d_ff, dropout)
 
-    @torch.compiler.disable
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:

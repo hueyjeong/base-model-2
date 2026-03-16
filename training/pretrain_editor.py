@@ -288,16 +288,7 @@ def train(args):
     if args.grad_ckpt:
         raw_model.gradient_checkpointing = True
 
-    # torch.compile (DDP 전에 — compile은 로컬 계산만 최적화, DDP는 통신을 독립 관리)
-    if args.compile:
-        torch._dynamo.config.capture_scalar_outputs = True
-        torch._dynamo.config.recompile_limit = 64
-        torch._dynamo.config.cache_size_limit = 256
-        if global_rank == 0:
-            print("torch.compile 적용 중... (첫 step 느림, 이후 빠름)")
-        model = torch.compile(model)
-
-    # DDP (compile 후에)
+    # DDP
     if is_distributed:
         model = DDP(
             model,
@@ -305,6 +296,15 @@ def train(args):
             gradient_as_bucket_view=True,  # gradient 복사 제거 → 메모리 절약 + 속도
             static_graph=True,             # 통신/계산 오버랩 최적화 (MoE 모듈 set 고정)
         )
+
+    # torch.compile (DDP 후에 — DDP 래핑 후 compile해야 reducer hook 충돌 방지)
+    if args.compile:
+        torch._dynamo.config.capture_scalar_outputs = True
+        torch._dynamo.config.recompile_limit = 64
+        torch._dynamo.config.cache_size_limit = 256
+        if global_rank == 0:
+            print("torch.compile 적용 중... (첫 step 느림, 이후 빠름)")
+        model = torch.compile(model)
 
     # 노이즈 설정 (토큰 레벨 비활성화)
     noise_cfg = NoiseConfig(

@@ -243,7 +243,6 @@ class Int8Linear(nn.Linear):
         self._w_quant_cache: torch.Tensor | None = None
         self._w_scale_cache: torch.Tensor | None = None
 
-    @torch.compiler.disable
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # LayerNorm (BitLinear과 동일한 sub-layer norm)
         x = self.norm(x)
