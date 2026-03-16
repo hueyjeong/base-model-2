@@ -64,7 +64,6 @@ void i8_sgemv(
     float x_scale,                 /* activation dequant: eta / 127 */
     float w_scale                  /* global weight scale (BitLinear gamma; Linear이면 0) */
 ) {
-    #pragma omp parallel for schedule(static) if(m >= 64)
     for (int row = 0; row < m; row++) {
         int32_t dot = vnni_dot(x_u8, (const int8_t*)(weights + (int64_t)row * n), n);
         int32_t corrected = dot - 128 * row_sums[row];
@@ -163,7 +162,6 @@ void ternary_sgemv(
     float x_scale                   /* activation dequant scale */
 ) {
     float combined_scale = gamma * x_scale;
-    #pragma omp parallel for schedule(static) if(m >= 64)
     for (int row = 0; row < m; row++) {
         /* thread-local 언팩 버퍼 (최대 in_dim + 32 패딩) */
         static __thread int8_t unpack_buf[8192];
@@ -174,6 +172,23 @@ void ternary_sgemv(
         int32_t dot = vnni_dot(x_u8, unpack_buf, n);
         int32_t corrected = dot - 128 * row_sums[row];
         y[row] = (float)corrected * combined_scale;
+    }
+}
+
+/* ── 2-bit packed → i8 배치 언팩 (모델 로드 시 1회 호출) ──── */
+
+void unpack_2bit_rows(
+    const uint8_t* packed,   /* [rows × packed_stride] packed 2-bit */
+    int8_t* out,             /* [rows × cols] i8 output (row-major) */
+    int rows, int cols, int packed_stride
+) {
+    init_byte_lut();
+    for (int row = 0; row < rows; row++) {
+        unpack_2bit_row(
+            packed + (int64_t)row * packed_stride,
+            out + (int64_t)row * cols,
+            cols
+        );
     }
 }
 
@@ -240,4 +255,161 @@ float quantize_f32_to_u8(const float* x, uint8_t* out, int n) {
         out[i] = (uint8_t)(iv + 128);
     }
     return eta / 127.0f;  /* x_scale */
+}
+
+/* ── 배치 f32 → u8 양자화 (seq_len 토큰을 한 번에) ──── */
+
+void batch_quantize_f32_to_u8(
+    const float* x,       /* [seq_len × d] row-major */
+    uint8_t* out,         /* [seq_len × d] row-major */
+    float* scales,        /* [seq_len] per-token x_scale 출력 */
+    int seq_len, int d
+) {
+    for (int t = 0; t < seq_len; t++) {
+        scales[t] = quantize_f32_to_u8(x + (int64_t)t * d, out + (int64_t)t * d, d);
+    }
+}
+
+/* ── i8 sgemm: X_u8[n,k] × W_i8[m,k]^T → Y[n,m] ──── */
+/*
+ * 배치 matmul: n개 토큰의 양자화된 활성화 × 가중치 행렬
+ * 가중치 행 1개를 로드하고 n개 토큰 전부와 dot → 가중치 재사용 n배
+ *
+ * Y[t,j] = (dot(X_u8[t,:], W_i8[j,:]) - 128 * row_sums[j]) * scale_j * x_scales[t]
+ * scale_j = row_scales[j] (Linear) 또는 w_scale (BitLinear)
+ */
+
+void i8_sgemm(
+    const int8_t* W,          /* [m, k] row-major */
+    const uint8_t* X_u8,      /* [n, k] row-major (n=seq_len) */
+    float* Y,                 /* [n, m] row-major */
+    int m, int n, int k,
+    const int32_t* row_sums,  /* [m] Σ W[j,:] */
+    const float* row_scales,  /* [m] per-row scale (NULL → w_scale) */
+    const float* x_scales,    /* [n] per-token scale */
+    float w_scale             /* global scale (BitLinear gamma; 0 for Linear) */
+) {
+    /* 토큰 기준 외부 루프 — 활성화 벡터를 L1에 유지하며 m개 출력 계산 */
+    for (int t = 0; t < n; t++) {
+        const uint8_t* x_row = X_u8 + (int64_t)t * k;
+        float xs = x_scales[t];
+        float* y_row = Y + (int64_t)t * m;
+
+        for (int j = 0; j < m; j++) {
+            int32_t dot = vnni_dot(x_row, W + (int64_t)j * k, k);
+            int32_t corrected = dot - 128 * row_sums[j];
+            float w_s = (row_scales != 0) ? row_scales[j] : w_scale;
+            y_row[j] = (float)corrected * w_s * xs;
+        }
+    }
+}
+
+/* ── WKV-6 순차 스캔 (AVX2 FMA 벡터화, headdim=32 전용) ──── */
+/*
+ * 1회 호출로 1방향 전체 시퀀스 처리 (순방향 또는 역방향).
+ *
+ * headdim=32 → 32 floats = 4×__m256, L1 캐시에 완전히 들어감.
+ * cblas_sgemv 호출 제거 → 인라인 FMA로 10x+ 가속.
+ *
+ * 수식:
+ *   output[t,h,:] = (S[t-1,h] + u[h] * k[t,h] ⊗ v[t,h])^T @ r[t,h]
+ *   S[t,h] = diag(decay[t,h]) * S[t-1,h] + k[t,h] ⊗ v[t,h]
+ *   where decay[i] = 1/(1+exp(w_raw[i]))  (sigmoid of -w_raw)
+ */
+
+void wkv6_scan_avx2(
+    const float* r,       /* [seq_len × d_model] */
+    const float* k,       /* [seq_len × d_model] */
+    const float* v,       /* [seq_len × d_model] */
+    const float* w,       /* [seq_len × d_model] — raw decay (before -softplus) */
+    const float* u_param, /* [n_heads × headdim] — in-context bonus */
+    float* output,        /* [seq_len × d_model] */
+    float* state,         /* [n_heads × 32 × 32] — 호출자가 0으로 초기화 */
+    int seq_len, int n_heads, int headdim, int d_model
+) {
+    /* headdim=32 전용 최적화 (4 × __m256) */
+    const int HD = 32;
+    /* assert(headdim == 32) */
+
+    for (int t = 0; t < seq_len; t++) {
+        const float* r_t = r + (int64_t)t * d_model;
+        const float* k_t = k + (int64_t)t * d_model;
+        const float* v_t = v + (int64_t)t * d_model;
+        const float* w_t = w + (int64_t)t * d_model;
+        float* out_t = output + (int64_t)t * d_model;
+
+        for (int h = 0; h < n_heads; h++) {
+            int h_off = h * HD;
+            float* S = state + h * HD * HD;  /* state[h]: 32×32 */
+
+            /* v[t,h,:] → 4 AVX2 레지스터 */
+            __m256 v0 = _mm256_loadu_ps(v_t + h_off);
+            __m256 v1 = _mm256_loadu_ps(v_t + h_off + 8);
+            __m256 v2 = _mm256_loadu_ps(v_t + h_off + 16);
+            __m256 v3 = _mm256_loadu_ps(v_t + h_off + 24);
+
+            /* output 누적기 초기화 */
+            __m256 out0 = _mm256_setzero_ps();
+            __m256 out1 = _mm256_setzero_ps();
+            __m256 out2 = _mm256_setzero_ps();
+            __m256 out3 = _mm256_setzero_ps();
+
+            /* 행별 순회: i = 0..31 */
+            for (int i = 0; i < HD; i++) {
+                float* si = S + i * HD;  /* state[h][i][:] */
+
+                /* 스칼라 값 로드 */
+                float u_val = u_param[h_off + i];
+                float k_val = k_t[h_off + i];
+                float r_val = r_t[h_off + i];
+                float w_raw = w_t[h_off + i];
+                float decay = 1.0f / (1.0f + expf(w_raw));
+
+                /* uk = u[i] * k[i] */
+                __m256 vuk = _mm256_set1_ps(u_val * k_val);
+                /* r_i = r[i] */
+                __m256 vr = _mm256_set1_ps(r_val);
+                /* decay_i */
+                __m256 vdecay = _mm256_set1_ps(decay);
+                /* k_i */
+                __m256 vk = _mm256_set1_ps(k_val);
+
+                /* state[i][:] 로드 (4 × __m256) */
+                __m256 s0 = _mm256_loadu_ps(si);
+                __m256 s1 = _mm256_loadu_ps(si + 8);
+                __m256 s2 = _mm256_loadu_ps(si + 16);
+                __m256 s3 = _mm256_loadu_ps(si + 24);
+
+                /* kv_bonus[i][:] = state[i][:] + uk * v[:] */
+                __m256 b0 = _mm256_fmadd_ps(vuk, v0, s0);
+                __m256 b1 = _mm256_fmadd_ps(vuk, v1, s1);
+                __m256 b2 = _mm256_fmadd_ps(vuk, v2, s2);
+                __m256 b3 = _mm256_fmadd_ps(vuk, v3, s3);
+
+                /* output[:] += kv_bonus[i][:] * r[i] */
+                out0 = _mm256_fmadd_ps(b0, vr, out0);
+                out1 = _mm256_fmadd_ps(b1, vr, out1);
+                out2 = _mm256_fmadd_ps(b2, vr, out2);
+                out3 = _mm256_fmadd_ps(b3, vr, out3);
+
+                /* state[i][:] = decay * state[i][:] + k[i] * v[:] */
+                s0 = _mm256_fmadd_ps(vdecay, s0, _mm256_mul_ps(vk, v0));
+                s1 = _mm256_fmadd_ps(vdecay, s1, _mm256_mul_ps(vk, v1));
+                s2 = _mm256_fmadd_ps(vdecay, s2, _mm256_mul_ps(vk, v2));
+                s3 = _mm256_fmadd_ps(vdecay, s3, _mm256_mul_ps(vk, v3));
+
+                /* state 저장 */
+                _mm256_storeu_ps(si, s0);
+                _mm256_storeu_ps(si + 8, s1);
+                _mm256_storeu_ps(si + 16, s2);
+                _mm256_storeu_ps(si + 24, s3);
+            }
+
+            /* output 저장 */
+            _mm256_storeu_ps(out_t + h_off, out0);
+            _mm256_storeu_ps(out_t + h_off + 8, out1);
+            _mm256_storeu_ps(out_t + h_off + 16, out2);
+            _mm256_storeu_ps(out_t + h_off + 24, out3);
+        }
+    }
 }

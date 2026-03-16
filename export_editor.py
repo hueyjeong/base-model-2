@@ -45,11 +45,11 @@ def is_linear_weight(key: str) -> bool:
         return False
     if not key.endswith(".weight"):
         return False
-    # Shared attention projections
-    if ".shared_attn." in key and "_proj." in key:
+    # Shared attention projections (최상위 또는 중첩)
+    if "shared_attn." in key and "_proj." in key:
         return True
     # LoRA weights
-    if ".lora_" in key:
+    if "lora_" in key and ".weight" in key:
         return True
     # Tag head
     if key == "tag_head.weight":
@@ -66,6 +66,28 @@ def is_linear_weight(key: str) -> bool:
     return False
 
 
+def _pack_bitlinear_2d(key: str, w2d: torch.Tensor, entries: list, stats: dict):
+    """2D BitLinear weight를 ternary 양자화 → 2-bit 패킹하여 entries에 추가"""
+    w_quant_i8, gamma = quantize_weights_158(w2d)
+    w_np = w_quant_i8.numpy()
+    rows, cols = w_np.shape
+    row_sums = w_np.astype(np.int32).sum(axis=1).astype(np.int32)
+    packed, packed_stride = pack_ternary_2bit(w_np)
+
+    # 검증
+    unpacked = unpack_2bit_to_i8(packed, rows, cols, packed_stride)
+    assert np.array_equal(w_np, unpacked), f"2-bit pack/unpack 검증 실패: {key}"
+
+    data = packed.tobytes()
+    extra = struct.pack("<f", gamma.item()) + row_sums.tobytes()
+
+    entries.append({
+        "name": key, "dtype": DTYPE_PACKED2BIT,
+        "shape": (rows, cols), "data": data, "extra": extra,
+    })
+    stats["packed2bit"] += 1
+
+
 def export_editor_bmmq(state_dict: dict, out_path: Path):
     """BitEditor 모델을 BMMQ 포맷으로 export"""
     entries = []
@@ -75,25 +97,20 @@ def export_editor_bmmq(state_dict: dict, out_path: Path):
         tensor = state_dict[key]
 
         if is_bitlinear_weight(key):
-            # BitLinear → ternary 양자화 → 2-bit 패킹
-            w_quant_i8, gamma = quantize_weights_158(tensor)
-            w_np = w_quant_i8.numpy()
-            rows, cols = w_np.shape
-            row_sums = w_np.astype(np.int32).sum(axis=1).astype(np.int32)
-            packed, packed_stride = pack_ternary_2bit(w_np)
-
-            # 검증
-            unpacked = unpack_2bit_to_i8(packed, rows, cols, packed_stride)
-            assert np.array_equal(w_np, unpacked), f"2-bit pack/unpack 검증 실패: {key}"
-
-            data = packed.tobytes()
-            extra = struct.pack("<f", gamma.item()) + row_sums.tobytes()
-
-            entries.append({
-                "name": key, "dtype": DTYPE_PACKED2BIT,
-                "shape": (rows, cols), "data": data, "extra": extra,
-            })
-            stats["packed2bit"] += 1
+            if tensor.ndim == 3:
+                # BatchedBitLinear (n_experts, out, in) → per-expert 2D 분할
+                # 키 변환: layers.X.moe_ffn.experts.{proj}.weight
+                #       → layers.X.moe_ffn.experts.{i}.{proj}.weight
+                n_experts = tensor.shape[0]
+                # experts.gate_proj.weight → experts.{i}.gate_proj.weight
+                parts = key.split(".experts.")
+                suffix = parts[1]  # "gate_proj.weight" 등
+                for i in range(n_experts):
+                    expert_key = f"{parts[0]}.experts.{i}.{suffix}"
+                    _pack_bitlinear_2d(expert_key, tensor[i], entries, stats)
+            else:
+                # 일반 2D BitLinear
+                _pack_bitlinear_2d(key, tensor, entries, stats)
 
         elif is_linear_weight(key):
             # Linear → per-row i8 양자화
