@@ -69,6 +69,11 @@ extern "C" {
         state_C: *mut f32, state_n: *mut f32,
         seq_len: c_int, n_heads: c_int, headdim: c_int,
     );
+    pub fn causal_conv1d_avx2(
+        input: *const f32, weight: *const f32, bias: *const f32,
+        output: *mut f32,
+        seq_len: c_int, channels: c_int, kernel_size: c_int,
+    );
     pub fn mamba2_scan_avx2(
         x: *const f32, B: *const f32, C: *const f32,
         decay: *const f32, D_skip: *const f32,
