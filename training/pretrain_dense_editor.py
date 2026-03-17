@@ -284,12 +284,16 @@ def train(args):
             print("torch.compile 적용 중... (첫 step 느림, 이후 빠름)")
         model = torch.compile(model)
 
-    # 노이즈 설정 (토큰 레벨 비활성화)
+    # 노이즈 설정 (토큰 레벨 비활성화, 한국어 오류 증강 CLI 제어)
     noise_cfg = NoiseConfig(
         token_mask_ratio=0.0,
         token_delete_ratio=0.0,
         text_infill_ratio=0.0,
+        korean_error_prob=args.error_prob,
+        korean_error_count=args.error_count,
     )
+    if global_rank == 0:
+        print(f"  noise: error_prob={args.error_prob}, error_count={args.error_count}")
     noiser = DenoisingNoiser(
         tokenizer, noise_cfg,
         seed=args.seed + global_rank,
@@ -361,8 +365,21 @@ def train(args):
         fused=use_fused,
     )
 
-    # Loss
-    criterion = nn.CrossEntropyLoss(ignore_index=-100)
+    # Loss (label smoothing + 편집 태그 가중치)
+    ce_weight = None
+    if args.edit_loss_weight != 1.0:
+        # TAG_KEEP(0)=1.0, 나머지 편집 태그=edit_loss_weight
+        ce_weight = torch.ones(config.n_tags, device=device)
+        ce_weight[1:] = args.edit_loss_weight
+        if global_rank == 0:
+            print(f"  edit_loss_weight={args.edit_loss_weight} (non-KEEP 태그 가중치)")
+    criterion = nn.CrossEntropyLoss(
+        weight=ce_weight,
+        ignore_index=-100,
+        label_smoothing=args.label_smoothing,
+    )
+    if args.label_smoothing > 0 and global_rank == 0:
+        print(f"  label_smoothing={args.label_smoothing}")
 
     # AMP
     use_amp = args.bf16 and torch.cuda.is_available()
@@ -744,8 +761,8 @@ def main():
     parser.add_argument("--batch_size", type=int, default=6)
     parser.add_argument("--grad_accum_steps", type=int, default=4)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--min_lr_ratio", type=float, default=0.1,
-                        help="최소 LR = lr × min_lr_ratio (default 0.1)")
+    parser.add_argument("--min_lr_ratio", type=float, default=0.01,
+                        help="최소 LR = lr × min_lr_ratio (default 0.01)")
     parser.add_argument("--schedule", type=str, default="cosine",
                         choices=["cosine", "wsd"],
                         help="LR 스케줄: cosine 또는 wsd (Warmup-Stable-Decay)")
@@ -761,6 +778,14 @@ def main():
     parser.add_argument("--grad_ckpt", action="store_true")
     parser.add_argument("--compile", action="store_true",
                         help="torch.compile 적용 (커널 fusion, 첫 step 느림)")
+    parser.add_argument("--label_smoothing", type=float, default=0.1,
+                        help="Label smoothing 계수 (0=비활성)")
+    parser.add_argument("--edit_loss_weight", type=float, default=2.0,
+                        help="non-KEEP 편집 태그 loss 가중치 (1.0=균등)")
+    parser.add_argument("--error_prob", type=float, default=0.5,
+                        help="한국어 오류 주입 확률 (NoiseConfig.korean_error_prob)")
+    parser.add_argument("--error_count", type=int, default=3,
+                        help="오류 주입 시 오류 수 (NoiseConfig.korean_error_count)")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
 

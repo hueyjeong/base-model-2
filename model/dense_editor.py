@@ -80,7 +80,9 @@ class DenseEditor(nn.Module):
 
     def _init_weights(self):
         """가중치 초기화"""
-        nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
+        # Xavier 근사 — d_model에 비례하는 std (BERT 0.02는 d=768 기준)
+        embed_std = 1.0 / math.sqrt(self.cfg.d_model)
+        nn.init.normal_(self.embedding.weight, mean=0.0, std=embed_std)
         if self.cfg.pad_id is not None:
             nn.init.zeros_(self.embedding.weight[self.cfg.pad_id])
 
