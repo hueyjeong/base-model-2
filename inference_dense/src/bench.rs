@@ -112,7 +112,7 @@ pub fn benchmark_full_model(mt: &str, sl: usize, d: usize, warmup: usize, n_runs
 
     // per-layer 파라미터 계산
     let mix_params = match mt_base {
-        "mamba" => 2 * (2*d*2*d + d*2*d + (d/16+2*16)*(2*d) + (d/16)*(2*d) + d*2*d), // 양방향
+        "mamba" => 2 * (d*2*(2*d) + (2*d)*d + (d/16+2*16)*(2*d) + (d/16)*(2*d)), // 양방향: in+out+x+dt
         "mamba2" => {
             let di = d * 2; let ds = m2_ds_override; let m2hd = 64usize;
             let m2nh = di / m2hd; let ng = 1usize; let dcv = 4usize;

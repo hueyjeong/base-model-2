@@ -59,24 +59,25 @@ d=640이 실용적 스위트스팟 (12~18L, L2 캐시 범위).
 
 ## 3. 멀티스레드 스케일링 (d=640, seq_len=2048, OpenMP)
 
-| Arch | 1T | 8T | 스케일(1→8) |
-|---|---|---|---|
-| **mLSTM** | 4,691 | **773** | 6.1x |
-| **RetNet** | 4,654 | **796** | 5.9x |
-| **xLSTM** | 4,628 | **819** | 5.7x |
-| RWKV | 4,654 | 889 | 5.2x |
-| FNet | 5,698 | 956 | 6.0x |
-| Mamba-1 (ds=16) | 4,066 | 1,191 | 3.4x |
-| TCN | 6,648 | 1,189 | 5.6x |
-| Mamba-2 (ds=16) | 4,946 | 1,360 | 3.6x |
-| Mamba-2 (ds=64) | 5,404 | 1,480 | 3.7x |
+**주의:** 이전 버전에서 Mamba-1 파라미터 공식에 out_proj 이중 계산 버그가 있었음 (12L로 잘못 표시).
+수정 후 Mamba-1도 15L이 정확. 아래는 수정된 공식 기준.
 
-**멀티스레드에서 순위 변화:**
-- 싱글: Mamba-1 1위 → 멀티(8T): mLSTM 1위, Mamba-1 6위
-- mLSTM/RetNet/xLSTM: scan이 가볍고 sgemm 병렬 스케일링 우수 (5.7~6.1x)
-- Mamba-1: 순차 scan(d_inner=1280) 병렬화 불리 (3.4x)
-- Mamba-2 (ds=16): 레이어당 91ms로 Mamba-1(99ms)보다 8% 빠르나, 15L vs 12L로 총 시간 14% 느림
-- Mamba-2: head 병렬화로 스케일링 개선 (3.6~3.7x vs 3.4x)
+| Arch | 8T (ms) | Layers | ms/L |
+|---|---|---|---|
+| **mLSTM** | **773** | 16L | 48 |
+| **RetNet** | **796** | 16L | 50 |
+| **xLSTM** | **819** | 18L | 46 |
+| RWKV | 889 | 16L | 56 |
+| FNet | 956 | 12L | 80 |
+| TCN | 1,189 | 34L | 35 |
+| **Mamba-2 ds=16** | **1,411** | 15L | **94** |
+| Mamba-1 | 1,497 | 15L | 100 |
+| Mamba-2 ds=64 | 1,538 | 15L | 103 |
+
+**공정 비교 (15L 동일)에서 Mamba-2 ds=16이 Mamba-1보다 6% 빠름:**
+- Mamba-2: sgemm 2회/방향 (in_proj + out_proj) → quantize 오버헤드 절반
+- Mamba-1: sgemm 4회/방향 (in_proj + x_proj + dt_proj + out_proj)
+- 총 mul-adds: Mamba-2가 0.98x (거의 동일)이지만 호출 수 절반이 유리
 
 ## 4. GPU 학습 품질 (10k DDP, d=640, 4GPU, lr=1e-3, seq=2048)
 
@@ -100,7 +101,8 @@ d=640이 실용적 스위트스팟 (12~18L, L2 캐시 범위).
 | 8코어 (데스크탑) | mLSTM d=640 | 773ms |
 | 16코어+ (서버) | mLSTM d=640 | ~700ms |
 
-**품질까지 고려한 실용 추천: Mamba-1** (recall 51.5% 독보적, CPU 싱글 1위)
+**품질까지 고려한 실용 추천: Mamba-1** (recall 51.5% 독보적)
+Mamba-2 ds=16은 CPU 6% 빠르나 향상폭이 미미하여 실익 부족.
 CPU 멀티코어 최적인 mLSTM/RetNet/xLSTM는 품질이 치명적 (recall <1%).
 
 ### Mamba-2 vs Mamba-1 종합 비교
@@ -108,10 +110,10 @@ CPU 멀티코어 최적인 mLSTM/RetNet/xLSTM는 품질이 치명적 (recall <1%
 **스캔 커널 (순수 scan):**
 - d_state=16: Mamba-2가 **5.6x(1T) ~ 12.3x(8T) 빠름** (exp 제거 + headdim 벡터화 + head 병렬)
 
-**전체 모델 (프로젝션 포함):**
-- 프로젝션(sgemm)이 90%+ 비중 → scan 12x 개선이 레이어당 8% 수준으로 축소
-- Mamba-2(ds=16)는 15L, Mamba-1은 12L → 레이어 수 차이로 총 시간은 Mamba-2가 14~22% 느림
-- **레이어당 기준: Mamba-2(91ms/L) < Mamba-1(99ms/L)** — 8% 효율 개선
+**전체 모델 (15L 동일, 8T):**
+- Mamba-2 ds=16: **1,411ms** vs Mamba-1: 1,497ms → **6% 빠름**
+- sgemm 호출 2회 vs 4회 → quantize 오버헤드 절반
+- 프로젝션이 90%+ 비중이지만, 호출 수 절반이 실측 차이를 만듦
 
 **GPU 학습에서는 chunk-parallel SSD fused kernel으로 더 큰 개선 기대** (별도 벤치마크 필요)
 
