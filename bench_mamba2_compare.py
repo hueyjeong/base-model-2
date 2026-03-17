@@ -24,14 +24,10 @@ from bench_quality import bench_quality_one
 # 테스트 변형 목록
 # (이름, mixing_type, d_model, config_overrides)
 VARIANTS = {
-    # Mamba-2 d_state 비교 (d=640, 15L — Mamba-1과 동일 depth)
-    "ds16":   ("mamba2", 640, {"mamba2_d_state": 16}),
-    "ds32":   ("mamba2", 640, {"mamba2_d_state": 32}),
+    # Mamba-1 기준선 (동일 조건 비교용)
+    "mamba1": ("mamba", 640, {}),
+    # Mamba-2 d_state=64 (기본)
     "ds64":   ("mamba2", 640, {"mamba2_d_state": 64}),
-    "ds128":  ("mamba2", 640, {"mamba2_d_state": 128}),
-    # Mamba-2 wider (d=704, 12L — 더 넓고 얕은 구조)
-    "wide16": ("mamba2", 704, {"mamba2_d_state": 16}),
-    "wide64": ("mamba2", 704, {"mamba2_d_state": 64}),
 }
 
 
