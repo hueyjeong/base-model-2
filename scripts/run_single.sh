@@ -21,7 +21,7 @@ export OMP_NUM_THREADS=4
 export NCCL_P2P_DISABLE=1
 
 NGPU=${NGPU:-8}
-CORPUS=${CORPUS:-"corpus/sample_10g.jsonl"}
+CORPUS=${CORPUS:-"corpus/sample_full.jsonl"}
 VAL_CORPUS=${VAL_CORPUS:-"corpus/val_50k.jsonl"}
 D_MODEL=${D_MODEL:-768}
 SEQ_LEN=${SEQ_LEN:-2048}    # 패킹: BOS..EOS BOS..EOS → 2048 토큰
