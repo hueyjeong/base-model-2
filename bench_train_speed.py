@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from model.dense_editor_config import make_config
 from model.dense_editor import DenseEditor
 
-MIXING_TYPES = ["xlstm", "mlstm", "rwkv", "retnet", "mamba", "fnet", "tcn"]
+MIXING_TYPES = ["xlstm", "mlstm", "rwkv", "retnet", "mamba", "mamba2", "fnet", "tcn"]
 
 
 def bench_one(mixing_type: str, d_model: int, seq_len: int, batch_size: int,

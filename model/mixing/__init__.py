@@ -30,6 +30,9 @@ def create_mixing_layer(cfg: "DenseEditorConfig") -> "MixingLayer":
     elif t == "mamba":
         from model.mixing.bi_mamba import BiMambaMixing
         return BiMambaMixing(cfg)
+    elif t == "mamba2":
+        from model.mixing.bi_mamba2 import BiMamba2Mixing
+        return BiMamba2Mixing(cfg)
     elif t == "xlstm":
         from model.mixing.xlstm import BiSLSTMMixing
         return BiSLSTMMixing(cfg)

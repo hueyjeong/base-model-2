@@ -37,7 +37,7 @@ struct Args {
     #[arg(long)]
     benchmark_full: bool,
 
-    /// Mixing type (all|rwkv|fnet|tcn|retnet|mamba|xlstm)
+    /// Mixing type (all|rwkv|fnet|tcn|retnet|mamba|mamba2|xlstm)
     #[arg(long, default_value = "all")]
     mixing_type: String,
 
@@ -192,6 +192,52 @@ fn benchmark_dummy(mixing_type: &str, seq_len: usize, warmup: usize, n_runs: usi
             }
             report("mamba_scan", seq_len, d_model, &latencies);
         }
+        "mamba2_scan" | "mamba2" => {
+            let nheads = 8; // d_model=256, expand=2, headdim=64 → d_inner=512, nheads=8
+            let headdim = 64;
+            let ngroups = 1;
+            let d_inner = nheads * headdim;
+
+            // d_state=16, 64, 128 비교
+            for &d_state in &[16usize, 64, 128] {
+                let x_inner = vec![0.1f32; seq_len * d_inner];
+                let b_ssm = vec![0.1f32; seq_len * ngroups * d_state];
+                let c_ssm = vec![0.1f32; seq_len * ngroups * d_state];
+                let decay: Vec<f32> = (0..nheads).map(|i| 0.9 + 0.09 * i as f32 / nheads as f32).collect();
+                let d_skip = vec![1.0f32; nheads];
+                let mut y = vec![0.0f32; seq_len * d_inner];
+                let mut state = vec![0.0f32; nheads * d_state * headdim];
+
+                for _ in 0..warmup {
+                    state.fill(0.0);
+                    unsafe {
+                        mamba2_scan_avx2(
+                            x_inner.as_ptr(), b_ssm.as_ptr(), c_ssm.as_ptr(),
+                            decay.as_ptr(), d_skip.as_ptr(),
+                            y.as_mut_ptr(), state.as_mut_ptr(),
+                            seq_len as i32, nheads as i32, headdim as i32,
+                            d_state as i32, ngroups as i32,
+                        );
+                    }
+                }
+                let mut latencies = Vec::with_capacity(n_runs);
+                for _ in 0..n_runs {
+                    state.fill(0.0);
+                    let t0 = Instant::now();
+                    unsafe {
+                        mamba2_scan_avx2(
+                            x_inner.as_ptr(), b_ssm.as_ptr(), c_ssm.as_ptr(),
+                            decay.as_ptr(), d_skip.as_ptr(),
+                            y.as_mut_ptr(), state.as_mut_ptr(),
+                            seq_len as i32, nheads as i32, headdim as i32,
+                            d_state as i32, ngroups as i32,
+                        );
+                    }
+                    latencies.push(t0.elapsed().as_secs_f64() * 1000.0);
+                }
+                report(&format!("mamba2_ds{}", d_state), seq_len, d_model, &latencies);
+            }
+        }
         "depthwise_conv" | "tcn" => {
             let kernel_size = 7;
             let weight = vec![0.1f32; d_model * kernel_size];
@@ -264,7 +310,7 @@ fn benchmark_dummy(mixing_type: &str, seq_len: usize, warmup: usize, n_runs: usi
             println!("{:<22} {:>10} {:>10} {:>10}", "Kernel", "Median(ms)", "Mean(ms)", "P99(ms)");
             println!("{}", "-".repeat(56));
 
-            for t in &["fnet", "tcn", "rwkv", "retnet", "mamba", "xlstm"] {
+            for t in &["fnet", "tcn", "rwkv", "retnet", "mamba", "mamba2", "xlstm"] {
                 benchmark_dummy(t, seq_len, warmup, n_runs);
             }
             return;

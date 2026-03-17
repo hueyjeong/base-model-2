@@ -31,7 +31,7 @@ def load_tokenizer(name="keyboard"):
     return KeyboardTokenizer(os.path.join(PROJECT_ROOT, "keyboard_tokenizer", "keyboard_tokenizer.json"))
 
 
-MIXING_TYPES = ["xlstm", "mlstm", "rwkv", "retnet", "mamba", "fnet", "tcn"]
+MIXING_TYPES = ["xlstm", "mlstm", "rwkv", "retnet", "mamba", "mamba2", "fnet", "tcn"]
 
 
 def bench_quality_one(
