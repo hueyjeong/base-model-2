@@ -20,13 +20,21 @@ pub struct DenseEditorConfig {
     pub n_heads: usize,
     pub headdim: usize,
 
-    // Mamba
+    // Mamba-1
     #[serde(default = "default_16")]
     pub mamba_d_state: usize,
     #[serde(default = "default_4")]
     pub mamba_d_conv: usize,
     #[serde(default = "default_2")]
     pub mamba_expand: usize,
+
+    // Mamba-2
+    #[serde(default = "default_64")]
+    pub mamba2_d_state: usize,
+    #[serde(default = "default_64")]
+    pub mamba2_headdim: usize,
+    #[serde(default = "default_1")]
+    pub mamba2_ngroups: usize,
 
     // TCN
     #[serde(default = "default_7")]
@@ -41,7 +49,9 @@ pub struct DenseEditorConfig {
     pub retnet_gamma_max: f64,
 }
 
+fn default_1() -> usize { 1 }
 fn default_16() -> usize { 16 }
+fn default_64() -> usize { 64 }
 fn default_4() -> usize { 4 }
 fn default_2() -> usize { 2 }
 fn default_7() -> usize { 7 }

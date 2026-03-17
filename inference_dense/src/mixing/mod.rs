@@ -5,6 +5,7 @@ pub mod fnet;
 pub mod tcn;
 pub mod retnet;
 pub mod mamba;
+pub mod mamba2;
 pub mod xlstm;
 
 use crate::common::BatchBufs;

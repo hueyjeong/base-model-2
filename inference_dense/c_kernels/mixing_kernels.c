@@ -373,6 +373,90 @@ void mlstm_scan_avx2(
 }
 
 
+/* ── Mamba-2 SSD Scan (스칼라 decay, head 병렬화) ──── */
+/*
+ * Mamba-1 vs Mamba-2 핵심 차이:
+ *   Mamba-1: exp(A[d,n]*dt) 매 state 원소마다 → fast_exp 필수
+ *   Mamba-2: decay[h] 스칼라 broadcast → FMA만으로 충분
+ *
+ * State: (nheads, d_state, headdim) matrix
+ * 벡터화: headdim=64 → 8 AVX2 iterations per state dim (fully FMA)
+ * 병렬화: OpenMP parallel over heads
+ */
+
+void mamba2_scan_avx2(
+    const float* x,       /* [seq_len, nheads * headdim] — 입력 (conv+silu 후) */
+    const float* B,       /* [seq_len, ngroups * d_state] — input projection */
+    const float* C,       /* [seq_len, ngroups * d_state] — output projection */
+    const float* decay,   /* [nheads] — precomputed exp(-softplus(A) * dt_default) */
+    const float* D_skip,  /* [nheads] — skip connection */
+    float* y,             /* [seq_len, nheads * headdim] — output */
+    float* state,         /* [nheads, d_state, headdim] */
+    int seq_len, int nheads, int headdim, int d_state, int ngroups
+) {
+    int d_inner = nheads * headdim;
+    int heads_per_group = nheads / ngroups;
+
+    #pragma omp parallel for schedule(static) if(nheads >= 4)
+    for (int h = 0; h < nheads; h++) {
+        int g = h / heads_per_group;  /* 이 헤드가 속한 그룹 */
+        float a = decay[h];           /* 스칼라 decay — exp 없이 broadcast */
+        float d_skip = D_skip[h];
+        float* S = state + h * d_state * headdim;
+        __m256 v_a = _mm256_set1_ps(a);
+
+        for (int t = 0; t < seq_len; t++) {
+            const float* x_t = x + t * d_inner + h * headdim;
+            const float* B_t = B + t * ngroups * d_state + g * d_state;
+            const float* C_t = C + t * ngroups * d_state + g * d_state;
+            float* y_t = y + t * d_inner + h * headdim;
+
+            /* State update: S[n,d] = a * S[n,d] + B[n] * x[d]
+             * 벡터화 over headdim (64 = 8×8 AVX2 iterations) */
+            for (int n = 0; n < d_state; n++) {
+                float b_n = B_t[n];
+                __m256 v_b = _mm256_set1_ps(b_n);
+                float* s = S + n * headdim;
+                int d = 0;
+                for (; d + 8 <= headdim; d += 8) {
+                    __m256 v_s = _mm256_loadu_ps(s + d);
+                    __m256 v_x = _mm256_loadu_ps(x_t + d);
+                    v_s = _mm256_fmadd_ps(v_a, v_s, _mm256_mul_ps(v_b, v_x));
+                    _mm256_storeu_ps(s + d, v_s);
+                }
+                for (; d < headdim; d++) {
+                    s[d] = a * s[d] + b_n * x_t[d];
+                }
+            }
+
+            /* Output: y[d] = Σ_n C[n] * S[n,d] + D * x[d] */
+            int d = 0;
+            for (; d + 8 <= headdim; d += 8) {
+                __m256 v_y = _mm256_setzero_ps();
+                for (int n = 0; n < d_state; n++) {
+                    __m256 v_c = _mm256_set1_ps(C_t[n]);
+                    __m256 v_s = _mm256_loadu_ps(S + n * headdim + d);
+                    v_y = _mm256_fmadd_ps(v_c, v_s, v_y);
+                }
+                /* Skip connection: + D * x */
+                __m256 v_d = _mm256_set1_ps(d_skip);
+                __m256 v_x = _mm256_loadu_ps(x_t + d);
+                v_y = _mm256_fmadd_ps(v_d, v_x, v_y);
+                _mm256_storeu_ps(y_t + d, v_y);
+            }
+            /* scalar tail */
+            for (; d < headdim; d++) {
+                float val = 0.0f;
+                for (int n = 0; n < d_state; n++) {
+                    val += C_t[n] * S[n * headdim + d];
+                }
+                y_t[d] = val + d_skip * x_t[d];
+            }
+        }
+    }
+}
+
+
 /* ── Depthwise 1D Dilated Conv (전치 weight 레이아웃) ── */
 
 void depthwise_conv1d_avx2(

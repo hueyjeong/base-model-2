@@ -38,10 +38,16 @@ class DenseEditorConfig:
     n_heads: int = 8
     headdim: int = 32          # d_model // n_heads
 
-    # Mamba 전용
+    # Mamba-1 전용
     mamba_d_state: int = 16
     mamba_d_conv: int = 4
     mamba_expand: int = 2
+
+    # Mamba-2 전용
+    mamba2_d_state: int = 64      # SSD 상태 크기 (16/64/128 비교 실험)
+    mamba2_headdim: int = 64      # SSD head 차원
+    mamba2_ngroups: int = 1       # SSD B,C 공유 그룹 수
+    mamba2_chunk_size: int = 256  # SSD chunk 크기 (GPU only)
 
     # TCN 전용
     tcn_kernel_size: int = 7
@@ -80,7 +86,7 @@ class DenseEditorConfig:
             f"headdim({self.headdim})은 d_model//n_heads({self.d_model // self.n_heads})이어야 함"
         assert self.n_tags == 2 + 2 * self.vocab_size, \
             f"n_tags({self.n_tags})는 2 + 2*vocab_size({2 + 2 * self.vocab_size})이어야 함"
-        valid_types = {"mamba", "fnet", "tcn", "rwkv", "retnet", "xlstm", "xlstm_mamba", "mlstm"}
+        valid_types = {"mamba", "mamba2", "fnet", "tcn", "rwkv", "retnet", "xlstm", "xlstm_mamba", "mlstm"}
         assert self.mixing_type in valid_types, \
             f"mixing_type '{self.mixing_type}'은 {valid_types} 중 하나여야 함"
 
@@ -94,6 +100,7 @@ MIXING_PROJ_COUNT: dict[str, int] = {
     "rwkv": 5,     # r,k,v,o,g (양방향 각각)
     "retnet": 5,   # q,k,v,o,g
     "mamba": 0,    # 특수 (in_proj 2x width)
+    "mamba2": 0,   # 특수 (Mamba2 내부 in_proj 구조)
     "xlstm": 5,    # gate(i,f,z,o) + o_proj (기본; 옵션에 따라 calc_layer_params에서 동적 계산)
     "xlstm_mamba": 0,  # 특수 (expand=2, calc_layer_params에서 직접 계산)
     "mlstm": 5,    # q,k,v,i,f
@@ -118,6 +125,18 @@ def calc_layer_params(d_model: int, mixing_type: str) -> tuple[int, int, int]:
         dtr = max(d // 16, 1)
         # 양방향: 2 × (in_proj + out_proj + x_proj + dt_proj)
         mix_params = 2 * (d * 2 * di + di * d + (dtr + 2 * ds) * di + dtr * di)
+    elif mixing_type == "mamba2":
+        di = d * 2  # expand=2
+        ds = 64     # mamba2_d_state 기본값
+        hd = 64     # mamba2_headdim
+        nh = di // hd
+        ng = 1      # ngroups
+        d_conv = 4
+        d_conv_in = di + 2 * ng * ds
+        d_in_proj = 2 * di + 2 * ng * ds + nh
+        # 양방향: 2 × (in_proj + conv1d + norm + out_proj + dt_bias + A_log + D)
+        per_dir = d * d_in_proj + d_conv_in * (d_conv + 1) + di + di * d + 3 * nh
+        mix_params = 2 * per_dir
     elif mixing_type == "xlstm_mamba":
         di = d * 2  # expand=2
         # 양방향: 2 × (in_proj d→2di + gate_proj d→3di + out_proj di→d + conv)

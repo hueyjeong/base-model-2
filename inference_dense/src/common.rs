@@ -69,6 +69,13 @@ extern "C" {
         state_C: *mut f32, state_n: *mut f32,
         seq_len: c_int, n_heads: c_int, headdim: c_int,
     );
+    pub fn mamba2_scan_avx2(
+        x: *const f32, B: *const f32, C: *const f32,
+        decay: *const f32, D_skip: *const f32,
+        y: *mut f32, state: *mut f32,
+        seq_len: c_int, nheads: c_int, headdim: c_int,
+        d_state: c_int, ngroups: c_int,
+    );
 }
 
 // ── 활성화 함수 ──────────────────────────────────────
