@@ -26,8 +26,9 @@ from bench_quality import bench_quality_one
 VARIANTS = {
     # Mamba-1 기준선 (동일 조건 비교용)
     "mamba1": ("mamba", 640, {}),
-    # Mamba-2 d_state=64 (기본)
+    # Mamba-2 d_state 비교
     "ds64":   ("mamba2", 640, {"mamba2_d_state": 64}),
+    "ds128":  ("mamba2", 640, {"mamba2_d_state": 128}),
 }
 
 
