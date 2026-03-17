@@ -33,6 +33,9 @@ def create_mixing_layer(cfg: "DenseEditorConfig") -> "MixingLayer":
     elif t == "xlstm":
         from model.mixing.xlstm import BiSLSTMMixing
         return BiSLSTMMixing(cfg)
+    elif t == "xlstm_mamba":
+        from model.mixing.xlstm import BiSLSTMMambaMixing
+        return BiSLSTMMambaMixing(cfg)
     elif t == "mlstm":
         from model.mixing.mlstm import BiMLSTMMixing
         return BiMLSTMMixing(cfg)
