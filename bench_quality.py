@@ -37,7 +37,7 @@ MIXING_TYPES = ["xlstm", "mlstm", "rwkv", "retnet", "mamba", "mamba2", "fnet", "
 def bench_quality_one(
     mixing_type: str, d_model: int, corpus: str, text_key: str,
     max_steps: int, log_interval: int, seq_len: int, batch_size: int,
-    use_bf16: bool, target_params: int,
+    use_bf16: bool, target_params: int, **config_overrides,
 ):
     """단일 아키텍처 오버핏 테스트"""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -47,7 +47,8 @@ def bench_quality_one(
                       vocab_size=tokenizer.vocab_size,
                       n_tags=2 + 2 * tokenizer.vocab_size,
                       max_seq_len=seq_len,
-                      pad_id=tokenizer.pad_id, bos_id=tokenizer.bos_id)
+                      pad_id=tokenizer.pad_id, bos_id=tokenizer.bos_id,
+                      **config_overrides)
 
     model = DenseEditor(cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())
