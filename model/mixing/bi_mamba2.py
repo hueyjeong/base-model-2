@@ -237,7 +237,11 @@ class BiMamba2Mixing(MixingLayer):
     def forward(self, x: Tensor, pad_mask: Tensor | None = None,
                 reset_mask: Tensor | None = None) -> Tensor:
         fwd_out = self.fwd(x, reset_mask=reset_mask)
-        bwd_reset = reset_mask.flip(1) if reset_mask is not None else None
+        if reset_mask is not None:
+            bwd_reset = reset_mask.flip(1).clone()
+            bwd_reset[:, 0] = True  # flipped 시퀀스 시작에 BOS 보장 (seq_idx >= 0)
+        else:
+            bwd_reset = None
         bwd_out = self.bwd(x.flip(1), reset_mask=bwd_reset).flip(1)
         out = fwd_out + bwd_out
         if pad_mask is not None:
