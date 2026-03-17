@@ -25,8 +25,8 @@ CORPUS=${CORPUS:-"corpus/sample_full.jsonl"}
 VAL_CORPUS=${VAL_CORPUS:-"corpus/val_50k.jsonl"}
 D_MODEL=${D_MODEL:-768}
 SEQ_LEN=${SEQ_LEN:-2048}    # 패킹: BOS..EOS BOS..EOS → 2048 토큰
-BATCH_SIZE=${BATCH_SIZE:-2}  # 16GB GPU에 seq=2048이면 bs=2
-GRAD_ACCUM=${GRAD_ACCUM:-4}  # eff_batch = 2*4*8 = 64
+BATCH_SIZE=${BATCH_SIZE:-4}  # 16GB GPU에 seq=2048이면 bs=2
+GRAD_ACCUM=${GRAD_ACCUM:-2}  # eff_batch = 2*4*8 = 64
 LR=${LR:-1e-3}
 WARMUP=${WARMUP:-500}
 SAVE_DIR=${SAVE_DIR:-"checkpoints/${MIXING}_d${D_MODEL}"}
