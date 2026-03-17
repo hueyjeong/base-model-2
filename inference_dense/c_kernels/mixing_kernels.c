@@ -457,6 +457,45 @@ void mamba2_scan_avx2(
 }
 
 
+/* ── Causal Depthwise 1D Conv (Mamba용, 왼쪽 패딩만) ── */
+
+void causal_conv1d_avx2(
+    const float* input,   /* [seq_len, channels] */
+    const float* weight,  /* [channels, kernel_size] */
+    const float* bias,    /* [channels] or NULL */
+    float* output,        /* [seq_len, channels] */
+    int seq_len, int channels, int kernel_size
+) {
+    #pragma omp parallel for schedule(static) if(seq_len >= 64)
+    for (int t = 0; t < seq_len; t++) {
+        int d = 0;
+        for (; d + 8 <= channels; d += 8) {
+            __m256 v_sum = bias ? _mm256_loadu_ps(bias + d) : _mm256_setzero_ps();
+            for (int ki = 0; ki < kernel_size; ki++) {
+                int src_t = t - ki;  /* causal: t, t-1, t-2, ... */
+                if (src_t < 0) continue;
+                float w_arr[8];
+                for (int c = 0; c < 8; c++)
+                    w_arr[c] = weight[(d + c) * kernel_size + ki];
+                __m256 v_w = _mm256_loadu_ps(w_arr);
+                __m256 v_x = _mm256_loadu_ps(input + src_t * channels + d);
+                v_sum = _mm256_fmadd_ps(v_w, v_x, v_sum);
+            }
+            _mm256_storeu_ps(output + t * channels + d, v_sum);
+        }
+        for (; d < channels; d++) {
+            float sum = bias ? bias[d] : 0.0f;
+            for (int ki = 0; ki < kernel_size; ki++) {
+                int src_t = t - ki;
+                if (src_t < 0) continue;
+                sum += weight[d * kernel_size + ki] * input[src_t * channels + d];
+            }
+            output[t * channels + d] = sum;
+        }
+    }
+}
+
+
 /* ── Depthwise 1D Dilated Conv (전치 weight 레이아웃) ── */
 
 void depthwise_conv1d_avx2(

@@ -105,16 +105,20 @@ pub fn benchmark_full_model(mt: &str, sl: usize, d: usize, warmup: usize, n_runs
 
     let dff = (d as f64 * dff_ratio) as usize;
 
-    // mamba2 d_state 파싱: "mamba2" → 64, "mamba2_ds16" → 16, "mamba2_ds128" → 128
-    let m2_ds_override: usize = if mt.starts_with("mamba2_ds") {
-        mt[9..].parse().unwrap_or(64)
+    // mamba2 파싱: "mamba2_ds16" → ds=16, "mamba2_e15" → expand=1.5, "mamba2_e15_ds16" 등
+    let m2_ds_override: usize = if mt.contains("ds") {
+        let pos = mt.find("ds").unwrap() + 2;
+        mt[pos..].split('_').next().unwrap_or("64").parse().unwrap_or(64)
     } else { 64 };
+    let m2_expand_num: usize = if mt.contains("e15") { 3 } else { 2 }; // expand: 2=2x, 3=1.5x (num/2)
+    let m2_expand_den: usize = if mt.contains("e15") { 2 } else { 1 };
 
     // per-layer 파라미터 계산
     let mix_params = match mt_base {
         "mamba" => 2 * (d*2*(2*d) + (2*d)*d + (d/16+2*16)*(2*d) + (d/16)*(2*d)), // 양방향: in+out+x+dt
         "mamba2" => {
-            let di = d * 2; let ds = m2_ds_override; let m2hd = 64usize;
+            let di = d * m2_expand_num / m2_expand_den;
+            let ds = m2_ds_override; let m2hd = 64usize;
             let m2nh = di / m2hd; let ng = 1usize; let dcv = 4usize;
             let d_conv_in = di + 2 * ng * ds;
             let d_in_proj = 2 * di + 2 * ng * ds + m2nh;
@@ -146,17 +150,18 @@ pub fn benchmark_full_model(mt: &str, sl: usize, d: usize, warmup: usize, n_runs
     let ma = vec![-1.0f32; di*ds];
     let md_skip = vec![1.0f32; di];
 
-    // Mamba-2 전용 (d_state는 m2_ds_override에서 결정)
-    let m2hd = 64usize; let m2nh = di / m2hd; let m2ds = m2_ds_override; let m2ng = 1usize;
-    let m2_d_conv_in = di + 2 * m2ng * m2ds;
-    let m2_d_in_proj = 2 * di + 2 * m2ng * m2ds + m2nh;
+    // Mamba-2 전용 (d_state, expand 파라미터에서 결정)
+    let m2di = d * m2_expand_num / m2_expand_den;
+    let m2hd = 64usize; let m2nh = m2di / m2hd; let m2ds = m2_ds_override; let m2ng = 1usize;
+    let m2_d_conv_in = m2di + 2 * m2ng * m2ds;
+    let m2_d_in_proj = 2 * m2di + 2 * m2ng * m2ds + m2nh;
     let (m2iw, m2ir) = make_dummy_i8(m2_d_in_proj, d);
-    let (m2ow, m2or) = make_dummy_i8(d, di);
+    let (m2ow, m2or) = make_dummy_i8(d, m2di);
     let m2_decay: Vec<f32> = (0..m2nh).map(|i| 0.9 + 0.09 * i as f32 / m2nh as f32).collect();
     let m2_d_skip = vec![1.0f32; m2nh];
     let m2_conv_w = vec![0.1f32; m2_d_conv_in * 4];
     let m2_conv_b = vec![0.0f32; m2_d_conv_in];
-    let m2_norm_w = vec![1.0f32; di];
+    let m2_norm_w = vec![1.0f32; m2di];
 
     // 공통 scan 버퍼
     let wdecay = vec![-0.5f32; tot];
@@ -216,40 +221,35 @@ pub fn benchmark_full_model(mt: &str, sl: usize, d: usize, warmup: usize, n_runs
                 for t in 0..sl {
                     let src = t * m2_d_in_proj;
                     let dst = t * m2_d_conv_in;
-                    m2xbc[dst..dst+di].copy_from_slice(&m2p[src..src+di]);
+                    m2xbc[dst..dst+m2di].copy_from_slice(&m2p[src..src+m2di]);
                     for j in 0..2*m2ng*m2ds {
-                        m2xbc[dst+di+j] = m2p[src+2*di+j];
+                        m2xbc[dst+m2di+j] = m2p[src+2*m2di+j];
                     }
                 }
-                // depthwise conv1d
+                // causal depthwise conv1d (C 커널 — AVX2 벡터화)
                 let mut m2conv = vec![0.0f32; sl * m2_d_conv_in];
-                for ch in 0..m2_d_conv_in {
-                    for t in 0..sl {
-                        let mut s = m2_conv_b[ch];
-                        for ki in 0..4usize {
-                            let st = t as i32 - ki as i32;
-                            if st >= 0 {
-                                s += m2_conv_w[ch * 4 + ki] * m2xbc[st as usize * m2_d_conv_in + ch];
-                            }
-                        }
-                        m2conv[t * m2_d_conv_in + ch] = s;
-                    }
+                unsafe {
+                    causal_conv1d_avx2(
+                        m2xbc.as_ptr(), m2_conv_w.as_ptr(), m2_conv_b.as_ptr(),
+                        m2conv.as_mut_ptr(),
+                        sl as c_int, m2_d_conv_in as c_int, 4,
+                    );
                 }
                 // Split x_conv (SiLU), B, C
-                let mut m2x = vec![0.0f32; sl * di];
+                let mut m2x = vec![0.0f32; sl * m2di];
                 let mut m2b = vec![0.0f32; sl * m2ng * m2ds];
                 let mut m2c = vec![0.0f32; sl * m2ng * m2ds];
-                let mut m2z = vec![0.0f32; sl * di];
+                let mut m2z = vec![0.0f32; sl * m2di];
                 for t in 0..sl {
                     let cb = t * m2_d_conv_in;
                     let pb = t * m2_d_in_proj;
-                    for j in 0..di { m2x[t*di+j] = silu_scalar(m2conv[cb+j]); }
-                    for j in 0..m2ng*m2ds { m2b[t*m2ng*m2ds+j] = m2conv[cb+di+j]; }
-                    for j in 0..m2ng*m2ds { m2c[t*m2ng*m2ds+j] = m2conv[cb+di+m2ng*m2ds+j]; }
-                    for j in 0..di { m2z[t*di+j] = m2p[pb+di+j]; }
+                    for j in 0..m2di { m2x[t*m2di+j] = silu_scalar(m2conv[cb+j]); }
+                    for j in 0..m2ng*m2ds { m2b[t*m2ng*m2ds+j] = m2conv[cb+m2di+j]; }
+                    for j in 0..m2ng*m2ds { m2c[t*m2ng*m2ds+j] = m2conv[cb+m2di+m2ng*m2ds+j]; }
+                    for j in 0..m2di { m2z[t*m2di+j] = m2p[pb+m2di+j]; }
                 }
                 // Mamba-2 SSD scan (양방향: 2회)
-                let mut m2y = vec![0.0f32; sl * di];
+                let mut m2y = vec![0.0f32; sl * m2di];
                 let mut m2st = vec![0.0f32; m2nh * m2ds * m2hd];
                 unsafe {
                     mamba2_scan_avx2(m2x.as_ptr(), m2b.as_ptr(), m2c.as_ptr(),
@@ -264,13 +264,13 @@ pub fn benchmark_full_model(mt: &str, sl: usize, d: usize, warmup: usize, n_runs
                 }
                 // RMSNorm + gate
                 for t in 0..sl {
-                    let b = t * di;
+                    let b = t * m2di;
                     let mut sq = 0.0f32;
-                    for j in 0..di { sq += m2y[b+j]*m2y[b+j]; }
-                    let rms = (sq/di as f32 + 1e-5).sqrt().recip();
-                    for j in 0..di { m2y[b+j] = m2y[b+j] * rms * m2_norm_w[j] * silu_scalar(m2z[b+j]); }
+                    for j in 0..m2di { sq += m2y[b+j]*m2y[b+j]; }
+                    let rms = (sq/m2di as f32 + 1e-5).sqrt().recip();
+                    for j in 0..m2di { m2y[b+j] = m2y[b+j] * rms * m2_norm_w[j] * silu_scalar(m2z[b+j]); }
                 }
-                quant_sgemm(&m2y, sl, di, d, &m2ow, &m2or, 0.01, mo, nb, ub, sb);
+                quant_sgemm(&m2y, sl, m2di, d, &m2ow, &m2or, 0.01, mo, nb, ub, sb);
             }
             "tcn" => {
                 let mut acc = vec![0.0f32; tot]; let mut ct = vec![0.0f32; tot];
@@ -396,7 +396,7 @@ pub fn benchmark_all_full(sl: usize, d_model: usize, warmup: usize, n_runs: usiz
     println!("{:<10} {:>5} {:>5} {:>6} {:>10} {:>10} {:>10}",
         "Arch", "d", "Depth", "Params", "Median(ms)", "Per-L(ms)", "Mean(ms)");
     println!("{}", "-".repeat(62));
-    for t in &["xlstm", "mlstm", "rwkv", "retnet", "fnet", "mamba", "mamba2", "mamba2_ds16", "tcn"] {
+    for t in &["mamba", "mamba2", "mamba2_ds16", "mamba2_e15", "mamba2_e15_ds16"] {
         benchmark_full_model(t, sl, d_model, warmup, n_runs);
     }
 }

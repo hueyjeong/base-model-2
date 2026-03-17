@@ -110,10 +110,24 @@ CPU 멀티코어 최적인 mLSTM/RetNet/xLSTM는 품질이 치명적 (recall <1%
 **스캔 커널 (순수 scan):**
 - d_state=16: Mamba-2가 **5.6x(1T) ~ 12.3x(8T) 빠름** (exp 제거 + headdim 벡터화 + head 병렬)
 
-**전체 모델 (15L 동일, 8T):**
-- Mamba-2 ds=16: **1,411ms** vs Mamba-1: 1,497ms → **6% 빠름**
-- sgemm 호출 2회 vs 4회 → quantize 오버헤드 절반
-- 프로젝션이 90%+ 비중이지만, 호출 수 절반이 실측 차이를 만듦
+**전체 모델 (15L 동일, 8T, conv1d C 커널 최적화 후):**
+
+| Variant | 8T (ms) | ms/L | vs Mamba-1 |
+|---|---|---|---|
+| Mamba-1 (expand=2) | 1,481 | 99 | 기준 |
+| **Mamba-2 ds=16** | **1,123** | **75** | **24% 빠름** |
+| **Mamba-2 ds=64** | **1,159** | **77** | **22% 빠름** |
+| Mamba-2 e1.5 ds=64 | 1,146 | 67 | 23% 빠름 |
+
+**핵심 최적화 3가지:**
+1. **conv1d C 커널 전환** → 6%→22% 개선 (순수 Rust 루프 → AVX2 벡터화)
+2. **sgemm 호출 절반** (2회 vs 4회) → quantize 오버헤드 절감
+3. **head 병렬 scan** → 멀티스레드 스케일링 개선
+
+**탈락:**
+- expand=1.5: ms/L 효율은 좋으나 총 시간 이점 미미
+- ds=16: ds=64 대비 2% 차이로 의미 없음 (표현력 손실만)
+- AVX-VNNI: 이 CPU에서 2x 역효과 (AVX2-only 유지)
 
 **GPU 학습에서는 chunk-parallel SSD fused kernel으로 더 큰 개선 기대** (별도 벤치마크 필요)
 
