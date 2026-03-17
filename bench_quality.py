@@ -37,9 +37,14 @@ MIXING_TYPES = ["xlstm", "mlstm", "rwkv", "retnet", "mamba", "mamba2", "fnet", "
 def bench_quality_one(
     mixing_type: str, d_model: int, corpus: str, text_key: str,
     max_steps: int, log_interval: int, seq_len: int, batch_size: int,
-    use_bf16: bool, target_params: int, **config_overrides,
+    use_bf16: bool, target_params: int, grad_accum: int = 1,
+    **config_overrides,
 ):
-    """단일 아키텍처 오버핏 테스트"""
+    """단일 아키텍처 오버핏 테스트
+
+    grad_accum > 1이면 batch_size를 키워도 effective batch를 유지할 수 있음.
+    effective_batch = batch_size * grad_accum
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     tokenizer = load_tokenizer()
@@ -76,30 +81,38 @@ def bench_quality_one(
     model.train()
     data_iter = iter(loader)
     results = []
+    micro_step = 0
 
     for step in range(max_steps):
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            data_iter = iter(loader)
-            batch = next(data_iter)
-
-        input_ids = batch["input_ids"].to(device, non_blocking=True)
-        edit_tags = batch["edit_tags"].to(device, non_blocking=True)
-        pad_mask = batch["pad_mask"].to(device, non_blocking=True)
-
         optimizer.zero_grad(set_to_none=True)
-        with amp_ctx:
-            logits = model(input_ids, pad_mask)
-            targets = torch.where(pad_mask, edit_tags, torch.tensor(-100, dtype=torch.long, device=device))
-            loss = criterion(logits.view(-1, cfg.n_tags), targets.view(-1))
 
-        loss.backward()
+        # gradient accumulation
+        for ga in range(grad_accum):
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                data_iter = iter(loader)
+                batch = next(data_iter)
+
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            edit_tags = batch["edit_tags"].to(device, non_blocking=True)
+            pad_mask = batch["pad_mask"].to(device, non_blocking=True)
+
+            with amp_ctx:
+                logits = model(input_ids, pad_mask)
+                targets = torch.where(pad_mask, edit_tags, torch.tensor(-100, dtype=torch.long, device=device))
+                loss = criterion(logits.view(-1, cfg.n_tags), targets.view(-1))
+                if grad_accum > 1:
+                    loss = loss / grad_accum
+
+            loss.backward()
+
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
         if (step + 1) % log_interval == 0:
             with torch.no_grad():
+                # 마지막 micro-batch의 logits로 메트릭 계산
                 preds = logits.argmax(dim=-1)
                 valid = pad_mask
                 n_tok = valid.sum().item()
@@ -114,9 +127,11 @@ def bench_quality_one(
                 edit_p = tp / max(tp + fp, 1)
                 edit_r = tp / max(tp + fn, 1)
 
+            # loss를 원래 스케일로 복원 (grad_accum으로 나눈 경우)
+            loss_val = loss.item() * grad_accum if grad_accum > 1 else loss.item()
             results.append({
                 "step": step + 1,
-                "loss": loss.item(),
+                "loss": loss_val,
                 "tag_acc": tag_acc,
                 "edit_p": edit_p,
                 "edit_r": edit_r,
@@ -146,13 +161,17 @@ def main():
     parser.add_argument("--log_interval", type=int, default=100)
     parser.add_argument("--seq_len", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--grad_accum", type=int, default=1,
+                        help="Gradient accumulation steps (effective_batch = batch_size * grad_accum)")
     parser.add_argument("--bf16", action="store_true", default=True)
     parser.add_argument("--target_params", type=int, default=128_000_000)
     parser.add_argument("--mixing_types", nargs="+", default=MIXING_TYPES)
     args = parser.parse_args()
 
+    eff_batch = args.batch_size * args.grad_accum
     print(f"=== DenseEditor 품질 벤치마크 (오버핏 테스트) ===")
-    print(f"d_model={args.d_model}, seq_len={args.seq_len}, batch={args.batch_size}")
+    print(f"d_model={args.d_model}, seq_len={args.seq_len}, batch={args.batch_size}, "
+          f"grad_accum={args.grad_accum}, effective_batch={eff_batch}")
     print(f"max_steps={args.max_steps}, corpus={args.corpus}\n")
 
     all_results = {}
@@ -163,7 +182,7 @@ def main():
             r = bench_quality_one(
                 mt, args.d_model, args.corpus, args.text_key,
                 args.max_steps, args.log_interval, args.seq_len, args.batch_size,
-                args.bf16, args.target_params,
+                args.bf16, args.target_params, grad_accum=args.grad_accum,
             )
             all_results[mt] = r
             f = r["final"]

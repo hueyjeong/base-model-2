@@ -43,6 +43,7 @@ def main():
     parser.add_argument("--log_interval", type=int, default=200)
     parser.add_argument("--seq_len", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--grad_accum", type=int, default=1)
     parser.add_argument("--bf16", action="store_true", default=True)
     parser.add_argument("--target_params", type=int, default=128_000_000)
     parser.add_argument("--variants", nargs="+",
@@ -50,8 +51,10 @@ def main():
                         choices=list(VARIANTS.keys()))
     args = parser.parse_args()
 
+    eff_batch = args.batch_size * args.grad_accum
     print(f"=== Mamba-2 d_state/d_model 비교 벤치마크 ===")
-    print(f"seq={args.seq_len}, batch={args.batch_size}, steps={args.max_steps}")
+    print(f"seq={args.seq_len}, batch={args.batch_size}, grad_accum={args.grad_accum}, "
+          f"effective_batch={eff_batch}, steps={args.max_steps}")
     print(f"variants: {args.variants}\n")
 
     all_results = {}
@@ -64,7 +67,8 @@ def main():
             r = bench_quality_one(
                 mixing_type, d_model, args.corpus, args.text_key,
                 args.max_steps, args.log_interval, args.seq_len, args.batch_size,
-                args.bf16, args.target_params, **overrides,
+                args.bf16, args.target_params, grad_accum=args.grad_accum,
+                **overrides,
             )
             all_results[name] = r
             f = r["final"]
