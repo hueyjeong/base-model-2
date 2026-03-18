@@ -379,9 +379,7 @@ def train(args):
     use_amp = args.bf16 and torch.cuda.is_available()
     amp_dtype = torch.bfloat16
 
-    # BF16 AMP 시 ce_weight도 amp dtype으로 캐스팅 (cross_entropy dtype 일치 요구)
-    if ce_weight is not None and use_amp:
-        ce_weight = ce_weight.to(amp_dtype)
+    # ce_weight는 float32 유지 — cross_entropy는 항상 .float() 로짓과 사용
     criterion = nn.CrossEntropyLoss(
         weight=ce_weight,
         ignore_index=-100,
@@ -544,7 +542,7 @@ def train(args):
                 targets = torch.where(pad_mask, edit_tags, _ignore_idx)
 
                 ce_loss = criterion(
-                    tag_logits.view(-1, config.n_tags),
+                    tag_logits.float().view(-1, config.n_tags),
                     targets.view(-1),
                 )
 
