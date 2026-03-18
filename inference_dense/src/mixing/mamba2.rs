@@ -4,7 +4,6 @@
 //! Mamba-1 대비: exp() 제거, 스칼라 decay, head 병렬화 (OpenMP)
 //!
 //! State: nheads × d_state × headdim
-//!   d=640, expand=2, headdim=64, d_state=16: 20×16×64 = 80KB (L2)
 //!   d=640, expand=2, headdim=64, d_state=64: 20×64×64 = 320KB (L2/L3 경계)
 
 use std::collections::HashMap;
@@ -14,16 +13,16 @@ use crate::bmmq::TensorData;
 use crate::common::*;
 use super::MixingLayer;
 
-/// 단방향 Mamba-2 SSD 블록
+/// 단방향 Mamba-2 SSD 블록 — BitLinear projection (Ternary/F32 자동 감지)
 pub struct Mamba2Block {
-    in_proj: LinearF32,       // d_model → d_in_proj (일반 nn.Linear — mamba_ssm.Mamba2)
-    conv1d_weight: Vec<f32>,  // (d_conv_in, d_conv) — depthwise
-    conv1d_bias: Vec<f32>,    // (d_conv_in,)
-    a_log: Vec<f32>,          // (nheads,) — log-space
-    d_skip: Vec<f32>,         // (nheads,)
-    dt_bias: Vec<f32>,        // (nheads,)
-    norm_weight: Vec<f32>,    // (d_inner,) — RMSNorm
-    out_proj: LinearF32,      // d_inner → d_model (일반 nn.Linear)
+    in_proj: Projection,          // d_model → d_in_proj (BitLinear → Ternary)
+    conv1d_weight: Vec<f32>,      // (d_conv_in, d_conv) — depthwise
+    conv1d_bias: Vec<f32>,        // (d_conv_in,)
+    a_log: Vec<f32>,              // (nheads,) — log-space
+    d_skip: Vec<f32>,             // (nheads,)
+    dt_bias: Vec<f32>,            // (nheads,)
+    norm_weight: Vec<f32>,        // (d_inner,) — RMSNorm
+    out_proj: Projection,         // d_inner → d_model (BitLinear → Ternary)
 
     d_model: usize,
     d_inner: usize,
@@ -45,14 +44,14 @@ impl Mamba2Block {
         let nheads = d_inner / headdim;
 
         Ok(Self {
-            in_proj: LinearF32::load_bmmq(tensors, &format!("{}.mamba2.in_proj", prefix))?,
-            conv1d_weight: bmmq_take_f32(tensors, &format!("{}.mamba2.conv1d.weight", prefix))?,
-            conv1d_bias: bmmq_take_f32(tensors, &format!("{}.mamba2.conv1d.bias", prefix))?,
-            a_log: bmmq_take_f32(tensors, &format!("{}.mamba2.A_log", prefix))?,
-            d_skip: bmmq_take_f32(tensors, &format!("{}.mamba2.D", prefix))?,
-            dt_bias: bmmq_take_f32(tensors, &format!("{}.mamba2.dt_bias", prefix))?,
-            norm_weight: bmmq_take_f32(tensors, &format!("{}.mamba2.norm.weight", prefix))?,
-            out_proj: LinearF32::load_bmmq(tensors, &format!("{}.mamba2.out_proj", prefix))?,
+            in_proj: Projection::load_bmmq(tensors, &format!("{}.in_proj", prefix))?,
+            conv1d_weight: bmmq_take_f32(tensors, &format!("{}.conv1d.weight", prefix))?,
+            conv1d_bias: bmmq_take_f32(tensors, &format!("{}.conv1d.bias", prefix))?,
+            a_log: bmmq_take_f32(tensors, &format!("{}.A_log", prefix))?,
+            d_skip: bmmq_take_f32(tensors, &format!("{}.D", prefix))?,
+            dt_bias: bmmq_take_f32(tensors, &format!("{}.dt_bias", prefix))?,
+            norm_weight: bmmq_take_f32(tensors, &format!("{}.norm.weight", prefix))?,
+            out_proj: Projection::load_bmmq(tensors, &format!("{}.out_proj", prefix))?,
             d_model, d_inner, d_state, d_conv, nheads, headdim, ngroups,
         })
     }
@@ -69,18 +68,17 @@ impl MixingLayer for Mamba2Block {
         let hd = self.headdim;
         let ng = self.ngroups;
         let d_conv_in = di + 2 * ng * ds;
-        let d_in_proj = 2 * di + 2 * ng * ds + nh;
+        let d_in_proj = self.in_proj.out_dim();
 
-        // in_proj: d_model → d_in_proj (FP32 matmul)
+        // BitLinear LayerNorm (elementwise_affine=False) → in_proj matmul
+        let mut x_normed = vec![0.0f32; seq_len * d_model];
+        for t in 0..seq_len {
+            layer_norm_no_affine(&x[t*d_model..(t+1)*d_model], &mut x_normed[t*d_model..(t+1)*d_model], 1e-5);
+        }
         let mut proj = vec![0.0f32; seq_len * d_in_proj];
-        self.in_proj.forward_batch(x, seq_len, &mut proj);
+        self.in_proj.forward_batch(&x_normed, seq_len, &mut proj);
 
-        // DEBUG (첫 호출만)
-        static DEBUG_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        let debug = !DEBUG_ONCE.swap(true, std::sync::atomic::Ordering::Relaxed);
-
-        // Split: mamba_ssm.Mamba2 순서 — z(di) + xBC(di+2*ng*ds) + dt_raw(nh)
-        // xBC = x(di) + B(ng*ds) + C(ng*ds)
+        // Split: mamba_ssm 순서 — z(di) + xBC(di+2*ng*ds) + dt_raw(nh)
         let mut z = vec![0.0f32; seq_len * di];
         let mut x_branch = vec![0.0f32; seq_len * di];
         let mut b_raw = vec![0.0f32; seq_len * ng * ds];
@@ -145,12 +143,7 @@ impl MixingLayer for Mamba2Block {
             }
         }
 
-        if debug {
-            eprintln!("  conv1d[0:5] = [{:.6},{:.6},{:.6},{:.6},{:.6}]",
-                xbc_conv[0], xbc_conv[1], xbc_conv[2], xbc_conv[3], xbc_conv[4]);
-        }
-
-        // SiLU on ALL xBC channels, then split (matching mamba_ssm combined kernel)
+        // SiLU on ALL xBC channels, then split (matching causal_conv1d_fn activation="silu")
         let mut x_conv = vec![0.0f32; seq_len * di];
         let mut b_conv = vec![0.0f32; seq_len * ng * ds];
         let mut c_conv = vec![0.0f32; seq_len * ng * ds];
@@ -189,16 +182,6 @@ impl MixingLayer for Mamba2Block {
             );
         }
 
-        // DEBUG: bwd scan token 10 h=0 p=0
-        static DEBUG_SSD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let ssd_call = DEBUG_SSD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if ssd_call == 1 {  // bwd만
-            let t = seq_len - 1;
-            eprintln!("  bwd_scan[{},h0p0]={:.8}", t, y_scan[t*di]);
-            eprintln!("  bwd_scan[{},h0p1]={:.8}", t, y_scan[t*di+1]);
-            eprintln!("  bwd_scan[{},h0p2]={:.8}", t, y_scan[t*di+2]);
-        }
-
         // Gate FIRST, then RMSNorm (norm_before_gate=False)
         // = RMSNorm(y * silu(z)) * weight
         for i in 0..seq_len * di {
@@ -214,8 +197,12 @@ impl MixingLayer for Mamba2Block {
             }
         }
 
-        // out_proj: d_inner → d_model (FP32 matmul)
-        self.out_proj.forward_batch(&y_scan, seq_len, out);
+        // BitLinear LayerNorm → out_proj matmul (Ternary)
+        let mut y_normed = vec![0.0f32; seq_len * di];
+        for t in 0..seq_len {
+            layer_norm_no_affine(&y_scan[t*di..(t+1)*di], &mut y_normed[t*di..(t+1)*di], 1e-5);
+        }
+        self.out_proj.forward_batch(&y_normed, seq_len, out);
     }
 }
 
