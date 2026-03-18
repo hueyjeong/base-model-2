@@ -388,8 +388,9 @@ void mamba2_scan_avx2(
     const float* x,       /* [seq_len, nheads * headdim] — 입력 (conv+silu 후) */
     const float* B,       /* [seq_len, ngroups * d_state] — input projection */
     const float* C,       /* [seq_len, ngroups * d_state] — output projection */
-    const float* decay,   /* [nheads] — precomputed exp(-softplus(A) * dt_default) */
+    const float* decay,   /* [seq_len * nheads] — per-timestep decay: decay[t*nh+h] */
     const float* D_skip,  /* [nheads] — skip connection */
+    const float* dt,      /* [seq_len * nheads] — per-timestep dt for x scaling */
     float* y,             /* [seq_len, nheads * headdim] — output */
     float* state,         /* [nheads, d_state, headdim] */
     int seq_len, int nheads, int headdim, int d_state, int ngroups
@@ -399,22 +400,23 @@ void mamba2_scan_avx2(
 
     #pragma omp parallel for schedule(static) if(nheads >= 4)
     for (int h = 0; h < nheads; h++) {
-        int g = h / heads_per_group;  /* 이 헤드가 속한 그룹 */
-        float a = decay[h];           /* 스칼라 decay — exp 없이 broadcast */
-        float d_skip = D_skip[h];
+        int g = h / heads_per_group;
+        float d_skip_h = D_skip[h];
         float* S = state + h * d_state * headdim;
-        __m256 v_a = _mm256_set1_ps(a);
 
         for (int t = 0; t < seq_len; t++) {
+            float a = decay[t * nheads + h];
+            float dt_val = dt[t * nheads + h];
+            __m256 v_a = _mm256_set1_ps(a);
+            __m256 v_dt = _mm256_set1_ps(dt_val);
             const float* x_t = x + t * d_inner + h * headdim;
             const float* B_t = B + t * ngroups * d_state + g * d_state;
             const float* C_t = C + t * ngroups * d_state + g * d_state;
             float* y_t = y + t * d_inner + h * headdim;
 
-            /* State update: S[n,d] = a * S[n,d] + B[n] * x[d]
-             * 벡터화 over headdim (64 = 8×8 AVX2 iterations) */
+            /* State update: S[n,d] = a * S[n,d] + dt * B[n] * x[d] */
             for (int n = 0; n < d_state; n++) {
-                float b_n = B_t[n];
+                float b_n = B_t[n] * dt_val;  /* dt scaling on B*x */
                 __m256 v_b = _mm256_set1_ps(b_n);
                 float* s = S + n * headdim;
                 int d = 0;
@@ -438,8 +440,8 @@ void mamba2_scan_avx2(
                     __m256 v_s = _mm256_loadu_ps(S + n * headdim + d);
                     v_y = _mm256_fmadd_ps(v_c, v_s, v_y);
                 }
-                /* Skip connection: + D * x */
-                __m256 v_d = _mm256_set1_ps(d_skip);
+                /* Skip connection: + D * x (original, not dt-scaled) */
+                __m256 v_d = _mm256_set1_ps(d_skip_h);
                 __m256 v_x = _mm256_loadu_ps(x_t + d);
                 v_y = _mm256_fmadd_ps(v_d, v_x, v_y);
                 _mm256_storeu_ps(y_t + d, v_y);
@@ -450,7 +452,7 @@ void mamba2_scan_avx2(
                 for (int n = 0; n < d_state; n++) {
                     val += C_t[n] * S[n * headdim + d];
                 }
-                y_t[d] = val + d_skip * x_t[d];
+                y_t[d] = val + d_skip_h * x_t[d];
             }
         }
     }

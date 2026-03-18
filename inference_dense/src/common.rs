@@ -76,8 +76,24 @@ extern "C" {
     );
     pub fn mamba2_scan_avx2(
         x: *const f32, B: *const f32, C: *const f32,
-        decay: *const f32, D_skip: *const f32,
+        decay: *const f32, D_skip: *const f32, dt: *const f32,
         y: *mut f32, state: *mut f32,
+        seq_len: c_int, nheads: c_int, headdim: c_int,
+        d_state: c_int, ngroups: c_int,
+    );
+
+    /// FP32 batch sgemm (AVX2 + FMA): y[n,m] = w[m,k] @ x[n,k]^T
+    pub fn f32_sgemm_avx2(
+        w: *const f32, x: *const f32, y: *mut f32,
+        m: c_int, n: c_int, k: c_int,
+    );
+
+    /// Chunk-parallel SSD forward — mamba_ssm CUDA 커널과 수치 호환
+    pub fn mamba2_ssd_fwd(
+        x: *const f32, B: *const f32, C: *const f32,
+        dt: *const f32, A: *const f32, D: *const f32,
+        y: *mut f32,
+        chunk_size: c_int,
         seq_len: c_int, nheads: c_int, headdim: c_int,
         d_state: c_int, ngroups: c_int,
     );
@@ -174,7 +190,7 @@ impl RMSNorm {
     }
 }
 
-/// RMSNorm without affine (BitLinear 내부용)
+/// RMSNorm without affine (벤치마크용)
 #[inline]
 pub fn rms_norm_no_affine(x: &[f32], out: &mut [f32], eps: f32) {
     let n = x.len();
@@ -183,6 +199,27 @@ pub fn rms_norm_no_affine(x: &[f32], out: &mut [f32], eps: f32) {
     let rms_inv = (sq_sum / n as f32 + eps).sqrt().recip();
     for i in 0..n {
         out[i] = x[i] * rms_inv;
+    }
+}
+
+/// LayerNorm without affine (BitLinear 내부용 — Python nn.LayerNorm과 동일)
+/// (x - mean(x)) / sqrt(var(x) + eps)
+#[inline]
+pub fn layer_norm_no_affine(x: &[f32], out: &mut [f32], eps: f32) {
+    let n = x.len();
+    let mut sum = 0.0f32;
+    for &v in x { sum += v; }
+    let mean = sum / n as f32;
+
+    let mut var_sum = 0.0f32;
+    for &v in x {
+        let d = v - mean;
+        var_sum += d * d;
+    }
+    let inv_std = (var_sum / n as f32 + eps).sqrt().recip();
+
+    for i in 0..n {
+        out[i] = (x[i] - mean) * inv_std;
     }
 }
 
@@ -201,12 +238,23 @@ impl BitLinear {
         let key = format!("{}.weight", prefix);
         match tensors.remove(&key).context(format!("BitLinear weight 없음: {}", key))? {
             TensorData::Packed2Bit { data, gamma, row_sums, rows, cols, packed_stride } => {
-                let mut w_i8 = vec![0i8; rows * cols];
+                // C 커널이 32-byte 정렬 패딩을 쓰므로 여유 확보
+                let aligned_cols = (cols + 31) & !31;
+                let mut w_i8 = vec![0i8; rows * aligned_cols];
                 unsafe {
                     unpack_2bit_rows(
                         data.as_ptr(), w_i8.as_mut_ptr(),
                         rows as c_int, cols as c_int, packed_stride as c_int,
                     );
+                }
+                // 패딩된 부분 잘라내기 (matmul은 cols 기준)
+                if aligned_cols != cols {
+                    let mut compact = vec![0i8; rows * cols];
+                    for r in 0..rows {
+                        compact[r*cols..(r+1)*cols]
+                            .copy_from_slice(&w_i8[r*aligned_cols..r*aligned_cols+cols]);
+                    }
+                    w_i8 = compact;
                 }
                 Ok(Self { gamma, out_dim: rows, in_dim: cols, w_i8, row_sums })
             }
@@ -214,10 +262,10 @@ impl BitLinear {
         }
     }
 
-    /// 단일 벡터 forward: RMSNorm → quantize → i8_sgemv
+    /// 단일 벡터 forward: LayerNorm → quantize → i8_sgemv
     pub fn forward_vec(&self, x: &[f32], out: &mut [f32], norm_buf: &mut [f32], u8_buf: &mut [u8]) {
         let n = self.in_dim;
-        rms_norm_no_affine(x, &mut norm_buf[..n], 1e-5);
+        layer_norm_no_affine(x, &mut norm_buf[..n], 1e-5);
         let x_scale = unsafe {
             quantize_f32_to_u8(norm_buf.as_ptr(), u8_buf.as_mut_ptr(), n as c_int)
         };
@@ -237,14 +285,14 @@ impl BitLinear {
         }
     }
 
-    /// 배치 forward: RMSNorm → quantize → i8_sgemm
+    /// 배치 forward: LayerNorm → quantize → i8_sgemm
     pub fn forward_batch(&self, x: &[f32], seq_len: usize, out: &mut [f32], bufs: &mut BatchBufs) {
         let k = self.in_dim;
         let m = self.out_dim;
 
         bufs.norm.resize(seq_len * k, 0.0);
         for t in 0..seq_len {
-            rms_norm_no_affine(&x[t*k..(t+1)*k], &mut bufs.norm[t*k..(t+1)*k], 1e-5);
+            layer_norm_no_affine(&x[t*k..(t+1)*k], &mut bufs.norm[t*k..(t+1)*k], 1e-5);
         }
 
         bufs.u8_buf.resize(seq_len * k, 0);
@@ -260,6 +308,56 @@ impl BitLinear {
                 self.row_sums.as_ptr(), std::ptr::null(),
                 bufs.scales.as_ptr(), self.gamma,
             );
+        }
+    }
+}
+
+// ── LinearF32 (FP32 matmul — mamba_ssm.Mamba2 projection용) ────
+
+pub struct LinearF32 {
+    pub weight: Vec<f32>,  // [out_dim × in_dim] row-major
+    pub out_dim: usize,
+    pub in_dim: usize,
+}
+
+impl LinearF32 {
+    pub fn load_bmmq(tensors: &mut HashMap<String, TensorData>, prefix: &str) -> Result<Self> {
+        let key = format!("{}.weight", prefix);
+        match tensors.remove(&key).context(format!("LinearF32 weight 없음: {}", key))? {
+            TensorData::F32 { data, shape } => {
+                let (out_dim, in_dim) = (shape[0], shape[1]);
+                Ok(Self { weight: data, out_dim, in_dim })
+            }
+            _ => bail!("LinearF32는 F32 타입이어야 함: {}", key),
+        }
+    }
+
+    /// FP32 배치 matmul (AVX2 C 커널): out[t,j] = Σ_k weight[j,k] * x[t,k]
+    pub fn forward_batch(&self, x: &[f32], seq_len: usize, out: &mut [f32]) {
+        unsafe {
+            f32_sgemm_avx2(
+                self.weight.as_ptr(), x.as_ptr(), out.as_mut_ptr(),
+                self.out_dim as i32, seq_len as i32, self.in_dim as i32,
+            );
+        }
+    }
+
+    /// FP32 배치 matmul (순수 Rust — 폴백용)
+    #[allow(dead_code)]
+    pub fn forward_batch_rust(&self, x: &[f32], seq_len: usize, out: &mut [f32]) {
+        let m = self.out_dim;
+        let k = self.in_dim;
+        for t in 0..seq_len {
+            let x_t = &x[t * k..(t + 1) * k];
+            let o_t = &mut out[t * m..(t + 1) * m];
+            for j in 0..m {
+                let w_row = &self.weight[j * k..(j + 1) * k];
+                let mut sum = 0.0f32;
+                for i in 0..k {
+                    sum += w_row[i] * x_t[i];
+                }
+                o_t[j] = sum;
+            }
         }
     }
 }
@@ -335,7 +433,7 @@ impl BitNetFFN {
         let k = d_model;
         bufs.norm.resize(seq_len * k, 0.0);
         for t in 0..seq_len {
-            rms_norm_no_affine(&x[t*k..(t+1)*k], &mut bufs.norm[t*k..(t+1)*k], 1e-5);
+            layer_norm_no_affine(&x[t*k..(t+1)*k], &mut bufs.norm[t*k..(t+1)*k], 1e-5);
         }
         bufs.u8_buf.resize(seq_len * k, 0);
         bufs.scales.resize(seq_len, 0.0);

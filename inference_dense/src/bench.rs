@@ -157,7 +157,8 @@ pub fn benchmark_full_model(mt: &str, sl: usize, d: usize, warmup: usize, n_runs
     let m2_d_in_proj = 2 * m2di + 2 * m2ng * m2ds + m2nh;
     let (m2iw, m2ir) = make_dummy_i8(m2_d_in_proj, d);
     let (m2ow, m2or) = make_dummy_i8(d, m2di);
-    let m2_decay: Vec<f32> = (0..m2nh).map(|i| 0.9 + 0.09 * i as f32 / m2nh as f32).collect();
+    // per-timestep decay (벤치마크용 더미: 모든 timestep 동일)
+    let m2_decay: Vec<f32> = (0..sl*m2nh).map(|i| 0.9 + 0.09 * (i % m2nh) as f32 / m2nh as f32).collect();
     let m2_d_skip = vec![1.0f32; m2nh];
     let m2_conv_w = vec![0.1f32; m2_d_conv_in * 4];
     let m2_conv_b = vec![0.0f32; m2_d_conv_in];
@@ -251,14 +252,16 @@ pub fn benchmark_full_model(mt: &str, sl: usize, d: usize, warmup: usize, n_runs
                 // Mamba-2 SSD scan (양방향: 2회)
                 let mut m2y = vec![0.0f32; sl * m2di];
                 let mut m2st = vec![0.0f32; m2nh * m2ds * m2hd];
+                // dt = 1.0 더미 (벤치마크)
+                let m2_dt_dummy: Vec<f32> = (0..sl*m2nh).map(|_| 1.0f32).collect();
                 unsafe {
                     mamba2_scan_avx2(m2x.as_ptr(), m2b.as_ptr(), m2c.as_ptr(),
-                        m2_decay.as_ptr(), m2_d_skip.as_ptr(),
+                        m2_decay.as_ptr(), m2_d_skip.as_ptr(), m2_dt_dummy.as_ptr(),
                         m2y.as_mut_ptr(), m2st.as_mut_ptr(),
                         sl as c_int, m2nh as c_int, m2hd as c_int, m2ds as c_int, m2ng as c_int);
                     m2st.fill(0.0);
                     mamba2_scan_avx2(m2x.as_ptr(), m2b.as_ptr(), m2c.as_ptr(),
-                        m2_decay.as_ptr(), m2_d_skip.as_ptr(),
+                        m2_decay.as_ptr(), m2_d_skip.as_ptr(), m2_dt_dummy.as_ptr(),
                         m2y.as_mut_ptr(), m2st.as_mut_ptr(),
                         sl as c_int, m2nh as c_int, m2hd as c_int, m2ds as c_int, m2ng as c_int);
                 }

@@ -5,6 +5,7 @@ fn main() {
         // AVX2-only 백엔드 (VNNI 미사용)
         build.file("c_kernels/i8_kernel_avx2.c")
             .file("c_kernels/mixing_kernels.c")
+            .file("c_kernels/mamba2_ssd.c")
             .flag("-march=native")
             .flag("-mtune=native")
             .flag("-mno-avxvnni")
@@ -13,12 +14,12 @@ fn main() {
             .flag("-mfma")
             .flag("-fopenmp")
             .flag("-funroll-loops")
-            .flag("-ffast-math")
             .flag("-mprefer-vector-width=256");
     } else {
         // AVX-VNNI 백엔드 (기본)
         build.file("c_kernels/i8_kernel_vnni.c")
             .file("c_kernels/mixing_kernels.c")
+            .file("c_kernels/mamba2_ssd.c")
             .flag("-march=native")
             .flag("-mtune=native")
             .flag("-O3")
