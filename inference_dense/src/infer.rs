@@ -203,17 +203,6 @@ impl DenseEditorModel {
                 layer.norm1.forward(&x[t*d..(t+1)*d], &mut nm[t*d..(t+1)*d]);
             }
 
-            if layer_idx == 0 {
-                let mean: f32 = x.iter().sum::<f32>() / x.len() as f32;
-                let std: f32 = (x.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / x.len() as f32).sqrt();
-                eprintln!("  emb: mean={:.6} std={:.6} first5=[{:.6},{:.6},{:.6},{:.6},{:.6}]",
-                    mean, std, x[0], x[1], x[2], x[3], x[4]);
-                let mean_n: f32 = nm.iter().sum::<f32>() / nm.len() as f32;
-                let std_n: f32 = (nm.iter().map(|v| (v - mean_n).powi(2)).sum::<f32>() / nm.len() as f32).sqrt();
-                eprintln!("  norm1: mean={:.6} std={:.6} first5=[{:.6},{:.6},{:.6},{:.6},{:.6}]",
-                    mean_n, std_n, nm[0], nm[1], nm[2], nm[3], nm[4]);
-            }
-
             // BiMamba2: forward + backward(reversed) + add
             layer.mixing.fwd.forward_batch(&nm, sl, d, &mut fwd_out, &mut bufs);
 
@@ -227,16 +216,6 @@ impl DenseEditorModel {
             for t in 0..sl {
                 for i in 0..d {
                     mo[t*d+i] = fwd_out[t*d+i] + bwd_out[(sl-1-t)*d+i];
-                }
-            }
-
-            if layer_idx == 0 {
-                // bwd의 scan 출력 (norm/gate/outproj 전) — Mamba2Block.forward_batch는
-                // 이미 norm+gate+outproj를 포함하므로, 직접 비교 불가.
-                // 대신 최종 bwd_out(=after outproj) 비교
-                for t in [0usize, 5, sl-1] {
-                    eprintln!("  bwd_final[{},:3]=[{:.6},{:.6},{:.6}]",
-                        t, bwd_out[t*d], bwd_out[t*d+1], bwd_out[t*d+2]);
                 }
             }
 
@@ -255,9 +234,6 @@ impl DenseEditorModel {
         for t in 0..sl {
             self.final_norm.forward(&x[t*d..(t+1)*d], &mut nm[t*d..(t+1)*d]);
         }
-
-        // DEBUG: final hidden state
-        eprintln!("  final_x[0,:5]=[{:.4},{:.4},{:.4},{:.4},{:.4}]", nm[0], nm[1], nm[2], nm[3], nm[4]);
 
         // Tag head: LayerNorm + FP32 matmul (d_model → n_tags)
         let mut nm_tag = vec![0.0f32; sl * d];

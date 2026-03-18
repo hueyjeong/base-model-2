@@ -245,8 +245,6 @@ void ternary_f32_sgemm_avx2(
     float gamma,
     int m, int n, int k
 ) {
-    __m256 v_gamma = _mm256_set1_ps(gamma);
-
     #pragma omp parallel for schedule(static) if(m >= 64)
     for (int j = 0; j < m; j++) {
         const int8_t* w_row = w + j * k;
@@ -256,7 +254,6 @@ void ternary_f32_sgemm_avx2(
             int i = 0;
             /* 8 i8 → 8 i32 → 8 f32, then FMA with x */
             for (; i + 8 <= k; i += 8) {
-                /* _mm_loadl_epi64: 8 bytes (i8) → __m128i low 64-bit */
                 __m128i w8 = _mm_loadl_epi64((const __m128i*)(w_row + i));
                 __m256i w32 = _mm256_cvtepi8_epi32(w8);
                 __m256 wf = _mm256_cvtepi32_ps(w32);
