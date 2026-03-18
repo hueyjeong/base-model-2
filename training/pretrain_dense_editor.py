@@ -149,6 +149,7 @@ def validate_editor(model, val_loader, criterion, config, device, use_amp, n_ste
             edit_tags = batch["edit_tags"].to(device)
             pad_mask = batch["pad_mask"].to(device)
 
+            torch.compiler.cudagraph_mark_step_begin()
             if use_amp:
                 with torch.amp.autocast("cuda", dtype=amp_dtype):
                     tag_logits = model(input_ids, pad_mask)
@@ -532,6 +533,9 @@ def train(args):
 
             with ctx:
               for it in range(args.n_iterations):
+                # CUDA graph 호환: reduce-overhead compile 시 step 경계 표시
+                if args.compile:
+                    torch.compiler.cudagraph_mark_step_begin()
                 if use_amp:
                     with torch.amp.autocast("cuda", dtype=amp_dtype):
                         tag_logits = model(current_ids, pad_mask)
