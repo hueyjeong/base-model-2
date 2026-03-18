@@ -375,6 +375,9 @@ def train(args):
         ce_weight[1:] = args.edit_loss_weight
         if global_rank == 0:
             print(f"  edit_loss_weight={args.edit_loss_weight} (non-KEEP 태그 가중치)")
+    # BF16 AMP 시 ce_weight도 amp dtype으로 캐스팅 (cross_entropy dtype 일치 요구)
+    if ce_weight is not None and use_amp:
+        ce_weight = ce_weight.to(amp_dtype)
     criterion = nn.CrossEntropyLoss(
         weight=ce_weight,
         ignore_index=-100,
@@ -541,7 +544,7 @@ def train(args):
                 targets = torch.where(pad_mask, edit_tags, _ignore_idx)
 
                 ce_loss = criterion(
-                    tag_logits.float().view(-1, config.n_tags),
+                    tag_logits.view(-1, config.n_tags),
                     targets.view(-1),
                 )
 
