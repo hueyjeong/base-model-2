@@ -89,6 +89,7 @@ class Mamba2Block(nn.Module):
         else:
             return self._forward_fallback(x, reset_mask)
 
+    @torch.compiler.disable
     def _forward_cuda(self, x: Tensor, reset_mask: Tensor | None = None) -> Tensor:
         """nn.Linear in_proj → mamba_split_conv1d_scan_combined fused kernel"""
         # seq_idx for document isolation
