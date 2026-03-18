@@ -540,6 +540,16 @@ def train(args):
                 )
 
                 loss = ce_loss / (args.n_iterations * args.grad_accum_steps)
+
+                # BitLinear proximity regularization (ternary 근접성 유지)
+                if args.quant_reg_weight > 0:
+                    from model.bitlinear import BitLinear as _BL
+                    quant_loss = sum(
+                        m.quantization_loss() for m in raw_model.modules()
+                        if isinstance(m, _BL)
+                    )
+                    loss = loss + args.quant_reg_weight * quant_loss
+
                 loss.backward()
 
                 _iter_loss += ce_loss.detach()
@@ -782,6 +792,8 @@ def main():
                         help="Label smoothing 계수 (0=비활성)")
     parser.add_argument("--edit_loss_weight", type=float, default=2.0,
                         help="non-KEEP 편집 태그 loss 가중치 (1.0=균등)")
+    parser.add_argument("--quant_reg_weight", type=float, default=0.0,
+                        help="BitLinear proximity regularization weight (0=비활성, 권장 0.01-0.1)")
     parser.add_argument("--error_prob", type=float, default=0.5,
                         help="한국어 오류 주입 확률 (NoiseConfig.korean_error_prob)")
     parser.add_argument("--error_count", type=int, default=3,

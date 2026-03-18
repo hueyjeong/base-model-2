@@ -27,11 +27,46 @@ struct OutputLine {
     tags: Vec<u32>,
 }
 
-// ── Fused BitNetFFN (FP32 matmul — INT8 양자화 오차 제거) ─────────────
+// ── Projection (F32/Ternary 자동 감지) ───────────────
+
+enum Projection {
+    F32(LinearF32),
+    Ternary(TernaryLinear),
+}
+
+impl Projection {
+    fn load_bmmq(tensors: &mut HashMap<String, TensorData>, prefix: &str) -> Result<Self> {
+        let key = format!("{}.weight", prefix);
+        let is_ternary = matches!(tensors.get(&key), Some(TensorData::Packed2Bit { .. }));
+        if is_ternary {
+            eprintln!("    {} → Ternary", prefix);
+            Ok(Projection::Ternary(TernaryLinear::load_bmmq(tensors, prefix)?))
+        } else {
+            Ok(Projection::F32(LinearF32::load_bmmq(tensors, prefix)?))
+        }
+    }
+
+    fn forward_batch(&self, x: &[f32], seq_len: usize, out: &mut [f32]) {
+        match self {
+            Projection::F32(l) => l.forward_batch(x, seq_len, out),
+            Projection::Ternary(l) => l.forward_batch(x, seq_len, out),
+        }
+    }
+
+    fn out_dim(&self) -> usize {
+        match self { Projection::F32(l) => l.out_dim, Projection::Ternary(l) => l.out_dim }
+    }
+
+    fn in_dim(&self) -> usize {
+        match self { Projection::F32(l) => l.in_dim, Projection::Ternary(l) => l.in_dim }
+    }
+}
+
+// ── Fused BitNetFFN (F32 또는 Ternary matmul) ──────────
 
 struct FusedBitNetFFN {
-    gate_up_proj: LinearF32,  // d_model → 2*d_ff (FP32 weight — ternary 포함)
-    down_proj: LinearF32,     // d_ff → d_model
+    gate_up_proj: Projection,  // d_model → 2*d_ff
+    down_proj: Projection,     // d_ff → d_model
     d_ff: usize,
 }
 
@@ -39,11 +74,11 @@ impl FusedBitNetFFN {
     fn load_bmmq(
         tensors: &mut HashMap<String, TensorData>, prefix: &str,
     ) -> Result<Self> {
-        let gate_up = LinearF32::load_bmmq(tensors, &format!("{}.gate_up_proj", prefix))?;
-        let d_ff = gate_up.out_dim / 2;
+        let gate_up = Projection::load_bmmq(tensors, &format!("{}.gate_up_proj", prefix))?;
+        let d_ff = gate_up.out_dim() / 2;
         Ok(Self {
             gate_up_proj: gate_up,
-            down_proj: LinearF32::load_bmmq(tensors, &format!("{}.down_proj", prefix))?,
+            down_proj: Projection::load_bmmq(tensors, &format!("{}.down_proj", prefix))?,
             d_ff,
         })
     }
@@ -53,8 +88,8 @@ impl FusedBitNetFFN {
         out: &mut [f32], _bufs: &mut BatchBufs,
         gu_buf: &mut Vec<f32>, mid_buf: &mut Vec<f32>,
     ) {
-        let d_in = self.gate_up_proj.in_dim;
-        let dff2 = self.gate_up_proj.out_dim;
+        let d_in = self.gate_up_proj.in_dim();
+        let dff2 = self.gate_up_proj.out_dim();
         let dff = self.d_ff;
 
         // BitLinear의 LayerNorm(no affine) 적용
@@ -63,7 +98,7 @@ impl FusedBitNetFFN {
             layer_norm_no_affine(&x[t*d_in..(t+1)*d_in], &mut normed[t*d_in..(t+1)*d_in], 1e-5);
         }
 
-        // FP32 matmul (gate_up)
+        // matmul (gate_up) — F32 또는 Ternary
         gu_buf.resize(seq_len * dff2, 0.0);
         self.gate_up_proj.forward_batch(&normed, seq_len, gu_buf);
 
@@ -77,8 +112,8 @@ impl FusedBitNetFFN {
             }
         }
 
-        // down_proj도 LayerNorm + FP32 matmul
-        let d_mid = self.down_proj.in_dim;
+        // down_proj: LayerNorm + matmul
+        let d_mid = self.down_proj.in_dim();
         let mut normed_mid = vec![0.0f32; seq_len * d_mid];
         for t in 0..seq_len {
             layer_norm_no_affine(&mid_buf[t*d_mid..(t+1)*d_mid], &mut normed_mid[t*d_mid..(t+1)*d_mid], 1e-5);
@@ -103,7 +138,7 @@ struct DenseEditorModel {
     embed_scale: f32,
     layers: Vec<DenseEditorLayer>,
     final_norm: RMSNorm,
-    tag_head: LinearF32,
+    tag_head: Projection,
     d_model: usize,
     n_tags: usize,
 }
@@ -148,7 +183,7 @@ impl DenseEditorModel {
         }
 
         let final_norm = RMSNorm::load_bmmq(&mut tensors, "final_norm", eps as f64)?;
-        let tag_head = LinearF32::load_bmmq(&mut tensors, "tag_head")?;
+        let tag_head = Projection::load_bmmq(&mut tensors, "tag_head")?;
 
         // 남은 텐서 보고 (tag_head.norm.weight 등은 BitLinear에 포함되지 않음 — 무시)
         if !tensors.is_empty() {

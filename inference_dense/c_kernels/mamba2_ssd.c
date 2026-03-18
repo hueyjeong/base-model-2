@@ -22,6 +22,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 #include <immintrin.h>
 #include <omp.h>
 
@@ -203,12 +204,12 @@ void f32_sgemm_avx2(
     float* y,        /* [n, m] */
     int m, int n, int k
 ) {
-    #pragma omp parallel for schedule(static) if(n >= 4)
-    for (int t = 0; t < n; t++) {
-        const float* x_t = x + t * k;
-        float* y_t = y + t * m;
-        for (int j = 0; j < m; j++) {
-            const float* w_row = w + j * k;
+    /* row(m) 방향 병렬화 — 스레드당 weight 부분 행만 읽어 L2 캐시 적합 */
+    #pragma omp parallel for schedule(static) if(m >= 64)
+    for (int j = 0; j < m; j++) {
+        const float* w_row = w + j * k;
+        for (int t = 0; t < n; t++) {
+            const float* x_t = x + t * k;
             __m256 vsum = _mm256_setzero_ps();
             int i = 0;
             for (; i + 8 <= k; i += 8) {
@@ -227,7 +228,53 @@ void f32_sgemm_avx2(
             for (; i < k; i++) {
                 sum += w_row[i] * x_t[i];
             }
-            y_t[j] = sum;
+            y[t * m + j] = sum;
+        }
+    }
+}
+
+/* ── Ternary matmul (AVX2) ─────────────────────────────────
+ * y[n,m] = gamma * (w_i8[m,k] @ x[n,k]^T)
+ * w_i8[j,i] ∈ {-1, 0, +1} — i8→i32→f32 변환 후 FMA
+ * 메모리 대역폭 4x 절약 (f32 weight 대비 i8)
+ */
+void ternary_f32_sgemm_avx2(
+    const int8_t* w,  /* [m, k] — ternary {-1,0,+1} */
+    const float* x,   /* [n, k] */
+    float* y,         /* [n, m] */
+    float gamma,
+    int m, int n, int k
+) {
+    __m256 v_gamma = _mm256_set1_ps(gamma);
+
+    #pragma omp parallel for schedule(static) if(m >= 64)
+    for (int j = 0; j < m; j++) {
+        const int8_t* w_row = w + j * k;
+        for (int t = 0; t < n; t++) {
+            const float* x_t = x + t * k;
+            __m256 vsum = _mm256_setzero_ps();
+            int i = 0;
+            /* 8 i8 → 8 i32 → 8 f32, then FMA with x */
+            for (; i + 8 <= k; i += 8) {
+                /* _mm_loadl_epi64: 8 bytes (i8) → __m128i low 64-bit */
+                __m128i w8 = _mm_loadl_epi64((const __m128i*)(w_row + i));
+                __m256i w32 = _mm256_cvtepi8_epi32(w8);
+                __m256 wf = _mm256_cvtepi32_ps(w32);
+                __m256 vx = _mm256_loadu_ps(x_t + i);
+                vsum = _mm256_fmadd_ps(wf, vx, vsum);
+            }
+            /* horizontal sum */
+            __m128 hi = _mm256_extractf128_ps(vsum, 1);
+            __m128 lo = _mm256_castps256_ps128(vsum);
+            __m128 s4 = _mm_add_ps(lo, hi);
+            __m128 s2 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+            __m128 s1 = _mm_add_ss(s2, _mm_shuffle_ps(s2, s2, 1));
+            float sum = _mm_cvtss_f32(s1);
+            /* scalar tail */
+            for (; i < k; i++) {
+                sum += (float)w_row[i] * x_t[i];
+            }
+            y[t * m + j] = gamma * sum;
         }
     }
 }
