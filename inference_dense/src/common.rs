@@ -88,6 +88,12 @@ extern "C" {
         m: c_int, n: c_int, k: c_int,
     );
 
+    /// Ternary matmul (AVX2): y[n,m] = gamma * (w_i8[m,k] @ x[n,k]^T)
+    pub fn ternary_f32_sgemm_avx2(
+        w: *const i8, x: *const f32, y: *mut f32,
+        gamma: f32, m: c_int, n: c_int, k: c_int,
+    );
+
     /// Chunk-parallel SSD forward — mamba_ssm CUDA 커널과 수치 호환
     pub fn mamba2_ssd_fwd(
         x: *const f32, B: *const f32, C: *const f32,
@@ -358,6 +364,53 @@ impl LinearF32 {
                 }
                 o_t[j] = sum;
             }
+        }
+    }
+}
+
+// ── TernaryLinear (1.58-bit ternary weight + FP32 activation) ──
+
+pub struct TernaryLinear {
+    pub w_i8: Vec<i8>,   // [out_dim × in_dim] ternary {-1, 0, +1}
+    pub gamma: f32,      // 단일 scale factor (per-tensor absmean)
+    pub out_dim: usize,
+    pub in_dim: usize,
+}
+
+impl TernaryLinear {
+    pub fn load_bmmq(tensors: &mut HashMap<String, TensorData>, prefix: &str) -> Result<Self> {
+        let key = format!("{}.weight", prefix);
+        match tensors.remove(&key).context(format!("TernaryLinear weight 없음: {}", key))? {
+            TensorData::Packed2Bit { data, gamma, row_sums: _, rows, cols, packed_stride } => {
+                let aligned_cols = (cols + 31) & !31;
+                let mut w_i8 = vec![0i8; rows * aligned_cols];
+                unsafe {
+                    unpack_2bit_rows(
+                        data.as_ptr(), w_i8.as_mut_ptr(),
+                        rows as c_int, cols as c_int, packed_stride as c_int,
+                    );
+                }
+                if aligned_cols != cols {
+                    let mut compact = vec![0i8; rows * cols];
+                    for r in 0..rows {
+                        compact[r*cols..(r+1)*cols]
+                            .copy_from_slice(&w_i8[r*aligned_cols..r*aligned_cols+cols]);
+                    }
+                    w_i8 = compact;
+                }
+                Ok(Self { w_i8, gamma, out_dim: rows, in_dim: cols })
+            }
+            _ => bail!("TernaryLinear은 Packed2Bit 타입이어야 함: {}", key),
+        }
+    }
+
+    /// Ternary 배치 matmul: out[t,j] = gamma * Σ_k w_i8[j,k] * x[t,k]
+    pub fn forward_batch(&self, x: &[f32], seq_len: usize, out: &mut [f32]) {
+        unsafe {
+            ternary_f32_sgemm_avx2(
+                self.w_i8.as_ptr(), x.as_ptr(), out.as_mut_ptr(),
+                self.gamma, self.out_dim as i32, seq_len as i32, self.in_dim as i32,
+            );
         }
     }
 }

@@ -142,6 +142,19 @@ class BitLinear(nn.Module):
 
         return out
 
+    def quantization_loss(self) -> torch.Tensor:
+        """가중치가 ternary {-1,0,+1}에 가까워지도록 하는 proximity loss
+
+        L_prox = mean((W - γ * round(clip(W/γ, -1, 1)))²)
+
+        학습 시 CE loss에 합산하여 latent weight의 ternary 근접성 유지.
+        """
+        with torch.no_grad():
+            gamma = self.weight.abs().mean().clamp(min=1e-5)
+            w_quant = (self.weight / gamma).clamp(-1.0, 1.0).round()
+            target = gamma * w_quant
+        return ((self.weight - target) ** 2).mean()
+
     def extra_repr(self) -> str:
         return (
             f"in_features={self.in_features}, "

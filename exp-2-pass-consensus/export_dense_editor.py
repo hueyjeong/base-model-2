@@ -30,10 +30,14 @@ from export_model import (
 )
 
 
-# 모든 가중치를 f32로 export — INT8 양자화 오차가 15 레이어 누적되어 발산
-# BitLinear weight도 f32로 저장 (Rust에서 FP32 matmul)
+# BitLinear weight를 ternary packed2bit로 export
+# in_proj, out_proj, FFN, tag_head 모두 BitLinear → 전체 ternary
 def _is_bitlinear(key: str) -> bool:
-    return False  # 모든 weight를 f32로 export
+    return any(p in key for p in [
+        "in_proj.weight", "out_proj.weight",
+        "gate_up_proj.weight", "down_proj.weight",
+        "tag_head.weight",
+    ])
 
 
 def export_dense_editor(ckpt_path: str, output_dir: str):
