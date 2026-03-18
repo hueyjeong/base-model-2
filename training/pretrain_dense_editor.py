@@ -14,10 +14,12 @@ Usage:
 """
 import argparse
 import gc
+import io
 import json
 import math
 import os
 import sys
+import threading
 import time
 from contextlib import nullcontext
 from dataclasses import asdict
@@ -456,6 +458,10 @@ def train(args):
     _lr_decay_start = None  # 에포크 1 종료 후 cosine decay 시작점
     _lr_decay_end = None
 
+    # 비동기 체크포인트 저장
+    _save_thread: threading.Thread | None = None
+    _prev_ckpt_path: str | None = None
+
     # 에포크 상태 복원
     if _restored_epoch_state is not None:
         _current_epoch = _restored_epoch_state.get("current_epoch", 0)
@@ -690,6 +696,13 @@ def train(args):
                     f"dense_{args.mixing_type}_d{args.d_model}_step_{step + 1}.pt"
                 )
                 os.makedirs(args.save_dir, exist_ok=True)
+
+                # 이전 저장 스레드 완료 대기
+                if _save_thread is not None:
+                    _save_thread.join()
+
+                # 메모리 버퍼에 직렬화 (GPU 텐서 안전하게 캡처)
+                ckpt_buf = io.BytesIO()
                 torch.save({
                     "step": step + 1,
                     "total_chars": int(total_chars),
@@ -706,11 +719,36 @@ def train(args):
                         "lr_decay_start": _lr_decay_start,
                         "lr_decay_end": _lr_decay_end,
                     },
-                }, ckpt_path)
-                print(f"  체크포인트 저장: {ckpt_path}", flush=True)
+                }, ckpt_buf)
 
-                if args.gdrive_remote:
-                    upload_and_cleanup(ckpt_path, args.log_file, args.gdrive_remote, keep_latest_n=1)
+                # 백그라운드 스레드: 디스크 기록 + 이전 체크포인트 삭제 + 업로드
+                _prev = _prev_ckpt_path
+                _gdrive = args.gdrive_remote
+                _logf = args.log_file
+
+                def _save_task(buf, path, prev, gdrive, logf):
+                    buf.seek(0)
+                    with open(path, "wb") as f:
+                        f.write(buf.getvalue())
+                    print(f"  체크포인트 저장 완료: {path}", flush=True)
+                    # 이전 체크포인트 삭제
+                    if prev and os.path.exists(prev):
+                        try:
+                            os.remove(prev)
+                            print(f"  이전 체크포인트 삭제: {prev}", flush=True)
+                        except OSError:
+                            pass
+                    # 업로드
+                    if gdrive:
+                        upload_and_cleanup(path, logf, gdrive, keep_latest_n=1)
+
+                _save_thread = threading.Thread(
+                    target=_save_task,
+                    args=(ckpt_buf, ckpt_path, _prev, _gdrive, _logf),
+                    daemon=True,
+                )
+                _save_thread.start()
+                _prev_ckpt_path = ckpt_path
 
     # 최종 저장 전 잔여 chars flush
     if is_distributed:
@@ -722,6 +760,10 @@ def train(args):
     log_chars.zero_()
 
     final_step = step + 1 if _epoch_done else args.max_steps
+
+    # 진행 중인 비동기 저장 완료 대기
+    if _save_thread is not None:
+        _save_thread.join()
 
     if global_rank == 0:
         os.makedirs(args.save_dir, exist_ok=True)
