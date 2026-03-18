@@ -283,8 +283,8 @@ def train(args):
         torch._dynamo.config.recompile_limit = 64
         torch._dynamo.config.cache_size_limit = 256
         if global_rank == 0:
-            print("torch.compile 적용 중... (첫 step 느림, 이후 빠름)")
-        model = torch.compile(model)
+            print(f"torch.compile 적용 중 (mode={args.compile_mode})... (첫 step 느림, 이후 빠름)")
+        model = torch.compile(model, mode=args.compile_mode)
 
     # 노이즈 설정 (토큰 레벨 비활성화, 한국어 오류 증강 CLI 제어)
     noise_cfg = NoiseConfig(
@@ -837,6 +837,9 @@ def main():
     parser.add_argument("--grad_ckpt", action="store_true")
     parser.add_argument("--compile", action="store_true",
                         help="torch.compile 적용 (커널 fusion, 첫 step 느림)")
+    parser.add_argument("--compile_mode", default="default",
+                        choices=["default", "reduce-overhead", "max-autotune"],
+                        help="torch.compile 모드 (default, reduce-overhead, max-autotune)")
     parser.add_argument("--label_smoothing", type=float, default=0.1,
                         help="Label smoothing 계수 (0=비활성)")
     parser.add_argument("--edit_loss_weight", type=float, default=2.0,
