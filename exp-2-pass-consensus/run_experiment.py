@@ -47,6 +47,122 @@ except ImportError:
     from model.edit_tags import compute_edit_tags
 
 
+# ── 추론 최적화 ────────────────────────────────────────────────────────
+
+def prepare_model_for_inference(model: DenseEditor):
+    """추론 전용 최적화 — 가중치 불변, 학습 호환성 유지
+
+    1. BitLinearCuda: 가중치 사전 양자화 (매 forward 재양자화 제거, 31모듈 × 6 element-wise 삭제)
+    2. BiMamba2: bwd_reset 캐싱 (매 레이어 flip+clone 제거, 14회 → 0회)
+    """
+    import types
+
+    n_bitlinear = 0
+    n_bimamba = 0
+
+    # --- BitLinearCuda 가중치 사전 양자화 ---
+    try:
+        from model.cuda_bitlinear import (
+            BitLinearCuda, _quantize_weights, _quantize_activations,
+            _pad_int8_for_int_mm,
+        )
+
+        for module in model.modules():
+            if not isinstance(module, BitLinearCuda):
+                continue
+
+            # 가중치를 한 번만 양자화하여 버퍼로 저장
+            with torch.no_grad():
+                w_q, w_scale = _quantize_weights(module.weight.float())
+                w_int8 = w_q.to(torch.int8).contiguous()
+                w_scale_1 = w_scale.reshape(1).contiguous().float()
+                # 패딩된 버전도 사전 계산 (차원이 8배수가 아닌 경우)
+                N, K = w_int8.shape
+                from model.cuda_bitlinear import _ceil_to_multiple_of_8
+                K8 = _ceil_to_multiple_of_8(K)
+                N8 = _ceil_to_multiple_of_8(N)
+                if N8 != N or K8 != K:
+                    w_int8_pad = torch.zeros((N8, K8), device=w_int8.device, dtype=torch.int8)
+                    w_int8_pad[:N, :K] = w_int8
+                else:
+                    w_int8_pad = w_int8
+                module._inf_w_int8_pad = w_int8_pad
+                module._inf_w_scale = w_scale_1
+                module._inf_N = N
+                module._inf_K8 = K8
+
+            # forward를 사전 양자화 버전으로 교체
+            def _fast_forward(self, x):
+                x_norm = self.norm(x)
+                if torch.is_autocast_enabled('cuda'):
+                    out_dtype = torch.get_autocast_dtype('cuda')
+                else:
+                    out_dtype = x_norm.dtype
+
+                x_q, x_scale = _quantize_activations(x_norm.float())
+                batch_shape = x_norm.shape[:-1]
+                M = x_q.reshape(-1, x_q.shape[-1]).shape[0]
+                x_int8 = x_q.reshape(M, -1).to(torch.int8).contiguous()
+                x_scale_2d = x_scale.reshape(M, 1).contiguous().float()
+
+                # 입력만 패딩 (가중치는 사전 패딩 완료)
+                from model.cuda_bitlinear import _ceil_to_multiple_of_8
+                M8 = _ceil_to_multiple_of_8(M)
+                if M8 != M or x_int8.shape[1] != self._inf_K8:
+                    x_pad = torch.zeros((M8, self._inf_K8),
+                                        device=x_int8.device, dtype=torch.int8)
+                    x_pad[:M, :x_int8.shape[1]] = x_int8
+                else:
+                    x_pad = x_int8
+
+                out_i32 = torch._int_mm(x_pad, self._inf_w_int8_pad.t().contiguous())
+                out_2d = out_i32[:M, :self._inf_N].float() * (x_scale_2d * self._inf_w_scale)
+
+                if self.bias is not None:
+                    out_2d = out_2d + self.bias.float()
+
+                return out_2d.to(out_dtype).reshape(*batch_shape, -1)
+
+            module.forward = types.MethodType(_fast_forward, module)
+            n_bitlinear += 1
+
+    except ImportError:
+        pass
+
+    # --- BiMamba2 bwd_reset 캐싱 ---
+    from model.mixing.bi_mamba2 import BiMamba2Mixing
+
+    for module in model.modules():
+        if not isinstance(module, BiMamba2Mixing):
+            continue
+
+        module._cached_bwd_reset = None
+        module._cached_reset_ptr = -1
+
+        def _cached_forward(self, x, pad_mask=None, reset_mask=None):
+            fwd_out = self.fwd(x, reset_mask=reset_mask)
+            if reset_mask is not None:
+                ptr = reset_mask.data_ptr()
+                if ptr != self._cached_reset_ptr:
+                    self._cached_bwd_reset = reset_mask.flip(1).clone()
+                    self._cached_bwd_reset[:, 0] = True
+                    self._cached_reset_ptr = ptr
+                bwd_reset = self._cached_bwd_reset
+            else:
+                bwd_reset = None
+            bwd_out = self.bwd(x.flip(1), reset_mask=bwd_reset).flip(1)
+            out = fwd_out + bwd_out
+            if pad_mask is not None:
+                out = out * pad_mask.unsqueeze(-1).to(out.dtype)
+            return out
+
+        module.forward = types.MethodType(_cached_forward, module)
+        n_bimamba += 1
+
+    print(f"  추론 최적화: BitLinearCuda {n_bitlinear}개 가중치 사전양자화, "
+          f"BiMamba2 {n_bimamba}개 bwd_reset 캐싱")
+
+
 # ── 모델 로딩 ──────────────────────────────────────────────────────────
 
 def load_model(
@@ -60,7 +176,7 @@ def load_model(
     model = DenseEditor(config)
     model.load_state_dict(ckpt["model"])
 
-    # INT8 CUDA BitLinear 교체 (학습과 동일 — fused INT8 matmul 가속)
+    # INT8 CUDA BitLinear (옵션 — 대형 GPU에서만 이득, 소형 GPU는 BF16이 더 빠름)
     if use_int8 and device == "cuda":
         try:
             from model.cuda_bitlinear import replace_bitlinear_with_cuda
@@ -68,11 +184,17 @@ def load_model(
             print("  INT8 CUDA BitLinear 활성화")
         except Exception as e:
             print(f"  INT8 CUDA 불가: {e}")
+    elif not use_int8:
+        print("  BF16 matmul (INT8 비활성화 — 소형 GPU에서 더 빠름)")
 
     model.to(device)
 
     # MC Dropout: train 모드 유지 → dropout(0.1) 활성
     model.train()
+
+    # 추론 전용 최적화 (가중치 사전 양자화 + bwd_reset 캐싱)
+    if device == "cuda":
+        prepare_model_for_inference(model)
 
     step = ckpt.get("step", "unknown")
     n_params = sum(p.numel() for p in model.parameters())
@@ -626,7 +748,7 @@ def run_experiment(args):
     # cuDNN 벤치마크 모드 (최적 커널 선택)
     torch.backends.cudnn.benchmark = True
 
-    model, config = load_model(args.ckpt, device, use_int8=(not args.no_int8))
+    model, config = load_model(args.ckpt, device, use_int8=args.int8)
     vocab_size = config.vocab_size
 
     tokenizer = KeyboardTokenizer()
@@ -728,7 +850,7 @@ def run_experiment(args):
             "variations": args.variations,
             "stochasticity": "mc_dropout",
             "dropout": config.dropout,
-            "int8": not args.no_int8,
+            "int8": args.int8,
         },
         "results": all_results,
     }
@@ -818,8 +940,8 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output_dir", default="exp-2-pass-consensus/results")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--no_int8", action="store_true",
-                        help="INT8 CUDA BitLinear 비활성화")
+    parser.add_argument("--int8", action="store_true",
+                        help="INT8 CUDA BitLinear 활성화 (대형 GPU용, 기본=BF16)")
 
     args = parser.parse_args()
     run_experiment(args)

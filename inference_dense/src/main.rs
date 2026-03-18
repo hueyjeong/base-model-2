@@ -9,6 +9,7 @@ mod config;
 mod common;
 mod mixing;
 mod bench;
+mod infer;
 
 use std::time::Instant;
 use clap::Parser;
@@ -36,6 +37,10 @@ struct Args {
     /// 전체 모델 벤치마크 (projection + scan + FFN)
     #[arg(long)]
     benchmark_full: bool,
+
+    /// 추론 모드 (stdin JSON Lines → stdout JSON Lines)
+    #[arg(long)]
+    infer: bool,
 
     /// Mixing type (all|rwkv|fnet|tcn|retnet|mamba|mamba2|xlstm)
     #[arg(long, default_value = "all")]
@@ -203,8 +208,9 @@ fn benchmark_dummy(mixing_type: &str, seq_len: usize, warmup: usize, n_runs: usi
                 let x_inner = vec![0.1f32; seq_len * d_inner];
                 let b_ssm = vec![0.1f32; seq_len * ngroups * d_state];
                 let c_ssm = vec![0.1f32; seq_len * ngroups * d_state];
-                let decay: Vec<f32> = (0..nheads).map(|i| 0.9 + 0.09 * i as f32 / nheads as f32).collect();
+                let decay: Vec<f32> = (0..seq_len*nheads).map(|i| 0.9 + 0.09 * (i % nheads) as f32 / nheads as f32).collect();
                 let d_skip = vec![1.0f32; nheads];
+                let dt_dummy = vec![1.0f32; seq_len * nheads];
                 let mut y = vec![0.0f32; seq_len * d_inner];
                 let mut state = vec![0.0f32; nheads * d_state * headdim];
 
@@ -213,7 +219,7 @@ fn benchmark_dummy(mixing_type: &str, seq_len: usize, warmup: usize, n_runs: usi
                     unsafe {
                         mamba2_scan_avx2(
                             x_inner.as_ptr(), b_ssm.as_ptr(), c_ssm.as_ptr(),
-                            decay.as_ptr(), d_skip.as_ptr(),
+                            decay.as_ptr(), d_skip.as_ptr(), dt_dummy.as_ptr(),
                             y.as_mut_ptr(), state.as_mut_ptr(),
                             seq_len as i32, nheads as i32, headdim as i32,
                             d_state as i32, ngroups as i32,
@@ -227,7 +233,7 @@ fn benchmark_dummy(mixing_type: &str, seq_len: usize, warmup: usize, n_runs: usi
                     unsafe {
                         mamba2_scan_avx2(
                             x_inner.as_ptr(), b_ssm.as_ptr(), c_ssm.as_ptr(),
-                            decay.as_ptr(), d_skip.as_ptr(),
+                            decay.as_ptr(), d_skip.as_ptr(), dt_dummy.as_ptr(),
                             y.as_mut_ptr(), state.as_mut_ptr(),
                             seq_len as i32, nheads as i32, headdim as i32,
                             d_state as i32, ngroups as i32,
@@ -334,6 +340,14 @@ fn report(name: &str, seq_len: usize, d_model: usize, latencies: &[f64]) {
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    if args.infer {
+        let config = args.config.as_deref()
+            .expect("--infer 모드에는 --config 필요");
+        let model = args.model.as_deref()
+            .expect("--infer 모드에는 --model 필요");
+        return infer::run_infer(config, model);
+    }
+
     if args.benchmark_full {
         bench::benchmark_all_full(args.seq_len, args.d_model, args.warmup, args.n_runs);
         return Ok(());
@@ -345,7 +359,9 @@ fn main() -> Result<()> {
     }
 
     println!("DenseEditor CPU 추론 엔진");
-    println!("사용법: --benchmark-dummy --mixing-type all --seq-len 2048");
+    println!("사용법:");
+    println!("  --infer --config config.json --model model.bmmq  (추론)");
+    println!("  --benchmark-dummy --mixing-type all --seq-len 2048  (벤치마크)");
 
     Ok(())
 }
