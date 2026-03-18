@@ -70,13 +70,9 @@ impl MixingLayer for Mamba2Block {
         let d_conv_in = di + 2 * ng * ds;
         let d_in_proj = self.in_proj.out_dim();
 
-        // BitLinear LayerNorm (elementwise_affine=False) → in_proj matmul
-        let mut x_normed = vec![0.0f32; seq_len * d_model];
-        for t in 0..seq_len {
-            layer_norm_no_affine(&x[t*d_model..(t+1)*d_model], &mut x_normed[t*d_model..(t+1)*d_model], 1e-5);
-        }
+        // in_proj: nn.Linear (LayerNorm 없음 — fused kernel이 내부 처리)
         let mut proj = vec![0.0f32; seq_len * d_in_proj];
-        self.in_proj.forward_batch(&x_normed, seq_len, &mut proj);
+        self.in_proj.forward_batch(x, seq_len, &mut proj);
 
         // Split: mamba_ssm 순서 — z(di) + xBC(di+2*ng*ds) + dt_raw(nh)
         let mut z = vec![0.0f32; seq_len * di];
@@ -197,12 +193,8 @@ impl MixingLayer for Mamba2Block {
             }
         }
 
-        // BitLinear LayerNorm → out_proj matmul (Ternary)
-        let mut y_normed = vec![0.0f32; seq_len * di];
-        for t in 0..seq_len {
-            layer_norm_no_affine(&y_scan[t*di..(t+1)*di], &mut y_normed[t*di..(t+1)*di], 1e-5);
-        }
-        self.out_proj.forward_batch(&y_normed, seq_len, out);
+        // out_proj: nn.Linear (LayerNorm 없음)
+        self.out_proj.forward_batch(&y_scan, seq_len, out);
     }
 }
 
