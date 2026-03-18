@@ -158,7 +158,7 @@ def validate_editor(model, val_loader, criterion, config, device, use_amp, n_ste
             targets = edit_tags.clone()
             targets[~pad_mask] = -100
             loss = criterion(
-                tag_logits.view(-1, config.n_tags),
+                tag_logits.float().view(-1, config.n_tags),
                 targets.view(-1),
             )
 
@@ -541,7 +541,7 @@ def train(args):
                 targets = torch.where(pad_mask, edit_tags, _ignore_idx)
 
                 ce_loss = criterion(
-                    tag_logits.view(-1, config.n_tags),
+                    tag_logits.float().view(-1, config.n_tags),
                     targets.view(-1),
                 )
 
