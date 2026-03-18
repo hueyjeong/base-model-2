@@ -548,13 +548,19 @@ def train(args):
 
                 loss = ce_loss / (args.n_iterations * args.grad_accum_steps)
 
-                # BitLinear proximity regularization (ternary 근접성 유지)
+                # Ternary proximity regularization (모든 linear 가중치의 ternary 근접성 유지)
                 if args.quant_reg_weight > 0:
-                    from model.bitlinear import BitLinear as _BL
-                    quant_loss = sum(
-                        m.quantization_loss() for m in raw_model.modules()
-                        if isinstance(m, _BL)
-                    )
+                    from model.bitlinear import BitLinear as _BL, quantize_weights_158 as _qw
+                    quant_loss = torch.tensor(0.0, device=device)
+                    for m in raw_model.modules():
+                        if isinstance(m, _BL):
+                            quant_loss = quant_loss + m.quantization_loss()
+                        elif isinstance(m, nn.Linear) and m.weight.requires_grad:
+                            # Mamba2 nn.Linear projection도 ternary 근접성 유지
+                            with torch.no_grad():
+                                gamma = m.weight.abs().mean().clamp(min=1e-5)
+                                target = gamma * (m.weight / gamma).clamp(-1.0, 1.0).round()
+                            quant_loss = quant_loss + ((m.weight - target) ** 2).mean()
                     loss = loss + args.quant_reg_weight * quant_loss
 
                 loss.backward()
