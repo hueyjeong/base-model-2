@@ -4,7 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-한국어 문법 오류 교정(GEC)을 위한 **BitNet-Mamba Encoder-Decoder (Seq2Seq)** 프로젝트. 8M~1B 파라미터 스케일 지원, 5종 한국어 토크나이저 탑재.
+한국어 문법 오류 교정(GEC)을 위한 **DenseEditor** (인코더-only 편집 태깅) + **BitNet-Mamba Seq2Seq** 프로젝트.
+128M 파라미터, BiMamba-2 SSD + BitNet 1.58-bit, CPU/GPU 이중 추론 지원.
 
 - 코드 주석/docstring은 **한국어**, 식별자는 영어
 - 항상 한국어로 응답할 것
@@ -14,96 +15,119 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 source .venv/bin/activate
 
-# 모델 검증 (forward/backward, param count, config JSON roundtrip)
-python verify_model.py
+# ── DenseEditor (현행 메인 모델) ──
 
-# 토크나이저 테스트 (inline __main__ 블록 — pytest 없음)
-python keyboard_tokenizer/ko_keyboard.py
-python keyboard_tokenizer/keyboard_wrapper.py
-python nfd_tokenizer/make_tokenizer.py
+# 모델 검증 (forward/backward)
+python model/dense_editor.py
 
-# 에러 생성 테스트
-python error_generation/test_errors.py
+# DenseEditor 학습 (DDP 4GPU)
+export BITLINEAR_CUDA_BACKWARD=bf16_tc
+export BITLINEAR_CUDA_GRADW_LT=1
+export BITLINEAR_CUDA_FUSED_ACT=1
+export BITLINEAR_CUDA_FUSED_WEIGHT=1
+torchrun --nproc_per_node=4 -m training.pretrain_dense_editor \
+    --mixing_type mamba2 --d_model 640 \
+    --corpus corpus/sample_full.jsonl --text_key text \
+    --bf16 --int8 --int8_backend cuda \
+    --batch_size 8 --grad_accum_steps 2 \
+    --lr 1e-3 --schedule wsd --max_steps 300000
 
-# 학습
+# 품질 벤치마크 (2000-step 오버핏)
+python bench_quality.py --mixing_types mamba2 --d_model 640 \
+    --corpus corpus/val_50k.jsonl --max_steps 2000
+
+# CPU 인퍼런스 벤치마크 (Rust+C)
+cd inference_dense
+cargo build --release --features avx2-only
+cargo run --release --features avx2-only -- --benchmark-full --seq-len 2048 --d-model 640
+OMP_NUM_THREADS=8 cargo run --release --features avx2-only -- --benchmark-full --d-model 640
+
+# ── Seq2Seq (레거시) ──
+
 python -m training.pretrain \
   --size 256M --tokenizer keyboard \
   --corpus corpus/sample_10g.jsonl \
-  --batch_size 1 --bf16 \
-  --int8 --int8_backend cuda
+  --batch_size 1 --bf16 --int8 --int8_backend cuda
 
-# 벤치마크
-python bench_cuda_ablation.py --size 32M --max_steps 30 --batch_sizes 1 2
+# ── 토크나이저 ──
 
-# 토크나이저 빌드 (결정적)
-python nfd_tokenizer/make_tokenizer.py
-python keyboard_tokenizer/make_tokenizer.py
-python char_tokenizer/make_tokenizer.py
-
-# 토크나이저 학습 (코퍼스 기반)
-python -m bbpe_tokenizer.train_tokenizer -i corpus/sample_10g.jsonl --text_key text
-python -m mecab_bbpe_tokenizer.train_tokenizer -i corpus/sample_10g.jsonl --text_key text
+python keyboard_tokenizer/ko_keyboard.py
+python keyboard_tokenizer/keyboard_wrapper.py
+python error_generation/test_errors.py
 ```
 
 테스트 프레임워크(pytest 등) 없음. 모든 테스트는 `if __name__ == "__main__"` 블록으로 직접 실행.
 
 ## Architecture
 
-### Model (`model/`)
+### DenseEditor (`model/dense_editor.py`) — 현행 메인 모델
 
-`BitMambaSeq2Seq` (seq2seq.py) — Encoder-Decoder 전체 모델:
+인코더-only 편집 태깅 모델. 입력 토큰마다 편집 태그(KEEP/DELETE/INSERT_x) 예측.
 
-- **Encoder** (encoder.py): `EncoderLayer` × N (기본 6). 레이어 구조: `Mamba → (+residual) → RMSNorm → BitNetFFN(SwiGLU) → (+residual) → RMSNorm`
-- **Decoder** (decoder.py): `DecoderLayer` × N (기본 10). 레이어 구조: `Mamba → RMSNorm → LinearCrossAttention → RMSNorm → BitNetFFN → RMSNorm` (각각 residual connection)
-- **LinearCrossAttention** (linear_attention.py): O(N) Grouped-Query Linear Attention. φ(x) = relu(x) + 1 feature map (≥1 보장으로 denominator 폭발 방지). Document isolation을 위한 CUDA scatter/gather 커널 탑재
-- **BitLinear** (bitlinear.py): 1.58-bit ternary weights {-1, 0, +1} + 8-bit activation quantization. STE(Straight-Through Estimator)로 gradient 전파. INT8 backends: Triton (`triton_bitlinear.py`), CUDA (`cuda_bitlinear.py`)
-- **MambaBlock** (mamba_block.py): Mamba-1 selective scan. `mamba_ssm` CUDA 커널 자동 감지. Document isolation: BOS 위치에서 dt=1e4로 SSM state 완전 리셋
-- **Mamba2Block** (mamba2_block.py): Mamba-2 SSD chunk-parallel. `mamba_ssm.Mamba2` 래핑. reset_mask → `seq_idx` 변환으로 네이티브 document isolation
-- **Config** (config.py): `BitMambaSeq2SeqConfig` dataclass. `mamba_version` (1 or 2), `use_copy_gate` (Trial B), `n_kv_heads` (GQA/MQA) 등
-- **Copy Gate** (seq2seq.py): Trial B — decoder logit과 source unigram 분포를 gate로 혼합. Gate collapse 방지: `gate = 0.5 + 0.5 * sigmoid(...)` (생성 분포 최소 50% 보장)
-- **Source-Aware Logit Bias** (seq2seq.py): Trial A — src_weights 기반으로 원문 토큰에 logit bias 가산
+```
+Embedding (vocab=303, d_model=640) × sqrt(d_model)
+├── DenseEditorLayer × 15
+│   ├── RMSNorm → BiMamba2Mixing → Dropout → (+residual)
+│   └── RMSNorm → BitNetFFN(SwiGLU) → Dropout → (+residual)
+├── Final RMSNorm
+└── Tag Head (BitLinear: d_model → n_tags=608)
+```
 
-모델 사이즈 프리셋 (`training/pretrain.py`의 `MODEL_CONFIGS`): 8M, 16M, 32M, 64M, 128M, 256M, 512M, 1B
+**핵심 컴포넌트:**
+
+- **BiMamba2Mixing** (`model/mixing/bi_mamba2.py`): 양방향 Mamba-2 SSD
+  - GPU: `mamba_ssm.Mamba2` fused CUDA kernel (chunk-parallel SSD)
+  - CPU: Python sequential scan fallback
+  - Document isolation: `reset_mask → cumsum → seq_idx` (BOS 위치에서 state 리셋)
+  - 양방향: fwd + bwd(input flip) → element-wise addition
+  - `bwd_reset[:, 0] = True` — flipped 시퀀스 시작의 seq_idx >= 0 보장
+  - 설정: d_state=64, headdim=64, expand=2, ngroups=1, chunk_size=256
+- **BitLinear** (`model/bitlinear.py`): 1.58-bit ternary weights + INT8 activation
+- **BitNetFFN** (`model/encoder.py`): SwiGLU (gate_proj + up_proj → down_proj), d_ff = d_model × 8/3
+- **DenseEditorConfig** (`model/dense_editor_config.py`): `make_config(mixing_type, d_model, target_params)`
+
+**Mixing layer 레지스트리** (`model/mixing/__init__.py`):
+mamba, mamba2, fnet, tcn, rwkv, retnet, xlstm, mlstm
+
+**확정 아키텍처**: Mamba-2 ds=64 (loss 37%↓, recall +19.5pp vs Mamba-1, CPU 22% 빠름)
+
+### DenseEditor 학습 (`training/pretrain_dense_editor.py`)
+
+- LR 스케줄: `cosine` (기본) 또는 `wsd` (Warmup-Stable-Decay)
+  - WSD: warmup → 80% stable at peak LR → 20% cosine decay
+  - cosine: warmup → 전 구간 cosine decay
+- Label smoothing: `--label_smoothing 0.1` (기본 활성)
+- Edit loss weight: `--edit_loss_weight 2.0` (non-KEEP 태그 2배 가중치)
+- 한국어 오류 증강: `--error_prob 0.5 --error_count 3`
+- Min LR: `--min_lr_ratio 0.01` (max_lr의 1%)
+- 패킹: `[BOS]문장1[EOS][BOS]문장2[EOS]...` → max_seq_len까지 연결, BOS에서 state 리셋
+- Iterative refinement: `--n_iterations 1` (기본), fine-tuning 시 2-3
+- 체크포인트: model + optimizer + data_state(noiser+dataset) + epoch_state 저장/복원
+
+### EditorDataset (`training/editor_dataset.py`)
+
+- JSONL 스트리밍 → 텍스트 노이즈 → 토크나이징 → Levenshtein 편집 태그
+- 패킹 모드: 여러 문장을 `[BOS]...[EOS]` 단위로 연결, PAD 최소화
+- DDP: rank별 line interleaving, state_dict로 학습 재개 지원
+- C++ Levenshtein 확장: iterative refinement 배치 병렬 처리
+
+### CPU 인퍼런스 (`inference_dense/`)
+
+Rust + C 추론 엔진. BitNet 1.58-bit, AVX2 i8 sgemm.
+
+- `src/mixing/mamba2.rs`: Mamba2Block + BiMamba2 (양방향)
+- `c_kernels/mixing_kernels.c`: `mamba2_scan_avx2` (head-parallel, FMA), `causal_conv1d_avx2`
+- 벤치마크: `inference_dense/BENCHMARK.md` (8종 아키텍처 비교, Mamba-2 ds=64 최종 확정)
+
+### Seq2Seq 모델 (`model/seq2seq.py`) — 레거시
+
+`BitMambaSeq2Seq` Encoder-Decoder. Mamba-1/2 + LinearCrossAttention + BitNetFFN.
+Copy Gate (Trial B), Source-Aware Logit Bias (Trial A) 포함.
 
 ### Tokenizers
 
-`BaseTokenizer` ABC (`tokenizer_base.py`) → 5종 구현. 모델 코드는 `BaseTokenizer`에만 의존.
-
-| 토크나이저 | wrapper | 특징 |
-|---|---|---|
-| keyboard | `keyboard_tokenizer/keyboard_wrapper.py` | 한국어 2벌식 키스트로크 시퀀스 |
-| nfd | `nfd_tokenizer/tokenizer_wrapper.py` | NFD 분해 + ByteLevel BPE + Hanja 전처리 |
-| char | `char_tokenizer/char_wrapper.py` | 문자 단위 |
-| bbpe | `bbpe_tokenizer/bbpe_wrapper.py` | ByteLevel BPE (HuggingFace tokenizers) |
-| mecab_bbpe | `mecab_bbpe_tokenizer/mecab_bbpe_wrapper.py` | MeCab 형태소 분석 + BPE |
-
-**불변 규칙:**
-- `[PAD]` 토큰은 항상 ID 0 (`BitMambaSeq2SeqConfig.pad_id` 기본값)
-- `decode(encode(text)) ≈ text` roundtrip 보존 필수
-- Unicode 처리 주의: NFC/NFD 정규화, Hanja→Hangul 변환, 자모 분해/합성
-
-### Training (`training/`)
-
-- `pretrain.py`: 메인 학습 스크립트. `--size`, `--tokenizer`, `--corpus`, `--bf16` (필수 — BitLinear scaler overflow 방지), `--int8 --int8_backend {triton,cuda}`, `--fused_ce` (liger-kernel), `--compile` (non-INT8만), `--grad_ckpt`, DDP 지원
-- `dataset.py`: `StreamingPackedDataset` — JSONL 스트리밍, noising 적용, 다중 문장을 `[BOS]...[EOS][BOS]...[EOS]` 형태로 `pack_size` 토큰까지 패킹. PAD 없음. state_dict/load_state_dict로 학습 재개 지원
-- `noising.py`: `DenoisingNoiser` + `NoiseConfig`. 2단계 노이즈:
-  1. **텍스트 레벨** (토큰화 전): Korean error injection, spacing noise, keyboard typo (유클리드 좌표 기반), n-gram shuffle, word reorder
-  2. **토큰 레벨** (토큰화 후): SequenceMatcher diff → token masking (~15%), deletion (~5%), text infilling (Poisson λ=3)
-- Metrics: BPC (Bits Per Character, 토크나이저 간 비교용), CER (Character Error Rate, 검증용)
-
-### Error Generation (`error_generation/`)
-
-`KoreanErrorGenerator` — 24종 한국어 오류 유형을 가중치 기반 랜덤 선택으로 주입. 주요: 띄어쓰기(20%), 구두점(10%), 수치, 삭제/첨가, 맞춤법, 모음혼동, 발음, 외래어, 어순, 시제, 의미론적 오류 등.
-
-### CUDA Kernels (`model/`)
-
-JIT 컴파일 (torch.utils.cpp_extension.load). DDP 멀티프로세스 대응 (rank-0 빌드 → barrier → 나머지 로드).
-
-- `cuda_bitlinear_kernel.cu` / `cuda_bitlinear_ext.cpp`: INT8 quantization + matmul + grad weight (dp4a, cublasLt)
-- `cuda_doc_linear_attn_kernel.cu` / `cuda_doc_linear_attn_ext.cpp`: Document-isolated linear attention. V3 fused scatter/gather — shared memory에서 context 처리, global memory 트래픽 제거
-- `cuda_linear_attention_kernel.cu` / `cuda_linear_attention_ext.cpp`: Non-doc-isolated linear attention fused kernel
-
-소스 해시 기반 JIT 캐시 — 소스 변경 시 자동 재빌드. Stale cache 시 `rm -rf ~/.cache/torch_extensions/` 후 재시도.
+`BaseTokenizer` ABC → 5종 구현 (keyboard, nfd, char, bbpe, mecab_bbpe).
+DenseEditor 기본: keyboard (vocab_size=303).
 
 ### INT8 CUDA 권장 설정
 
@@ -114,21 +138,15 @@ export BITLINEAR_CUDA_FUSED_ACT=1
 export BITLINEAR_CUDA_FUSED_WEIGHT=1
 ```
 
-- `--int8 --compile` 조합은 설계상 스킵 (custom autograd path)
-- `grad_ckpt`: 메모리 절감 크지만 처리량(tok/s) 감소 유의미
-- 안정 배치 범위: 1~2; batch 4+는 강한 GPU 필요
+### Document Isolation (패킹 시 문서 간 정보 누출 방지)
 
-### Document Isolation
-
-배치 내 여러 문서를 packed sequence로 처리할 때 문서 간 정보 누출 방지:
-- **Mamba**: BOS 위치에서 x_branch/z 제로링 + dt=1e4로 SSM state 완전 리셋 (exp(A*dt)≈0)
-- **Mamba-2**: reset_mask → cumsum → `seq_idx`로 네이티브 document isolation
-- **Cross-Attention**: src_doc_ids/tgt_doc_ids 기반 per-document context matrix. CUDA scatter(소스→context)/gather(context→타겟) 구조
-- `max_docs`는 seq2seq.py에서 1회만 계산하여 `.item()` GPU sync 최소화 (기존 24회→1회)
+- **Mamba-2 (DenseEditor)**: `reset_mask = (input_ids == bos_id)` → `cumsum - 1` → `seq_idx`로 네이티브 isolation
+- **Mamba-1 (Seq2Seq)**: BOS 위치에서 dt=1e4로 SSM state 완전 리셋
+- **Cross-Attention (Seq2Seq)**: per-document context matrix + CUDA scatter/gather
 
 ## Key References
 
+- `inference_dense/BENCHMARK.md`: CPU 인퍼런스 + GPU 품질 벤치마크 결과
 - `AGENTS.md`: AI 어시스턴트용 상세 프로젝트 컨텍스트
-- `docs/experiment_handoff_2026-02-23.md`: 최신 실험 결과 및 INT8 가이드
 - `training/noise_config.example.json`: 노이즈 설정 템플릿
 - Docker: `nvidia/cuda:12.8.0-devel-ubuntu24.04` 기반, Python 3.12, CUDA 12.8
