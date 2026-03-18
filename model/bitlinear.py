@@ -164,6 +164,80 @@ class BitLinear(nn.Module):
         )
 
 
+class TernaryLinear(nn.Module):
+    """STE Ternary Weight Linear — activation quantization 없이 weight만 ternary QAT
+
+    BitLinear 대비 장점:
+      - LayerNorm, activation quantization, scale multiply 제거 → 커널 런치 ~8개 절약
+      - 추론 시 FP32 activation × ternary weight이므로 act quant 불필요
+      - STE로 ternary weight 학습은 유지
+    """
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = False):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features))
+        else:
+            self.register_parameter("bias", None)
+
+        # STE 캐시
+        self._weight_version: int = -1
+        self._w_quant_cache: torch.Tensor | None = None
+        self._w_scale_cache: torch.Tensor | None = None
+
+        self._reset_parameters()
+
+    def _reset_parameters(self):
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 가중치 양자화 (1.58-bit ternary) — 캐시 활용
+        v = self.weight._version
+        if v != self._weight_version:
+            with torch.no_grad():
+                gamma = self.weight.abs().mean().clamp(min=1e-5)
+                w_scaled = self.weight / gamma
+                w_quant_det = w_scaled.clamp(-1.0, 1.0).round()
+            self._w_quant_cache = w_quant_det
+            self._w_scale_cache = gamma
+            self._weight_version = v
+
+        # STE 재연결
+        w_quant = self.weight + (self._w_quant_cache - self.weight).detach()
+        w_scale = self._w_scale_cache
+
+        # 양자화된 행렬곱 + 스케일 복원 (activation quantization 없음)
+        # BF16 AMP: w_quant(fp32) → x.dtype으로 캐스팅
+        if w_quant.dtype != x.dtype:
+            w_quant = w_quant.to(x.dtype)
+            w_scale = w_scale.to(x.dtype)
+        out = F.linear(x, w_quant, self.bias)
+        out = out * w_scale
+
+        return out
+
+    def quantization_loss(self) -> torch.Tensor:
+        """가중치 proximity loss (BitLinear과 동일)"""
+        with torch.no_grad():
+            gamma = self.weight.abs().mean().clamp(min=1e-5)
+            w_quant = (self.weight / gamma).clamp(-1.0, 1.0).round()
+            target = gamma * w_quant
+        return ((self.weight - target) ** 2).mean()
+
+    def extra_repr(self) -> str:
+        return (
+            f"in_features={self.in_features}, "
+            f"out_features={self.out_features}, "
+            f"bias={self.bias is not None}, "
+            f"quant=ternary_ste"
+        )
+
+
 class BatchedBitLinear(nn.Module):
     """Batched BitLinear: E개 expert 가중치를 단일 (E, out, in) 텐서에 저장
 

@@ -1,11 +1,11 @@
 """BiMamba2 Mixing Layer — 양방향 Mamba-2 SSD (Structured State Space Duality)
 
-모든 projection을 BitLinear로 통일하여 전체 ternary (1.58-bit) 양자화 학습.
+GPU 학습: nn.Linear proj + mamba_ssm fused CUDA kernel (mamba_split_conv1d_scan_combined)
+         + proximity regularization으로 ternary 근접 가중치 학습
+CPU 추론: TernaryLinear proj + Python sequential scan fallback
 
-GPU 학습: BitLinear proj + mamba_ssm 개별 CUDA ops (causal_conv1d_fn + mamba_chunk_scan_combined)
-CPU 추론: BitLinear proj + Python sequential scan fallback
-
-기존 mamba_ssm.Mamba2 fused kernel은 내부 nn.Linear를 사용하여 BitLinear 적용 불가 → split path로 대체.
+in_proj/out_proj는 nn.Linear로 유지 — fused kernel과 호환 + 최대 학습 속도.
+export 시 ternary quantization 적용 (proximity loss로 양자화 오차 최소화).
 """
 import math
 
@@ -15,42 +15,32 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from model.mixing.base import MixingLayer
-from model.bitlinear import BitLinear
 
-# CUDA ops 감지 (개별 커널 — fused 아닌 split path용)
+# CUDA ops 감지
 _MAMBA2_CUDA_OPS = False
-_causal_conv1d_fn = None
-_mamba_chunk_scan_combined = None
-_RMSNormGated = None
-_rearrange = None
+_mamba_split_conv1d_scan_combined = None
 
 try:
     import torch as _torch_check
     if _torch_check.cuda.is_available():
-        from causal_conv1d import causal_conv1d_fn as _ccf
-        from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined as _mcsc
-        from mamba_ssm.ops.triton.layernorm_gated import RMSNorm as _RNMG
-        from einops import rearrange as _rear
-        _causal_conv1d_fn = _ccf
-        _mamba_chunk_scan_combined = _mcsc
-        _RMSNormGated = _RNMG
-        _rearrange = _rear
+        from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined as _mscsc
+        _mamba_split_conv1d_scan_combined = _mscsc
         _MAMBA2_CUDA_OPS = True
 except ImportError:
     pass
 
 
 class Mamba2Block(nn.Module):
-    """Mamba-2 SSD 단방향 블록 — 전체 BitLinear projection
+    """Mamba-2 SSD 단방향 블록
 
-    GPU: BitLinear proj + mamba_ssm CUDA ops (causal_conv1d + chunk_scan)
-    CPU: BitLinear proj + Python sequential scan fallback
+    GPU: nn.Linear proj + mamba_ssm fused kernel (conv+scan+norm+gate+outproj)
+    CPU: nn.Linear proj + Python sequential scan fallback
 
     파라미터 구조 (d=640, expand=2, d_state=64, headdim=64, ngroups=1):
-      in_proj:  (2708, 640) — BitLinear — z(1280) + xBC(1408) + dt(20)
+      in_proj:  (2708, 640) — nn.Linear — z(1280) + xBC(1408) + dt(20)
       conv1d:   (1408, 1, 4) — depthwise on [x, B, C]
-      norm:     (1280,) — RMSNormGated (GPU) or RMSNorm (CPU)
-      out_proj: (640, 1280) — BitLinear
+      norm:     (1280,) — RMSNorm weight (fused kernel 내부에서 사용)
+      out_proj: (640, 1280) — nn.Linear
       A_log, D, dt_bias: (20,) each
     """
 
@@ -74,20 +64,18 @@ class Mamba2Block(nn.Module):
         d_in_proj = 2 * self.d_inner + 2 * ngroups * d_state + self.nheads
         d_conv_in = self.d_inner + 2 * ngroups * d_state
 
-        # BitLinear projection — GPU/CPU 공통
-        self.in_proj = BitLinear(d_model, d_in_proj)
+        # nn.Linear projection — fused kernel 호환, 최대 학습 속도
+        # export 시 ternary quantization 적용 (proximity loss로 양자화 오차 최소화)
+        self.in_proj = nn.Linear(d_model, d_in_proj, bias=False)
         self.conv1d = nn.Conv1d(
             d_conv_in, d_conv_in,
             kernel_size=d_conv, padding=d_conv - 1,
             groups=d_conv_in, bias=True,
         )
-        self.out_proj = BitLinear(self.d_inner, d_model)
+        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
 
-        # Norm — GPU: RMSNormGated (gate 지원, norm_before_gate=False), CPU: nn.RMSNorm
-        if _MAMBA2_CUDA_OPS and _RMSNormGated is not None:
-            self.norm = _RMSNormGated(self.d_inner, eps=1e-5, norm_before_gate=False)
-        else:
-            self.norm = nn.RMSNorm(self.d_inner)
+        # RMSNorm weight — GPU에서는 fused kernel 내부에서 사용, CPU에서는 수동 적용
+        self.norm = nn.RMSNorm(self.d_inner)
 
         # SSM 파라미터 (head당 스칼라)
         self.dt_bias = nn.Parameter(torch.zeros(self.nheads))
@@ -101,68 +89,39 @@ class Mamba2Block(nn.Module):
         else:
             return self._forward_fallback(x, reset_mask)
 
-    @torch.compiler.disable
     def _forward_cuda(self, x: Tensor, reset_mask: Tensor | None = None) -> Tensor:
-        """BitLinear proj + mamba_ssm 개별 CUDA ops"""
-        B_batch, T, _ = x.shape
-        di = self.d_inner
-        ds = self.d_state
-        nh = self.nheads
-        hd = self.headdim
-        ng = self.ngroups
-        d_conv_in = di + 2 * ng * ds
-        rearrange = _rearrange
-
+        """nn.Linear in_proj → mamba_split_conv1d_scan_combined fused kernel"""
         # seq_idx for document isolation
         seq_idx = None
         if reset_mask is not None:
             seq_idx = (reset_mask.int().cumsum(dim=1) - 1).to(torch.int32)
 
-        # 1) BitLinear in_proj (ternary QAT)
-        proj = self.in_proj(x)  # (B, T, d_in_proj)
+        # 1) nn.Linear in_proj
+        zxbcdt = self.in_proj(x)  # (B, T, d_in_proj)
 
-        # 2) Split: mamba_ssm 순서 — z(di), xBC(di+2*ng*ds), dt(nh)
-        z = proj[:, :, :di]
-        # contiguous 필수: d_in_proj=2708은 8의 배수가 아니라 stride 비정렬
-        # → causal_conv1d_fn이 8-aligned stride 요구
-        xBC = proj[:, :, di:di + d_conv_in].contiguous()
-        dt = proj[:, :, di + d_conv_in:]  # (B, T, nh)
-
-        # 3) causal_conv1d_fn (mamba_ssm CUDA op) — silu 포함
-        xBC = _causal_conv1d_fn(
-            xBC.transpose(1, 2),
-            self.conv1d.weight.squeeze(1),  # (d_conv_in, 1, d_conv) → (d_conv_in, d_conv)
-            bias=self.conv1d.bias,
-            activation="silu",
-            seq_idx=seq_idx,
-        ).transpose(1, 2)
-
-        # 4) Split x, B, C
-        x_conv = xBC[:, :, :di]
-        B_conv = xBC[:, :, di:di + ng * ds]
-        C_conv = xBC[:, :, di + ng * ds:]
-
-        # 5) mamba_chunk_scan_combined (CUDA — scan only, no proj)
         A = -torch.exp(self.A_log.float())
-        y = _mamba_chunk_scan_combined(
-            rearrange(x_conv, "b l (h p) -> b l h p", p=hd),
-            dt,
+
+        # 2) Fused: conv1d + chunk_scan + RMSNorm + gate + out_proj
+        y = _mamba_split_conv1d_scan_combined(
+            zxbcdt,
+            self.conv1d.weight.squeeze(1),  # (d_conv_in, d_conv)
+            self.conv1d.bias,
+            self.dt_bias,
             A,
-            rearrange(B_conv, "b l (g n) -> b l g n", g=ng),
-            rearrange(C_conv, "b l (g n) -> b l g n", g=ng),
+            self.D,
             chunk_size=self.chunk_size,
-            D=self.D,
-            dt_bias=self.dt_bias,
-            dt_softplus=True,
             seq_idx=seq_idx,
+            activation="silu",
+            rmsnorm_weight=self.norm.weight,
+            rmsnorm_eps=1e-5,
+            outproj_weight=self.out_proj.weight,
+            outproj_bias=self.out_proj.bias,
+            headdim=self.headdim,
+            ngroups=self.ngroups,
+            norm_before_gate=False,
         )
-        y = rearrange(y, "b l h p -> b l (h p)")
 
-        # 6) RMSNormGated (norm_before_gate=False): y * silu(z) → norm
-        y = self.norm(y, z)
-
-        # 7) BitLinear out_proj (ternary QAT)
-        return self.out_proj(y)
+        return y
 
     def _forward_fallback(self, x: Tensor, reset_mask: Tensor | None = None) -> Tensor:
         """Python sequential scan fallback (CPU / non-CUDA)"""
@@ -209,61 +168,37 @@ class Mamba2Block(nn.Module):
 
         # Reshape + gate→norm (norm_before_gate=False)
         y = y.reshape(B_batch, T, di)
-        if hasattr(self.norm, 'norm_before_gate'):
-            y = self.norm(y, z)
-        else:
-            # nn.RMSNorm: 수동 gate→norm (y * silu(z) → norm)
-            y = y * F.silu(z)
-            y = self.norm(y)
+        y = y * F.silu(z)
+        y = self.norm(y)
 
         return self.out_proj(y)
 
     def _scan_sequential(self, x, B, C, decay, reset_mask, heads_per_group):
-        """Mamba-2 SSD sequential scan (in-place 연산 회피 — autograd 호환)
-
-        h[n,d] = decay[h] * h[n,d] + B[g,n] * x[h,d]
-        y[h,d] = Σ_n C[g,n] * h[n,d]
-
-        Args:
-            x: (B, T, nheads, headdim)
-            B: (B, T, ngroups, d_state)
-            C: (B, T, ngroups, d_state)
-            decay: (B, T, nheads)
-            reset_mask: (B, T) bool or None
-            heads_per_group: int
-        Returns:
-            y: (B, T, nheads, headdim)
-        """
+        """Mamba-2 SSD sequential scan (in-place 연산 회피 — autograd 호환)"""
         batch, T, nh, hd = x.shape
         ds = self.d_state
 
-        # state: (B, nheads, d_state, headdim)
         h = x.new_zeros(batch, nh, ds, hd)
         ys = []
 
         for t in range(T):
-            # 리셋
             if reset_mask is not None:
                 rst = reset_mask[:, t].view(batch, 1, 1, 1).float()
                 h = h * (1 - rst)
 
-            a_t = decay[:, t, :].view(batch, nh, 1, 1)  # (B, nh, 1, 1)
-            b_t = B[:, t, :]  # (B, ngroups, ds)
-            c_t = C[:, t, :]  # (B, ngroups, ds)
-            x_t = x[:, t, :]  # (B, nh, hd)
+            a_t = decay[:, t, :].view(batch, nh, 1, 1)
+            b_t = B[:, t, :]
+            c_t = C[:, t, :]
+            x_t = x[:, t, :]
 
-            # 그룹별 B, C를 헤드별로 확장
-            b_expanded = b_t.repeat_interleave(heads_per_group, dim=1)  # (B, nh, ds)
-            c_expanded = c_t.repeat_interleave(heads_per_group, dim=1)  # (B, nh, ds)
+            b_expanded = b_t.repeat_interleave(heads_per_group, dim=1)
+            c_expanded = c_t.repeat_interleave(heads_per_group, dim=1)
 
-            # state update: h_new = a * h + outer(b, x)
             h = a_t * h + b_expanded.unsqueeze(-1) * x_t.unsqueeze(2)
-
-            # output: y = einsum(C @ h) → (B, nh, hd)
             y_t = (c_expanded.unsqueeze(-1) * h).sum(dim=2)
             ys.append(y_t)
 
-        return torch.stack(ys, dim=1)  # (B, T, nh, hd)
+        return torch.stack(ys, dim=1)
 
 
 class BiMamba2Mixing(MixingLayer):
