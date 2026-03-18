@@ -27,41 +27,6 @@ struct OutputLine {
     tags: Vec<u32>,
 }
 
-// ── Projection (F32/Ternary 자동 감지) ───────────────
-
-enum Projection {
-    F32(LinearF32),
-    Ternary(TernaryLinear),
-}
-
-impl Projection {
-    fn load_bmmq(tensors: &mut HashMap<String, TensorData>, prefix: &str) -> Result<Self> {
-        let key = format!("{}.weight", prefix);
-        let is_ternary = matches!(tensors.get(&key), Some(TensorData::Packed2Bit { .. }));
-        if is_ternary {
-            eprintln!("    {} → Ternary", prefix);
-            Ok(Projection::Ternary(TernaryLinear::load_bmmq(tensors, prefix)?))
-        } else {
-            Ok(Projection::F32(LinearF32::load_bmmq(tensors, prefix)?))
-        }
-    }
-
-    fn forward_batch(&self, x: &[f32], seq_len: usize, out: &mut [f32]) {
-        match self {
-            Projection::F32(l) => l.forward_batch(x, seq_len, out),
-            Projection::Ternary(l) => l.forward_batch(x, seq_len, out),
-        }
-    }
-
-    fn out_dim(&self) -> usize {
-        match self { Projection::F32(l) => l.out_dim, Projection::Ternary(l) => l.out_dim }
-    }
-
-    fn in_dim(&self) -> usize {
-        match self { Projection::F32(l) => l.in_dim, Projection::Ternary(l) => l.in_dim }
-    }
-}
-
 // ── Fused BitNetFFN (F32 또는 Ternary matmul) ──────────
 
 struct FusedBitNetFFN {
