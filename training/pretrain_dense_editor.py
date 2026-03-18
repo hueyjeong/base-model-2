@@ -375,6 +375,10 @@ def train(args):
         ce_weight[1:] = args.edit_loss_weight
         if global_rank == 0:
             print(f"  edit_loss_weight={args.edit_loss_weight} (non-KEEP 태그 가중치)")
+    # AMP
+    use_amp = args.bf16 and torch.cuda.is_available()
+    amp_dtype = torch.bfloat16
+
     # BF16 AMP 시 ce_weight도 amp dtype으로 캐스팅 (cross_entropy dtype 일치 요구)
     if ce_weight is not None and use_amp:
         ce_weight = ce_weight.to(amp_dtype)
@@ -385,10 +389,6 @@ def train(args):
     )
     if args.label_smoothing > 0 and global_rank == 0:
         print(f"  label_smoothing={args.label_smoothing}")
-
-    # AMP
-    use_amp = args.bf16 and torch.cuda.is_available()
-    amp_dtype = torch.bfloat16
     scaler = None  # BF16은 scaler 불필요
 
     # 체크포인트 복원
