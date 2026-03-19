@@ -57,33 +57,40 @@ impl FusedBitNetFFN {
         let dff2 = self.gate_up_proj.out_dim();
         let dff = self.d_ff;
 
-        // BitLinear의 LayerNorm(no affine) 적용
-        let mut normed = vec![0.0f32; seq_len * d_in];
+        // BitLinear의 LayerNorm(no affine) — gu_buf를 normed 버퍼로 재사용
+        gu_buf.resize(seq_len * d_in, 0.0);
         for t in 0..seq_len {
-            layer_norm_no_affine(&x[t*d_in..(t+1)*d_in], &mut normed[t*d_in..(t+1)*d_in], 1e-5);
+            layer_norm_no_affine(&x[t*d_in..(t+1)*d_in], &mut gu_buf[t*d_in..(t+1)*d_in], 1e-5);
         }
 
-        // matmul (gate_up) — F32 또는 Ternary
-        gu_buf.resize(seq_len * dff2, 0.0);
-        self.gate_up_proj.forward_batch(&normed, seq_len, gu_buf);
+        // matmul (gate_up) — normed → mid_buf로 출력
+        mid_buf.resize(seq_len * dff2, 0.0);
+        self.gate_up_proj.forward_batch(gu_buf, seq_len, mid_buf);
 
-        // relu(gate) * up
-        mid_buf.resize(seq_len * dff, 0.0);
+        // relu(gate) * up → gu_buf 재사용 (dff 크기)
+        gu_buf.resize(seq_len * dff, 0.0);
         for t in 0..seq_len {
             for i in 0..dff {
-                let gate = gu_buf[t * dff2 + i];
-                let up = gu_buf[t * dff2 + dff + i];
-                mid_buf[t * dff + i] = relu_scalar(gate) * up;
+                let gate = mid_buf[t * dff2 + i];
+                let up = mid_buf[t * dff2 + dff + i];
+                gu_buf[t * dff + i] = relu_scalar(gate) * up;
             }
         }
 
-        // down_proj: LayerNorm + matmul
+        // down_proj: in-place LayerNorm on gu_buf, then matmul
         let d_mid = self.down_proj.in_dim();
-        let mut normed_mid = vec![0.0f32; seq_len * d_mid];
         for t in 0..seq_len {
-            layer_norm_no_affine(&mid_buf[t*d_mid..(t+1)*d_mid], &mut normed_mid[t*d_mid..(t+1)*d_mid], 1e-5);
+            let sl = &mut gu_buf[t*d_mid..(t+1)*d_mid];
+            let n = sl.len();
+            let mut sum = 0.0f32;
+            for &v in sl.iter() { sum += v; }
+            let mean = sum / n as f32;
+            let mut var_sum = 0.0f32;
+            for &v in sl.iter() { let d = v - mean; var_sum += d * d; }
+            let inv_std = (var_sum / n as f32 + 1e-5).sqrt().recip();
+            for v in sl.iter_mut() { *v = (*v - mean) * inv_std; }
         }
-        self.down_proj.forward_batch(&normed_mid, seq_len, out);
+        self.down_proj.forward_batch(gu_buf, seq_len, out);
     }
 }
 
