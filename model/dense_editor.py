@@ -18,8 +18,8 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
 from model.dense_editor_config import DenseEditorConfig
-from model.encoder import RMSNorm, BitNetFFN
-from model.bitlinear import BitLinear
+from model.encoder import RMSNorm, BitNetFFN, SwiGLUFFN
+from model.bitlinear import BitLinear, Int8Linear
 from model.mixing import create_mixing_layer
 
 
@@ -36,7 +36,10 @@ class DenseEditorLayer(nn.Module):
         self.norm1 = RMSNorm(cfg.d_model, eps=cfg.rms_norm_eps)
         self.mixing = create_mixing_layer(cfg)
         self.norm2 = RMSNorm(cfg.d_model, eps=cfg.rms_norm_eps)
-        self.ffn = BitNetFFN(cfg.d_model, cfg.d_ff, dropout=cfg.dropout, fused_gate_up=True)
+        if cfg.mixing_type == "attention":
+            self.ffn = SwiGLUFFN(cfg.d_model, cfg.d_ff, dropout=cfg.dropout)
+        else:
+            self.ffn = BitNetFFN(cfg.d_model, cfg.d_ff, dropout=cfg.dropout, fused_gate_up=True)
         self.dropout = nn.Dropout(cfg.dropout)
 
     def forward(
@@ -72,9 +75,12 @@ class DenseEditor(nn.Module):
             DenseEditorLayer(cfg) for _ in range(cfg.n_layers)
         ])
 
-        # Final norm + tag head (ternary weight)
+        # Final norm + tag head
         self.final_norm = RMSNorm(cfg.d_model, eps=cfg.rms_norm_eps)
-        self.tag_head = BitLinear(cfg.d_model, cfg.n_tags)
+        if cfg.mixing_type == "attention":
+            self.tag_head = Int8Linear(cfg.d_model, cfg.n_tags, bias=False)
+        else:
+            self.tag_head = BitLinear(cfg.d_model, cfg.n_tags)
 
         self._init_weights()
 
@@ -143,7 +149,7 @@ if __name__ == "__main__":
     print("DenseEditor 모델 검증")
     print("=" * 60)
 
-    for mixing_type in ["fnet", "tcn", "rwkv", "retnet", "mamba", "xlstm"]:
+    for mixing_type in ["fnet", "tcn", "rwkv", "retnet", "mamba", "xlstm", "attention"]:
         print(f"\n--- {mixing_type.upper()} ---")
         cfg = make_preset(mixing_type)
 

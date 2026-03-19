@@ -75,7 +75,7 @@ def load_tokenizer(name: str, path: str | None = None):
     return cls(path or preset["default_path"])
 
 
-VALID_MIXING_TYPES = ["mamba", "mamba2", "fnet", "tcn", "rwkv", "retnet", "xlstm", "mlstm"]
+VALID_MIXING_TYPES = ["mamba", "mamba2", "fnet", "tcn", "rwkv", "retnet", "xlstm", "mlstm", "attention"]
 
 
 def get_lr(
@@ -218,15 +218,20 @@ def train(args):
         print(f"지원하지 않는 mixing_type: {args.mixing_type}, 사용 가능: {VALID_MIXING_TYPES}")
         return 1
 
-    config = make_config(
-        mixing_type=args.mixing_type,
-        d_model=args.d_model,
-        target_params=args.target_params,
+    config_overrides = dict(
         vocab_size=tokenizer.vocab_size,
         n_tags=2 + 2 * tokenizer.vocab_size,
         max_seq_len=args.max_seq_len,
         pad_id=tokenizer.pad_id,
         bos_id=tokenizer.bos_id,
+    )
+    if args.n_layers is not None:
+        config_overrides["n_layers"] = args.n_layers
+    config = make_config(
+        mixing_type=args.mixing_type,
+        d_model=args.d_model,
+        target_params=args.target_params,
+        **config_overrides,
     )
 
     if global_rank == 0:
@@ -532,10 +537,11 @@ def train(args):
             ctx = model.no_sync() if (is_distributed and not is_last_accum) else nullcontext()
 
             with ctx:
+              # CUDA graph 호환: reduce-overhead compile 시 step 경계 표시
+              # grad_accum + n_iterations 각 forward마다 호출 필요
+              if args.compile:
+                  torch.compiler.cudagraph_mark_step_begin()
               for it in range(args.n_iterations):
-                # CUDA graph 호환: reduce-overhead compile 시 step 경계 표시
-                if args.compile:
-                    torch.compiler.cudagraph_mark_step_begin()
                 if use_amp:
                     with torch.amp.autocast("cuda", dtype=amp_dtype):
                         tag_logits = model(current_ids, pad_mask)
@@ -809,6 +815,8 @@ def main():
                         help="모델 히든 차원 (headdim=32의 배수)")
     parser.add_argument("--target_params", type=int, default=128_000_000,
                         help="타겟 파라미터 수")
+    parser.add_argument("--n_layers", type=int, default=None,
+                        help="레이어 수 직접 지정 (미지정 시 target_params로 자동 계산)")
     parser.add_argument("--tokenizer", type=str, default="keyboard",
                         choices=list(TOKENIZER_PRESETS.keys()))
     parser.add_argument("--n_iterations", type=int, default=1,

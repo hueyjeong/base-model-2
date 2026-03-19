@@ -42,5 +42,8 @@ def create_mixing_layer(cfg: "DenseEditorConfig") -> "MixingLayer":
     elif t == "mlstm":
         from model.mixing.mlstm import BiMLSTMMixing
         return BiMLSTMMixing(cfg)
+    elif t == "attention":
+        from model.mixing.full_attention import FullAttentionMixing
+        return FullAttentionMixing(cfg)
     else:
         raise ValueError(f"알 수 없는 mixing_type: {t}")
