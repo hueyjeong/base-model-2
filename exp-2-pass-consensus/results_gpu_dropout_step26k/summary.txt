@@ -1,0 +1,22 @@
+합의 기반 2단계 반복 교정 실험 결과
+============================================================
+체크포인트: dense_mamba2_d640_step_26000.pt
+데이터: corpus/val_50k.jsonl (500개)
+반복: 2회
+Stochasticity: MC Dropout (p=0.1)
+INT8 CUDA: False
+
+Variation                 |       P_exact |       R_exact |    F0.5_exact |      F1_exact |     Avg Edits
+---------------------------------------------------------------------------------------------------------
+V1 single-pass            | 0.7830±0.0011 | 0.6384±0.0012 | 0.7490±0.0011 | 0.7033±0.0012 | 10.3620±0.0057
+V3 consensus-2            | 0.8203±0.0024 | 0.6112±0.0003 | 0.7678±0.0018 | 0.7005±0.0011 | 9.4680±0.0226
+
+Raw per-run 결과:
+
+  V1 single-pass:
+    repeat 0: P=0.7837 R=0.6393 F0.5=0.7498 F1=0.7042 edits/sent=10.37 (infer 1.94s, eval 0.1s)
+    repeat 1: P=0.7822 R=0.6376 F0.5=0.7482 F1=0.7025 edits/sent=10.36 (infer 1.91s, eval 0.1s)
+
+  V3 consensus-2:
+    repeat 0: P=0.8186 R=0.6110 F0.5=0.7665 F1=0.6997 edits/sent=9.48 (infer 4.54s, eval 0.11s)
+    repeat 1: P=0.8220 R=0.6114 F0.5=0.7691 F1=0.7013 edits/sent=9.45 (infer 4.07s, eval 0.07s)

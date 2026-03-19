@@ -46,6 +46,26 @@ struct Args {
     #[arg(long)]
     infer: bool,
 
+    /// Consensus 추론 모드 (forward 1회 → Gumbel N회 → majority vote)
+    #[arg(long)]
+    consensus: bool,
+
+    /// Gumbel noise temperature (0=결정론적, >0=stochastic sampling)
+    #[arg(long, default_value = "0.0")]
+    temperature: f32,
+
+    /// Gumbel noise용 난수 시드
+    #[arg(long, default_value = "42")]
+    seed: u64,
+
+    /// Consensus: Gumbel sampling 횟수 (기본 2)
+    #[arg(long, default_value = "2")]
+    n_samples: usize,
+
+    /// Consensus: 최소 동의 수 (기본 = n_samples, 즉 만장일치)
+    #[arg(long, default_value = "0")]
+    min_agree: usize,
+
     /// Mixing type (all|rwkv|fnet|tcn|retnet|mamba|mamba2|xlstm)
     #[arg(long, default_value = "all")]
     mixing_type: String,
@@ -524,7 +544,18 @@ fn main() -> Result<()> {
             .expect("--infer 모드에는 --config 필요");
         let model = args.model.as_deref()
             .expect("--infer 모드에는 --model 필요");
-        return infer::run_infer(config, model);
+        return infer::run_infer(config, model, args.temperature, args.seed);
+    }
+
+    if args.consensus {
+        let config = args.config.as_deref()
+            .expect("--consensus 모드에는 --config 필요");
+        let model = args.model.as_deref()
+            .expect("--consensus 모드에는 --model 필요");
+        let temp = if args.temperature > 0.0 { args.temperature } else { 0.3 };
+        let n_samples = args.n_samples;
+        let min_agree = if args.min_agree == 0 { n_samples } else { args.min_agree };
+        return infer::run_consensus(config, model, temp, args.seed, n_samples, min_agree);
     }
 
     if args.benchmark_matmul {
