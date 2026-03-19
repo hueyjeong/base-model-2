@@ -38,6 +38,10 @@ void mamba2_ssd_fwd(
     int chunk_size,
     int seq_len, int nheads, int headdim, int d_state, int ngroups
 ) {
+    /* DAZ/FTZ: denormal float를 0으로 flush → 초기 모델의 극소값 연산 100x 가속 */
+    unsigned int mxcsr_orig = _mm_getcsr();
+    _mm_setcsr(mxcsr_orig | 0x8040);  /* FTZ (bit 15) + DAZ (bit 6) */
+
     int d_inner = nheads * headdim;
     int heads_per_group = nheads / ngroups;
     int nchunks = (seq_len + chunk_size - 1) / chunk_size;
@@ -185,14 +189,28 @@ void mamba2_ssd_fwd(
                 }
 
                 /* Phase 2: intra[p] = Σ_s score[s] * x[s,h,p]
-                 * scalar 누적 — 원본과 동일한 FMA contraction 보장 (bit-exact) */
-                for (int p = 0; p < headdim; p++) {
-                    double intra = 0.0;
-                    for (int s = 0; s <= l; s++) {
-                        int t_s = c * chunk_size + s;
-                        intra += score_buf[s] * (double)x[t_s * d_inner + h * headdim + p];
+                 * s-outer/p-inner: 연속 메모리 접근 (x[s,h,0..63]) + AVX2 double
+                 * per-p 누적 순서 동일 (s=0,1,...l) → bit-exact */
+                memset(intra_buf, 0, headdim * sizeof(double));
+                for (int s = 0; s <= l; s++) {
+                    int t_s = c * chunk_size + s;
+                    const float* x_src = &x[t_s * d_inner + h * headdim];
+                    double sc = score_buf[s];
+                    /* AVX2 double: 4 doubles per iteration */
+                    int pp = 0;
+                    __m256d vsc = _mm256_set1_pd(sc);
+                    for (; pp + 4 <= headdim; pp += 4) {
+                        __m128 xf = _mm_loadu_ps(x_src + pp);
+                        __m256d xd = _mm256_cvtps_pd(xf);
+                        __m256d acc = _mm256_loadu_pd(&intra_buf[pp]);
+                        /* mul + add (2 roundings) — FMA가 아닌 separate ops로 원본 일치 */
+                        __m256d prod = _mm256_mul_pd(vsc, xd);
+                        acc = _mm256_add_pd(acc, prod);
+                        _mm256_storeu_pd(&intra_buf[pp], acc);
                     }
-                    intra_buf[p] = intra;
+                    for (; pp < headdim; pp++) {
+                        intra_buf[pp] += sc * (double)x_src[pp];
+                    }
                 }
 
                 /* Phase 3: inter-chunk + skip → output (scalar — bit-exact 보장) */
@@ -228,6 +246,9 @@ void mamba2_ssd_fwd(
     free(dA_cumsum);
     free(chunk_states);
     free(prev_states);
+
+    /* MXCSR 복원 */
+    _mm_setcsr(mxcsr_orig);
 }
 
 /* ── Bitmask LUT 기반 ternary matmul ─────────────────────────
