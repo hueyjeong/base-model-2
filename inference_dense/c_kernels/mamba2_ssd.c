@@ -363,6 +363,119 @@ void ternary_bitmask_sgemm_avx2(
     }
 }
 
+/* ── hsum 헬퍼 ──────────────────────────────────────── */
+static inline float _hsum_ps(__m256 v) {
+    __m128 hi = _mm256_extractf128_ps(v, 1);
+    __m128 lo = _mm256_castps256_ps128(v);
+    __m128 s4 = _mm_add_ps(lo, hi);
+    __m128 s2 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
+    __m128 s1 = _mm_add_ss(s2, _mm_shuffle_ps(s2, s2, 1));
+    return _mm_cvtss_f32(s1);
+}
+
+/* ── Packed 2-bit LUT (4KB, L1 상주) ──────────────────
+ * packed byte → 4×f32 unit ternary {-1.0, 0.0, +1.0}
+ * gamma는 kernel에서 후곱셈. LUT는 전역 1회 초기화. */
+static __m128 _packed_unit_lut[256] __attribute__((aligned(16)));
+static int _packed_lut_init = 0;
+
+static const float _2bit_f32[4] = {0.0f, 1.0f, 0.0f, -1.0f};
+
+void init_packed_lut(void) {
+    if (_packed_lut_init) return;
+    for (int b = 0; b < 256; b++) {
+        float vals[4] __attribute__((aligned(16)));
+        vals[0] = _2bit_f32[(b >> 6) & 3];
+        vals[1] = _2bit_f32[(b >> 4) & 3];
+        vals[2] = _2bit_f32[(b >> 2) & 3];
+        vals[3] = _2bit_f32[ b       & 3];
+        _packed_unit_lut[b] = _mm_load_ps(vals);
+    }
+    _packed_lut_init = 1;
+}
+
+/* ── Packed 2-bit ternary sgemm (AVX2, 4-way j-tiling) ──────
+ * packed 2-bit에서 직접 디코딩 — i8 중간 변환 없음.
+ * port 5 병목 제거 (cvtepi8→cvtepi32 대신 LUT + insertf128)
+ */
+void ternary_packed_sgemm_avx2(
+    const uint8_t* packed,  /* [m, packed_stride] — original 2-bit packed */
+    const float* x,         /* [n, k] */
+    float* y,               /* [n, m] */
+    float gamma,
+    int m, int n, int k, int packed_stride
+) {
+    init_packed_lut();
+
+    #pragma omp parallel for schedule(static) if(m >= 64)
+    for (int j = 0; j < m - 3; j += 4) {
+        const uint8_t* p0 = packed + (int64_t)j * packed_stride;
+        const uint8_t* p1 = packed + (int64_t)(j+1) * packed_stride;
+        const uint8_t* p2 = packed + (int64_t)(j+2) * packed_stride;
+        const uint8_t* p3 = packed + (int64_t)(j+3) * packed_stride;
+
+        for (int t = 0; t < n; t++) {
+            const float* x_t = x + (int64_t)t * k;
+            __m256 s0 = _mm256_setzero_ps();
+            __m256 s1 = _mm256_setzero_ps();
+            __m256 s2 = _mm256_setzero_ps();
+            __m256 s3 = _mm256_setzero_ps();
+
+            for (int i = 0; i + 8 <= k; i += 8) {
+                __m256 vx = _mm256_loadu_ps(x_t + i);
+                int bi = i >> 2;  /* i / 4 = byte index in packed row */
+
+                /* row 0: 2 LUT lookups → __m256 */
+                __m256 w0 = _mm256_insertf128_ps(
+                    _mm256_castps128_ps256(_packed_unit_lut[p0[bi]]),
+                    _packed_unit_lut[p0[bi+1]], 1);
+                s0 = _mm256_fmadd_ps(w0, vx, s0);
+
+                /* row 1 */
+                __m256 w1 = _mm256_insertf128_ps(
+                    _mm256_castps128_ps256(_packed_unit_lut[p1[bi]]),
+                    _packed_unit_lut[p1[bi+1]], 1);
+                s1 = _mm256_fmadd_ps(w1, vx, s1);
+
+                /* row 2 */
+                __m256 w2 = _mm256_insertf128_ps(
+                    _mm256_castps128_ps256(_packed_unit_lut[p2[bi]]),
+                    _packed_unit_lut[p2[bi+1]], 1);
+                s2 = _mm256_fmadd_ps(w2, vx, s2);
+
+                /* row 3 */
+                __m256 w3 = _mm256_insertf128_ps(
+                    _mm256_castps128_ps256(_packed_unit_lut[p3[bi]]),
+                    _packed_unit_lut[p3[bi+1]], 1);
+                s3 = _mm256_fmadd_ps(w3, vx, s3);
+            }
+
+            y[(int64_t)t * m + j]   = gamma * _hsum_ps(s0);
+            y[(int64_t)t * m + j+1] = gamma * _hsum_ps(s1);
+            y[(int64_t)t * m + j+2] = gamma * _hsum_ps(s2);
+            y[(int64_t)t * m + j+3] = gamma * _hsum_ps(s3);
+        }
+    }
+    /* tail rows */
+    int j_tail = (m / 4) * 4;
+    for (int j = j_tail; j < m; j++) {
+        const uint8_t* p = packed + (int64_t)j * packed_stride;
+        for (int t = 0; t < n; t++) {
+            const float* x_t = x + (int64_t)t * k;
+            __m256 vsum = _mm256_setzero_ps();
+            for (int i = 0; i + 8 <= k; i += 8) {
+                __m256 vx = _mm256_loadu_ps(x_t + i);
+                int bi = i >> 2;
+                __m256 w = _mm256_insertf128_ps(
+                    _mm256_castps128_ps256(_packed_unit_lut[p[bi]]),
+                    _packed_unit_lut[p[bi+1]], 1);
+                vsum = _mm256_fmadd_ps(w, vx, vsum);
+            }
+            y[(int64_t)t * m + j] = gamma * _hsum_ps(vsum);
+        }
+    }
+}
+
 /* ── FP32 batch sgemm (AVX2 + FMA) ──────────────────────────
  * y[n,m] = w[m,k] @ x[n,k]^T
  * 즉 y[t,j] = Σ_i w[j,i] * x[t,i]
@@ -374,40 +487,52 @@ void f32_sgemm_avx2(
     float* y,        /* [n, m] */
     int m, int n, int k
 ) {
-    /* row(m) 방향 병렬화 — 스레드당 weight 부분 행만 읽어 L2 캐시 적합 */
+    /* 4-way j-tiling — activation 로드 공유로 L2 대역폭 4x 절감 */
     #pragma omp parallel for schedule(static) if(m >= 64)
-    for (int j = 0; j < m; j++) {
-        const float* w_row = w + j * k;
+    for (int j = 0; j < m - 3; j += 4) {
+        const float* w0 = w + (int64_t)j * k;
+        const float* w1 = w + (int64_t)(j+1) * k;
+        const float* w2 = w + (int64_t)(j+2) * k;
+        const float* w3 = w + (int64_t)(j+3) * k;
         for (int t = 0; t < n; t++) {
-            const float* x_t = x + t * k;
-            __m256 vsum = _mm256_setzero_ps();
-            int i = 0;
-            for (; i + 8 <= k; i += 8) {
-                __m256 vw = _mm256_loadu_ps(w_row + i);
+            const float* x_t = x + (int64_t)t * k;
+            __m256 s0 = _mm256_setzero_ps(), s1 = _mm256_setzero_ps();
+            __m256 s2 = _mm256_setzero_ps(), s3 = _mm256_setzero_ps();
+            for (int i = 0; i + 8 <= k; i += 8) {
                 __m256 vx = _mm256_loadu_ps(x_t + i);
-                vsum = _mm256_fmadd_ps(vw, vx, vsum);
+                s0 = _mm256_fmadd_ps(_mm256_loadu_ps(w0 + i), vx, s0);
+                s1 = _mm256_fmadd_ps(_mm256_loadu_ps(w1 + i), vx, s1);
+                s2 = _mm256_fmadd_ps(_mm256_loadu_ps(w2 + i), vx, s2);
+                s3 = _mm256_fmadd_ps(_mm256_loadu_ps(w3 + i), vx, s3);
             }
-            /* horizontal sum */
-            __m128 hi = _mm256_extractf128_ps(vsum, 1);
-            __m128 lo = _mm256_castps256_ps128(vsum);
-            __m128 s4 = _mm_add_ps(lo, hi);
-            __m128 s2 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
-            __m128 s1 = _mm_add_ss(s2, _mm_shuffle_ps(s2, s2, 1));
-            float sum = _mm_cvtss_f32(s1);
-            /* scalar tail */
-            for (; i < k; i++) {
-                sum += w_row[i] * x_t[i];
+            y[(int64_t)t * m + j]   = _hsum_ps(s0);
+            y[(int64_t)t * m + j+1] = _hsum_ps(s1);
+            y[(int64_t)t * m + j+2] = _hsum_ps(s2);
+            y[(int64_t)t * m + j+3] = _hsum_ps(s3);
+        }
+    }
+    /* tail */
+    int j_tail = (m / 4) * 4;
+    for (int j = j_tail; j < m; j++) {
+        const float* w_row = w + (int64_t)j * k;
+        for (int t = 0; t < n; t++) {
+            const float* x_t = x + (int64_t)t * k;
+            __m256 vsum = _mm256_setzero_ps();
+            for (int i = 0; i + 8 <= k; i += 8) {
+                vsum = _mm256_fmadd_ps(_mm256_loadu_ps(w_row + i), _mm256_loadu_ps(x_t + i), vsum);
             }
-            y[t * m + j] = sum;
+            float sum = _hsum_ps(vsum);
+            for (int i = (k/8)*8; i < k; i++) sum += w_row[i] * x_t[i];
+            y[(int64_t)t * m + j] = sum;
         }
     }
 }
 
-/* ── Ternary matmul (AVX2) ─────────────────────────────────
+/* ── Ternary matmul (AVX2, 4-way j-tiling) ───────────────────
  * y[n,m] = gamma * (w_i8[m,k] @ x[n,k]^T)
- * w_i8[j,i] ∈ {-1, 0, +1} — i8→i32→f32 변환 후 FMA
- * 메모리 대역폭 4x 절약 (f32 weight 대비 i8)
+ * 4행을 동시 처리하여 activation 로드를 공유 → L2 대역폭 4x 절감
  */
+
 void ternary_f32_sgemm_avx2(
     const int8_t* w,  /* [m, k] — ternary {-1,0,+1} */
     const float* x,   /* [n, k] */
@@ -416,32 +541,63 @@ void ternary_f32_sgemm_avx2(
     int m, int n, int k
 ) {
     #pragma omp parallel for schedule(static) if(m >= 64)
-    for (int j = 0; j < m; j++) {
-        const int8_t* w_row = w + j * k;
+    for (int j = 0; j < m - 3; j += 4) {
+        const int8_t* w0 = w + (int64_t)j * k;
+        const int8_t* w1 = w + (int64_t)(j+1) * k;
+        const int8_t* w2 = w + (int64_t)(j+2) * k;
+        const int8_t* w3 = w + (int64_t)(j+3) * k;
+
         for (int t = 0; t < n; t++) {
-            const float* x_t = x + t * k;
+            const float* x_t = x + (int64_t)t * k;
+            __m256 s0 = _mm256_setzero_ps();
+            __m256 s1 = _mm256_setzero_ps();
+            __m256 s2 = _mm256_setzero_ps();
+            __m256 s3 = _mm256_setzero_ps();
+
+            for (int i = 0; i + 8 <= k; i += 8) {
+                __m256 vx = _mm256_loadu_ps(x_t + i);  /* 1 activation load shared */
+                /* row 0 */
+                __m256 wf0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
+                    _mm_loadl_epi64((const __m128i*)(w0 + i))));
+                s0 = _mm256_fmadd_ps(wf0, vx, s0);
+                /* row 1 */
+                __m256 wf1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
+                    _mm_loadl_epi64((const __m128i*)(w1 + i))));
+                s1 = _mm256_fmadd_ps(wf1, vx, s1);
+                /* row 2 */
+                __m256 wf2 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
+                    _mm_loadl_epi64((const __m128i*)(w2 + i))));
+                s2 = _mm256_fmadd_ps(wf2, vx, s2);
+                /* row 3 */
+                __m256 wf3 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
+                    _mm_loadl_epi64((const __m128i*)(w3 + i))));
+                s3 = _mm256_fmadd_ps(wf3, vx, s3);
+            }
+
+            y[(int64_t)t * m + j]   = gamma * _hsum_ps(s0);
+            y[(int64_t)t * m + j+1] = gamma * _hsum_ps(s1);
+            y[(int64_t)t * m + j+2] = gamma * _hsum_ps(s2);
+            y[(int64_t)t * m + j+3] = gamma * _hsum_ps(s3);
+        }
+    }
+    /* tail rows (m이 4의 배수가 아닌 경우) */
+    int j_tail = (m / 4) * 4;
+    #pragma omp parallel for schedule(static) if(m - j_tail >= 4)
+    for (int j = j_tail; j < m; j++) {
+        const int8_t* w_row = w + (int64_t)j * k;
+        for (int t = 0; t < n; t++) {
+            const float* x_t = x + (int64_t)t * k;
             __m256 vsum = _mm256_setzero_ps();
-            int i = 0;
-            /* 8 i8 → 8 i32 → 8 f32, then FMA with x */
-            for (; i + 8 <= k; i += 8) {
-                __m128i w8 = _mm_loadl_epi64((const __m128i*)(w_row + i));
-                __m256i w32 = _mm256_cvtepi8_epi32(w8);
-                __m256 wf = _mm256_cvtepi32_ps(w32);
+            for (int i = 0; i + 8 <= k; i += 8) {
                 __m256 vx = _mm256_loadu_ps(x_t + i);
+                __m256 wf = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(
+                    _mm_loadl_epi64((const __m128i*)(w_row + i))));
                 vsum = _mm256_fmadd_ps(wf, vx, vsum);
             }
-            /* horizontal sum */
-            __m128 hi = _mm256_extractf128_ps(vsum, 1);
-            __m128 lo = _mm256_castps256_ps128(vsum);
-            __m128 s4 = _mm_add_ps(lo, hi);
-            __m128 s2 = _mm_add_ps(s4, _mm_movehl_ps(s4, s4));
-            __m128 s1 = _mm_add_ss(s2, _mm_shuffle_ps(s2, s2, 1));
-            float sum = _mm_cvtss_f32(s1);
-            /* scalar tail */
-            for (; i < k; i++) {
+            float sum = _hsum_ps(vsum);
+            for (int i = (k/8)*8; i < k; i++)
                 sum += (float)w_row[i] * x_t[i];
-            }
-            y[t * m + j] = gamma * sum;
+            y[(int64_t)t * m + j] = gamma * sum;
         }
     }
 }

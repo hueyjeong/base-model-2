@@ -110,6 +110,12 @@ extern "C" {
         gamma: f32, m: c_int, n: c_int, k: c_int,
     );
 
+    /// Packed 2-bit LUT ternary matmul (AVX2): packed→LUT decode→FMA
+    pub fn ternary_packed_sgemm_avx2(
+        packed: *const u8, x: *const f32, y: *mut f32,
+        gamma: f32, m: c_int, n: c_int, k: c_int, packed_stride: c_int,
+    );
+
     /// Chunk-parallel SSD forward — mamba_ssm CUDA 커널과 수치 호환
     pub fn mamba2_ssd_fwd(
         x: *const f32, B: *const f32, C: *const f32,
@@ -483,6 +489,43 @@ impl TernaryBitmask {
     }
 }
 
+// ── TernaryPacked (packed 2-bit LUT 디코딩, 가장 빠른 ternary matmul) ──
+
+pub struct TernaryPacked {
+    pub packed: Vec<u8>,     // [out_dim × packed_stride] original 2-bit packed
+    pub gamma: f32,
+    pub out_dim: usize,
+    pub in_dim: usize,
+    pub packed_stride: usize,
+}
+
+impl TernaryPacked {
+    pub fn load_bmmq(tensors: &mut HashMap<String, TensorData>, prefix: &str) -> Result<Self> {
+        let key = format!("{}.weight", prefix);
+        match tensors.remove(&key).context(format!("TernaryPacked weight 없음: {}", key))? {
+            TensorData::Packed2Bit { data, gamma, row_sums: _, rows, cols, packed_stride } => {
+                Ok(Self { packed: data, gamma, out_dim: rows, in_dim: cols, packed_stride })
+            }
+            _ => bail!("TernaryPacked은 Packed2Bit 타입이어야 함: {}", key),
+        }
+    }
+
+    pub fn forward_batch(&self, x: &[f32], seq_len: usize, out: &mut [f32]) {
+        unsafe {
+            ternary_packed_sgemm_avx2(
+                self.packed.as_ptr(),
+                x.as_ptr(),
+                out.as_mut_ptr(),
+                self.gamma,
+                self.out_dim as i32,
+                seq_len as i32,
+                self.in_dim as i32,
+                self.packed_stride as i32,
+            );
+        }
+    }
+}
+
 // ── Linear (per-row i8 quantized) ────────────────────
 
 pub struct Linear {
@@ -595,8 +638,8 @@ impl BitNetFFN {
 
 pub enum Projection {
     F32(LinearF32),
-    Ternary(TernaryLinear),       // i8 커널 (bit-exact 비교용)
-    TernaryBM(TernaryBitmask),    // bitmask 커널
+    Ternary(TernaryLinear),       // i8 tiled 커널 (가장 빠름)
+    TernaryBM(TernaryBitmask),    // bitmask 커널 (실험적)
 }
 
 impl Projection {
