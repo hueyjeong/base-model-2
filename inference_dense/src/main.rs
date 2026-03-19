@@ -38,6 +38,10 @@ struct Args {
     #[arg(long)]
     benchmark_full: bool,
 
+    /// Matmul 커널 벤치마크 (f32 vs ternary_i8 vs ternary_bitmask)
+    #[arg(long)]
+    benchmark_matmul: bool,
+
     /// 추론 모드 (stdin JSON Lines → stdout JSON Lines)
     #[arg(long)]
     infer: bool,
@@ -328,7 +332,182 @@ fn benchmark_dummy(mixing_type: &str, seq_len: usize, warmup: usize, n_runs: usi
     }
 }
 
-fn report(name: &str, seq_len: usize, d_model: usize, latencies: &[f64]) {
+/// Matmul 커널 벤치마크: f32 vs ternary_i8 vs ternary_bitmask
+fn benchmark_matmul(d_model: usize, seq_len: usize, warmup: usize, n_runs: usize) {
+    use std::time::Instant;
+
+    // 대표적 프로젝션 크기들
+    let sizes: Vec<(usize, usize, &str)> = vec![
+        (2708, d_model, "in_proj"),
+        (d_model, 1280, "out_proj"),
+        (3414, d_model, "gate_up_proj"),
+        (d_model, 1707, "down_proj"),
+        (608, d_model, "tag_head"),
+    ];
+
+    println!("=== Matmul 커널 벤치마크 (d_model={}, seq_len={}) ===\n", d_model, seq_len);
+    println!("{:<16} {:>8} {:>12} {:>12} {:>12} {:>10}",
+        "Projection", "(m,k)", "f32(ms)", "ternary_i8", "bitmask(ms)", "max_diff");
+    println!("{}", "-".repeat(76));
+
+    // LUT 초기화
+    unsafe { init_bitmask_luts(); }
+
+    for (m, k, name) in &sizes {
+        let m = *m;
+        let k = *k;
+        let n = seq_len;
+
+        // 랜덤 ternary weights {-1, 0, +1}
+        let mut rng_state: u32 = 42;
+        let mut w_i8 = vec![0i8; m * k];
+        for w in w_i8.iter_mut() {
+            // 간단한 LCG 랜덤
+            rng_state = rng_state.wrapping_mul(1664525).wrapping_add(1013904223);
+            let r = (rng_state >> 16) % 3;
+            *w = match r { 0 => -1, 1 => 0, _ => 1 };
+        }
+        let gamma = 0.03f32; // 대표 gamma 값
+
+        // f32 weights (ternary 값 그대로 f32로)
+        let w_f32: Vec<f32> = w_i8.iter().map(|&v| v as f32 * gamma).collect();
+
+        // bitmasks 생성
+        let bitmask_stride = (k + 7) / 8;
+        let mut sign_bits = vec![0u8; m * bitmask_stride];
+        let mut nonzero_bits = vec![0u8; m * bitmask_stride];
+        for j in 0..m {
+            for i in 0..k {
+                let v = w_i8[j * k + i];
+                let bm_byte = i / 8;
+                let bm_bit = 7 - (i % 8);
+                if v != 0 {
+                    nonzero_bits[j * bitmask_stride + bm_byte] |= 1 << bm_bit;
+                }
+                if v == -1 {
+                    sign_bits[j * bitmask_stride + bm_byte] |= 1 << bm_bit;
+                }
+            }
+        }
+
+        // 랜덤 activations
+        let x: Vec<f32> = (0..n * k)
+            .map(|i| ((i as f32 * 0.0137).sin() * 0.5))
+            .collect();
+
+        let mut y_f32 = vec![0.0f32; n * m];
+        let mut y_i8 = vec![0.0f32; n * m];
+        let mut y_bm = vec![0.0f32; n * m];
+
+        // ── 정확성 테스트 ──
+        unsafe {
+            f32_sgemm_avx2(
+                w_f32.as_ptr(), x.as_ptr(), y_f32.as_mut_ptr(),
+                m as i32, n as i32, k as i32,
+            );
+            ternary_f32_sgemm_avx2(
+                w_i8.as_ptr(), x.as_ptr(), y_i8.as_mut_ptr(),
+                gamma, m as i32, n as i32, k as i32,
+            );
+            ternary_bitmask_sgemm_avx2(
+                sign_bits.as_ptr(), nonzero_bits.as_ptr(),
+                x.as_ptr(), y_bm.as_mut_ptr(),
+                gamma, m as i32, n as i32, k as i32,
+            );
+        }
+
+        // max diff (bitmask vs i8)
+        let max_diff: f32 = y_i8.iter().zip(y_bm.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        // max diff (bitmask vs f32)
+        let max_diff_f32: f32 = y_f32.iter().zip(y_bm.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        // ── 벤치마크 ──
+        // f32
+        for _ in 0..warmup {
+            unsafe {
+                f32_sgemm_avx2(
+                    w_f32.as_ptr(), x.as_ptr(), y_f32.as_mut_ptr(),
+                    m as i32, n as i32, k as i32,
+                );
+            }
+        }
+        let mut lat_f32 = Vec::with_capacity(n_runs);
+        for _ in 0..n_runs {
+            let t0 = Instant::now();
+            unsafe {
+                f32_sgemm_avx2(
+                    w_f32.as_ptr(), x.as_ptr(), y_f32.as_mut_ptr(),
+                    m as i32, n as i32, k as i32,
+                );
+            }
+            lat_f32.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+
+        // ternary i8
+        for _ in 0..warmup {
+            unsafe {
+                ternary_f32_sgemm_avx2(
+                    w_i8.as_ptr(), x.as_ptr(), y_i8.as_mut_ptr(),
+                    gamma, m as i32, n as i32, k as i32,
+                );
+            }
+        }
+        let mut lat_i8 = Vec::with_capacity(n_runs);
+        for _ in 0..n_runs {
+            let t0 = Instant::now();
+            unsafe {
+                ternary_f32_sgemm_avx2(
+                    w_i8.as_ptr(), x.as_ptr(), y_i8.as_mut_ptr(),
+                    gamma, m as i32, n as i32, k as i32,
+                );
+            }
+            lat_i8.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+
+        // ternary bitmask
+        for _ in 0..warmup {
+            unsafe {
+                ternary_bitmask_sgemm_avx2(
+                    sign_bits.as_ptr(), nonzero_bits.as_ptr(),
+                    x.as_ptr(), y_bm.as_mut_ptr(),
+                    gamma, m as i32, n as i32, k as i32,
+                );
+            }
+        }
+        let mut lat_bm = Vec::with_capacity(n_runs);
+        for _ in 0..n_runs {
+            let t0 = Instant::now();
+            unsafe {
+                ternary_bitmask_sgemm_avx2(
+                    sign_bits.as_ptr(), nonzero_bits.as_ptr(),
+                    x.as_ptr(), y_bm.as_mut_ptr(),
+                    gamma, m as i32, n as i32, k as i32,
+                );
+            }
+            lat_bm.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+
+        // 중간값 계산
+        lat_f32.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        lat_i8.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        lat_bm.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let med_f32 = lat_f32[lat_f32.len() / 2];
+        let med_i8 = lat_i8[lat_i8.len() / 2];
+        let med_bm = lat_bm[lat_bm.len() / 2];
+
+        println!("{:<16} ({:>4},{:>4}) {:>10.3} {:>10.3} {:>10.3}   {:.2e}",
+            name, m, k, med_f32, med_i8, med_bm, max_diff);
+    }
+
+    println!("\n(max_diff = bitmask vs ternary_i8 커널 차이, 0이면 bit-exact)");
+}
+
+fn report(name: &str, _seq_len: usize, _d_model: usize, latencies: &[f64]) {
     let mut sorted = latencies.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let median = sorted[sorted.len() / 2];
@@ -346,6 +525,11 @@ fn main() -> Result<()> {
         let model = args.model.as_deref()
             .expect("--infer 모드에는 --model 필요");
         return infer::run_infer(config, model);
+    }
+
+    if args.benchmark_matmul {
+        benchmark_matmul(args.d_model, args.seq_len, args.warmup, args.n_runs);
+        return Ok(());
     }
 
     if args.benchmark_full {

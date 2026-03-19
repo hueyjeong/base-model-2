@@ -196,8 +196,13 @@ impl DenseEditorModel {
         let mut fwd_out = vec![0.0f32; sl * d];
         let mut bwd_out = vec![0.0f32; sl * d];
 
-        // Layer loop
-        for (layer_idx, layer) in self.layers.iter().enumerate() {
+        // Layer loop (타이밍 계측)
+        let mut total_mixing = 0.0f64;
+        let mut total_ffn = 0.0f64;
+
+        for (_layer_idx, layer) in self.layers.iter().enumerate() {
+            let t_mix = std::time::Instant::now();
+
             // Mixing sub-layer: RMSNorm → BiMamba2 → residual
             for t in 0..sl {
                 layer.norm1.forward(&x[t*d..(t+1)*d], &mut nm[t*d..(t+1)*d]);
@@ -222,13 +227,23 @@ impl DenseEditorModel {
             // Residual add
             for i in 0..sl*d { x[i] += mo[i]; }
 
+            total_mixing += t_mix.elapsed().as_secs_f64();
+
+            let t_ffn = std::time::Instant::now();
+
             // FFN sub-layer: RMSNorm → FFN → residual
             for t in 0..sl {
                 layer.norm2.forward(&x[t*d..(t+1)*d], &mut nm[t*d..(t+1)*d]);
             }
             layer.ffn.forward_batch(&nm, sl, &mut fo, &mut bufs, &mut gu_buf, &mut mid_buf);
             for i in 0..sl*d { x[i] += fo[i]; }
+
+            total_ffn += t_ffn.elapsed().as_secs_f64();
         }
+
+        eprintln!("  [profile] mixing={:.0}ms, ffn={:.0}ms, total={:.0}ms (seq={})",
+            total_mixing * 1000.0, total_ffn * 1000.0,
+            (total_mixing + total_ffn) * 1000.0, sl_orig);
 
         // Final norm
         for t in 0..sl {

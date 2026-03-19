@@ -70,9 +70,14 @@ impl MixingLayer for Mamba2Block {
         let d_conv_in = di + 2 * ng * ds;
         let d_in_proj = self.in_proj.out_dim();
 
+        // 세부 프로파일링
+        let _t0 = std::time::Instant::now();
+
         // in_proj: nn.Linear (LayerNorm 없음 — fused kernel이 내부 처리)
         let mut proj = vec![0.0f32; seq_len * d_in_proj];
         self.in_proj.forward_batch(x, seq_len, &mut proj);
+
+        let _t_proj = _t0.elapsed();
 
         // Split: mamba_ssm 순서 — z(di) + xBC(di+2*ng*ds) + dt_raw(nh)
         let mut z = vec![0.0f32; seq_len * di];
@@ -122,6 +127,8 @@ impl MixingLayer for Mamba2Block {
             }
         }
 
+        let _t1 = std::time::Instant::now();
+
         // Depthwise causal conv1d (PyTorch cross-correlation 규칙: w[ki] * x[t-K+1+ki])
         let dc = self.d_conv;
         let mut xbc_conv = vec![0.0f32; seq_len * d_conv_in];
@@ -138,6 +145,8 @@ impl MixingLayer for Mamba2Block {
                 xbc_conv[t * d_conv_in + ch] = sum;
             }
         }
+
+        let _t_conv = _t1.elapsed();
 
         // SiLU on ALL xBC channels, then split (matching causal_conv1d_fn activation="silu")
         let mut x_conv = vec![0.0f32; seq_len * di];
@@ -166,6 +175,8 @@ impl MixingLayer for Mamba2Block {
         // A = -exp(A_log) per head
         let a_neg: Vec<f32> = self.a_log.iter().map(|v| -v.exp()).collect();
 
+        let _t2 = std::time::Instant::now();
+
         // Chunk-parallel SSD forward (mamba_ssm CUDA 호환)
         let mut y_scan = vec![0.0f32; seq_len * di];
         unsafe {
@@ -177,6 +188,8 @@ impl MixingLayer for Mamba2Block {
                 seq_len as i32, nh as i32, hd as i32, ds as i32, ng as i32,
             );
         }
+
+        let _t_scan = _t2.elapsed();
 
         // Gate FIRST, then RMSNorm (norm_before_gate=False)
         // = RMSNorm(y * silu(z)) * weight
@@ -193,8 +206,25 @@ impl MixingLayer for Mamba2Block {
             }
         }
 
+        let _t3 = std::time::Instant::now();
+
         // out_proj: nn.Linear (LayerNorm 없음)
         self.out_proj.forward_batch(&y_scan, seq_len, out);
+
+        let _t4 = std::time::Instant::now();
+
+        static PROF_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let cnt = PROF_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if cnt < 2 {  // 첫 2회만 출력 (fwd+bwd of layer 0)
+            eprintln!("    [mamba2 L0-{}] in_proj={:.1}ms conv1d={:.1}ms ssd_scan={:.1}ms gate+norm+out={:.1}ms total={:.1}ms",
+                if cnt == 0 { "fwd" } else { "bwd" },
+                _t_proj.as_secs_f64() * 1000.0,
+                _t_conv.as_secs_f64() * 1000.0,
+                _t_scan.as_secs_f64() * 1000.0,
+                (_t4 - _t3).as_secs_f64() * 1000.0 + (_t2 - _t1).as_secs_f64() * 1000.0 - _t_conv.as_secs_f64() * 1000.0,
+                (_t4 - _t0).as_secs_f64() * 1000.0,
+            );
+        }
     }
 }
 
