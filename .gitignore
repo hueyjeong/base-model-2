@@ -53,3 +53,6 @@ Thumbs.db
 corpus/sample_10g.zip
 
 *.bmmq
+
+exp-2-pass-consensus/exported_step2000/
+exp-2-pass-consensus/exported_step2000_f32/
