@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model.bitlinear import BitLinear, BatchedBitLinear
+from model.bitlinear import BitLinear, BatchedBitLinear, Int8Linear
 
 # Triton fused 커널 감지
 _TRITON_KERNELS = False
@@ -89,6 +89,29 @@ class BitNetFFN(nn.Module):
             up = self.up_proj(x)
 
         x = F.relu(gate_out) * up
+        x = self.dropout(x)
+        x = self.down_proj(x)
+        return x
+
+
+class SwiGLUFFN(nn.Module):
+    """SwiGLU FFN (Int8Linear QAT, SiLU activation)
+
+    Attention 모델용 FFN. INT8 QAT 적용.
+    x → gate_up_proj(INT8) → SiLU(gate) * up → dropout → down_proj(INT8)
+    """
+
+    def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1):
+        super().__init__()
+        self.d_ff = d_ff
+        self.gate_up_proj = Int8Linear(d_model, 2 * d_ff, bias=False)
+        self.down_proj = Int8Linear(d_ff, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gu = self.gate_up_proj(x)
+        gate, up = gu.split(self.d_ff, dim=-1)
+        x = F.silu(gate) * up
         x = self.dropout(x)
         x = self.down_proj(x)
         return x

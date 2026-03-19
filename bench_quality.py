@@ -31,7 +31,7 @@ def load_tokenizer(name="keyboard"):
     return KeyboardTokenizer(os.path.join(PROJECT_ROOT, "keyboard_tokenizer", "keyboard_tokenizer.json"))
 
 
-MIXING_TYPES = ["xlstm", "mlstm", "rwkv", "retnet", "mamba", "mamba2", "fnet", "tcn"]
+MIXING_TYPES = ["xlstm", "mlstm", "rwkv", "retnet", "mamba", "mamba2", "fnet", "tcn", "attention"]
 
 
 def bench_quality_one(
@@ -165,6 +165,8 @@ def main():
                         help="Gradient accumulation steps (effective_batch = batch_size * grad_accum)")
     parser.add_argument("--bf16", action="store_true", default=True)
     parser.add_argument("--target_params", type=int, default=128_000_000)
+    parser.add_argument("--n_layers", type=int, default=None,
+                        help="레이어 수 직접 지정 (미지정 시 target_params로 자동 계산)")
     parser.add_argument("--mixing_types", nargs="+", default=MIXING_TYPES)
     args = parser.parse_args()
 
@@ -179,10 +181,14 @@ def main():
     for mt in args.mixing_types:
         print(f"--- {mt.upper()} ---")
         try:
+            overrides = {}
+            if args.n_layers is not None:
+                overrides["n_layers"] = args.n_layers
             r = bench_quality_one(
                 mt, args.d_model, args.corpus, args.text_key,
                 args.max_steps, args.log_interval, args.seq_len, args.batch_size,
                 args.bf16, args.target_params, grad_accum=args.grad_accum,
+                **overrides,
             )
             all_results[mt] = r
             f = r["final"]
