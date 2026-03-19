@@ -138,15 +138,18 @@ def prepare_model_for_inference(model: DenseEditor):
 
         module._cached_bwd_reset = None
         module._cached_reset_ptr = -1
+        module._cached_reset_shape = None
 
         def _cached_forward(self, x, pad_mask=None, reset_mask=None):
             fwd_out = self.fwd(x, reset_mask=reset_mask)
             if reset_mask is not None:
                 ptr = reset_mask.data_ptr()
-                if ptr != self._cached_reset_ptr:
+                shp = reset_mask.shape
+                if ptr != self._cached_reset_ptr or shp != self._cached_reset_shape:
                     self._cached_bwd_reset = reset_mask.flip(1).clone()
                     self._cached_bwd_reset[:, 0] = True
                     self._cached_reset_ptr = ptr
+                    self._cached_reset_shape = shp
                 bwd_reset = self._cached_bwd_reset
             else:
                 bwd_reset = None
@@ -335,15 +338,27 @@ def _pack_to_batched_tensors(
 
 def _forward_batch(
     model: DenseEditor, input_ids: torch.Tensor, pad_mask: torch.Tensor,
-    use_amp: bool, device: str,
+    use_amp: bool, device: str, temperature: float = 0.0,
 ) -> torch.Tensor:
-    """단일 배치 forward pass → argmax tag 텐서 (GPU)"""
+    """단일 배치 forward pass → argmax tag 텐서 (GPU)
+
+    temperature > 0: Gumbel-max trick → stochastic sampling (eval 모드와 호환)
+    temperature = 0: 결정론적 argmax
+    """
     if use_amp and device == "cuda":
         with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
             logits = model(input_ids, pad_mask)
     else:
         with torch.no_grad():
             logits = model(input_ids, pad_mask)
+
+    if temperature > 0:
+        # Gumbel-max trick: argmax(logit/T + Gumbel(0,1))
+        gumbel_noise = -torch.log(-torch.log(
+            torch.rand_like(logits.float()) * 0.9998 + 0.0001  # avoid log(0)
+        ))
+        logits = logits.float() / temperature + gumbel_noise
+
     return logits.argmax(dim=-1)
 
 
@@ -364,13 +379,14 @@ def _predict_from_batches(
     n_sents: int,
     device: str,
     use_amp: bool = True,
+    temperature: float = 0.0,
 ) -> list[list[int]]:
     """사전 변환된 배치 텐서로 추론 — 핫 루프에 텐서 생성 없음"""
     all_tags: list[list[int] | None] = [None] * n_sents
 
     # GPU에서 모든 배치 실행, 배치 단위 CPU 전송
     for input_ids, pad_mask, bounds_list in batches:
-        pred = _forward_batch(model, input_ids, pad_mask, use_amp, device)
+        pred = _forward_batch(model, input_ids, pad_mask, use_amp, device, temperature)
         pred_cpu = pred.cpu()
         _unpack_tags(pred_cpu, bounds_list, all_tags)
 
@@ -383,26 +399,42 @@ def _predict_paired_from_batches(
     n_sents: int,
     device: str,
     use_amp: bool = True,
+    temperature: float = 0.0,
 ) -> tuple[list[list[int]], list[list[int]]]:
-    """사전 변환된 배치에서 2회 stochastic 추론을 1회 forward로
+    """사전 변환된 배치에서 2회 stochastic 추론
 
-    input_ids.repeat(2,1)로 GPU 내 복제 → dropout이 독립 적용.
+    temperature>0 (Gumbel): 독립 2회 forward (각각 다른 noise)
+    temperature=0 (MC Dropout): input_ids.repeat(2,1) → 1회 forward로 독립 dropout
     """
     all_tags_a: list[list[int] | None] = [None] * n_sents
     all_tags_b: list[list[int] | None] = [None] * n_sents
 
-    for input_ids, pad_mask, bounds_list in batches:
-        B = input_ids.shape[0]
-        doubled_ids = input_ids.repeat(2, 1)
-        doubled_mask = pad_mask.repeat(2, 1)
+    if temperature > 0:
+        # Gumbel: 독립 2회 forward (eval 모드에서도 다른 noise)
+        for input_ids, pad_mask, bounds_list in batches:
+            pred_a = _forward_batch(model, input_ids, pad_mask, use_amp, device, temperature)
+            pred_b = _forward_batch(model, input_ids, pad_mask, use_amp, device, temperature)
+            pred_a_cpu = pred_a.cpu()
+            pred_b_cpu = pred_b.cpu()
 
-        pred = _forward_batch(model, doubled_ids, doubled_mask, use_amp, device)
-        pred_cpu = pred.cpu()
+            for seq_idx, bounds in enumerate(bounds_list):
+                for sent_idx, start, end in bounds:
+                    all_tags_a[sent_idx] = pred_a_cpu[seq_idx, start:end].tolist()
+                    all_tags_b[sent_idx] = pred_b_cpu[seq_idx, start:end].tolist()
+    else:
+        # MC Dropout: repeat(2,1) → 1회 forward로 독립 dropout
+        for input_ids, pad_mask, bounds_list in batches:
+            B = input_ids.shape[0]
+            doubled_ids = input_ids.repeat(2, 1)
+            doubled_mask = pad_mask.repeat(2, 1)
 
-        for seq_idx, bounds in enumerate(bounds_list):
-            for sent_idx, start, end in bounds:
-                all_tags_a[sent_idx] = pred_cpu[seq_idx, start:end].tolist()
-                all_tags_b[sent_idx] = pred_cpu[seq_idx + B, start:end].tolist()
+            pred = _forward_batch(model, doubled_ids, doubled_mask, use_amp, device)
+            pred_cpu = pred.cpu()
+
+            for seq_idx, bounds in enumerate(bounds_list):
+                for sent_idx, start, end in bounds:
+                    all_tags_a[sent_idx] = pred_cpu[seq_idx, start:end].tolist()
+                    all_tags_b[sent_idx] = pred_cpu[seq_idx + B, start:end].tolist()
 
     return all_tags_a, all_tags_b
 
@@ -414,6 +446,7 @@ def _predict_dynamic(
     device: str,
     use_amp: bool = True,
     max_seq_len: int = 2048,
+    temperature: float = 0.0,
 ) -> list[list[int]]:
     """동적 입력용 추론 — V2/V4 중간 결과 처리 (numpy 기반 빠른 텐서 생성)"""
     packed_seqs, boundaries = _pack_sentences(all_ids, max_seq_len)
@@ -432,7 +465,7 @@ def _predict_dynamic(
         input_ids = torch.from_numpy(arr).to(device, non_blocking=True)
         pad_mask = input_ids != 0
 
-        pred = _forward_batch(model, input_ids, pad_mask, use_amp, device)
+        pred = _forward_batch(model, input_ids, pad_mask, use_amp, device, temperature)
         pred_cpu = pred.cpu()
         _unpack_tags(pred_cpu, bounds, all_tags)
 
@@ -446,6 +479,7 @@ def _predict_paired_dynamic(
     device: str,
     use_amp: bool = True,
     max_seq_len: int = 2048,
+    temperature: float = 0.0,
 ) -> tuple[list[list[int]], list[list[int]]]:
     """동적 입력용 paired 추론 — V4 stage 2"""
     packed_seqs, boundaries = _pack_sentences(all_ids, max_seq_len)
@@ -464,17 +498,29 @@ def _predict_paired_dynamic(
 
         input_ids = torch.from_numpy(arr).to(device, non_blocking=True)
         pad_mask = input_ids != 0
-        B = input_ids.shape[0]
-        doubled_ids = input_ids.repeat(2, 1)
-        doubled_mask = pad_mask.repeat(2, 1)
 
-        pred = _forward_batch(model, doubled_ids, doubled_mask, use_amp, device)
-        pred_cpu = pred.cpu()
+        if temperature > 0:
+            pred_a = _forward_batch(model, input_ids, pad_mask, use_amp, device, temperature)
+            pred_b = _forward_batch(model, input_ids, pad_mask, use_amp, device, temperature)
+            pred_a_cpu = pred_a.cpu()
+            pred_b_cpu = pred_b.cpu()
 
-        for seq_idx, blist in enumerate(bounds):
-            for sent_idx, start, end in blist:
-                all_tags_a[sent_idx] = pred_cpu[seq_idx, start:end].tolist()
-                all_tags_b[sent_idx] = pred_cpu[seq_idx + B, start:end].tolist()
+            for seq_idx, blist in enumerate(bounds):
+                for sent_idx, start, end in blist:
+                    all_tags_a[sent_idx] = pred_a_cpu[seq_idx, start:end].tolist()
+                    all_tags_b[sent_idx] = pred_b_cpu[seq_idx, start:end].tolist()
+        else:
+            B = input_ids.shape[0]
+            doubled_ids = input_ids.repeat(2, 1)
+            doubled_mask = pad_mask.repeat(2, 1)
+
+            pred = _forward_batch(model, doubled_ids, doubled_mask, use_amp, device)
+            pred_cpu = pred.cpu()
+
+            for seq_idx, blist in enumerate(bounds):
+                for sent_idx, start, end in blist:
+                    all_tags_a[sent_idx] = pred_cpu[seq_idx, start:end].tolist()
+                    all_tags_b[sent_idx] = pred_cpu[seq_idx + B, start:end].tolist()
 
     return all_tags_a, all_tags_b
 
@@ -510,35 +556,39 @@ def run_variation_batch(
     vocab_size: int,
     device: str,
     batch_size: int,
+    temperature: float = 0.0,
 ) -> list[list[int]]:
     """noised_batches: 사전 변환된 GPU 텐서 배치 (첫 pass에 재사용)"""
     all_noised = [pair[0] for pair in eval_data]
 
     if variation == "v1":
-        tags = _predict_from_batches(model, noised_batches, n_sents, device)
+        tags = _predict_from_batches(model, noised_batches, n_sents, device,
+                                     temperature=temperature)
         return _apply_tags_all(all_noised, tags, vocab_size)
 
     elif variation == "v2":
-        tags_1 = _predict_from_batches(model, noised_batches, n_sents, device)
+        tags_1 = _predict_from_batches(model, noised_batches, n_sents, device,
+                                       temperature=temperature)
         intermediates = _apply_tags_all(all_noised, tags_1, vocab_size)
-        tags_2 = _predict_dynamic(model, intermediates, batch_size, device)
+        tags_2 = _predict_dynamic(model, intermediates, batch_size, device,
+                                  temperature=temperature)
         return _apply_tags_all(intermediates, tags_2, vocab_size)
 
     elif variation == "v3":
         tags_a, tags_b = _predict_paired_from_batches(
-            model, noised_batches, n_sents, device)
+            model, noised_batches, n_sents, device, temperature=temperature)
         cons = [consensus_tags(a, b) for a, b in zip(tags_a, tags_b)]
         return _apply_tags_all(all_noised, cons, vocab_size)
 
     elif variation == "v4":
         # Stage 1: paired consensus on x (사전 변환 텐서)
         tags_a, tags_b = _predict_paired_from_batches(
-            model, noised_batches, n_sents, device)
+            model, noised_batches, n_sents, device, temperature=temperature)
         cons_1 = [consensus_tags(a, b) for a, b in zip(tags_a, tags_b)]
         y_list = _apply_tags_all(all_noised, cons_1, vocab_size)
         # Stage 2: paired consensus on y (동적 텐서)
         tags_a2, tags_b2 = _predict_paired_dynamic(
-            model, y_list, batch_size, device)
+            model, y_list, batch_size, device, temperature=temperature)
         cons_2 = [consensus_tags(a, b) for a, b in zip(tags_a2, tags_b2)]
         return _apply_tags_all(y_list, cons_2, vocab_size)
 
@@ -751,6 +801,13 @@ def run_experiment(args):
     model, config = load_model(args.ckpt, device, use_int8=args.int8)
     vocab_size = config.vocab_size
 
+    # Gumbel noise 모드: eval → dropout 비활성화, Gumbel noise가 stochasticity 제공
+    if args.temperature > 0:
+        model.eval()
+        print(f"  Gumbel noise 모드 (temperature={args.temperature}, dropout 비활성화)")
+    else:
+        print(f"  MC Dropout 모드 (dropout={config.dropout})")
+
     tokenizer = KeyboardTokenizer()
 
     eval_data = prepare_eval_data(
@@ -803,6 +860,7 @@ def run_experiment(args):
             finals = run_variation_batch(
                 var, model, eval_data, noised_batches, n_sents,
                 vocab_size, device, args.batch_size,
+                temperature=args.temperature,
             )
             if device == "cuda":
                 torch.cuda.synchronize()
@@ -848,7 +906,8 @@ def run_experiment(args):
             "device": device,
             "seed": args.seed,
             "variations": args.variations,
-            "stochasticity": "mc_dropout",
+            "stochasticity": "gumbel_noise" if args.temperature > 0 else "mc_dropout",
+            "temperature": args.temperature,
             "dropout": config.dropout,
             "int8": args.int8,
         },
@@ -942,6 +1001,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--int8", action="store_true",
                         help="INT8 CUDA BitLinear 활성화 (대형 GPU용, 기본=BF16)")
+    parser.add_argument("--temperature", type=float, default=0.0,
+                        help="Gumbel noise temperature (0=MC Dropout, >0=Gumbel stochastic)")
 
     args = parser.parse_args()
     run_experiment(args)
