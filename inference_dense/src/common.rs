@@ -94,6 +94,22 @@ extern "C" {
         gamma: f32, m: c_int, n: c_int, k: c_int,
     );
 
+    /// Bitmask LUT 초기화 (최초 1회)
+    pub fn init_bitmask_luts();
+
+    /// packed 2-bit → sign_bits + nonzero_bits 추출 (모델 로드 시 1회)
+    pub fn extract_bitmasks(
+        packed: *const u8, sign_bits: *mut u8, nonzero_bits: *mut u8,
+        rows: c_int, cols: c_int, packed_stride: c_int,
+    );
+
+    /// Bitmask 기반 ternary matmul (AVX2): sign-XOR + zero-AND + ADD
+    pub fn ternary_bitmask_sgemm_avx2(
+        sign_bits: *const u8, nonzero_bits: *const u8,
+        x: *const f32, y: *mut f32,
+        gamma: f32, m: c_int, n: c_int, k: c_int,
+    );
+
     /// Chunk-parallel SSD forward — mamba_ssm CUDA 커널과 수치 호환
     pub fn mamba2_ssd_fwd(
         x: *const f32, B: *const f32, C: *const f32,
@@ -415,6 +431,58 @@ impl TernaryLinear {
     }
 }
 
+// ── TernaryBitmask (bitmask LUT 기반, 곱셈 없는 ternary matmul) ──
+
+pub struct TernaryBitmask {
+    pub sign_bits: Vec<u8>,      // [out_dim × bitmask_stride]
+    pub nonzero_bits: Vec<u8>,   // [out_dim × bitmask_stride]
+    pub gamma: f32,
+    pub out_dim: usize,
+    pub in_dim: usize,
+}
+
+impl TernaryBitmask {
+    pub fn load_bmmq(tensors: &mut HashMap<String, TensorData>, prefix: &str) -> Result<Self> {
+        // LUT 초기화 (최초 1회)
+        unsafe { init_bitmask_luts(); }
+
+        let key = format!("{}.weight", prefix);
+        match tensors.remove(&key).context(format!("TernaryBitmask weight 없음: {}", key))? {
+            TensorData::Packed2Bit { data, gamma, row_sums: _, rows, cols, packed_stride } => {
+                let bitmask_stride = (cols + 7) / 8;
+                let mut sign_bits = vec![0u8; rows * bitmask_stride];
+                let mut nonzero_bits = vec![0u8; rows * bitmask_stride];
+                unsafe {
+                    extract_bitmasks(
+                        data.as_ptr(),
+                        sign_bits.as_mut_ptr(),
+                        nonzero_bits.as_mut_ptr(),
+                        rows as c_int, cols as c_int, packed_stride as c_int,
+                    );
+                }
+                Ok(Self { sign_bits, nonzero_bits, gamma, out_dim: rows, in_dim: cols })
+            }
+            _ => bail!("TernaryBitmask은 Packed2Bit 타입이어야 함: {}", key),
+        }
+    }
+
+    /// Bitmask ternary 배치 matmul: out[t,j] = gamma * Σ(x XOR sign AND nonzero)
+    pub fn forward_batch(&self, x: &[f32], seq_len: usize, out: &mut [f32]) {
+        unsafe {
+            ternary_bitmask_sgemm_avx2(
+                self.sign_bits.as_ptr(),
+                self.nonzero_bits.as_ptr(),
+                x.as_ptr(),
+                out.as_mut_ptr(),
+                self.gamma,
+                self.out_dim as i32,
+                seq_len as i32,
+                self.in_dim as i32,
+            );
+        }
+    }
+}
+
 // ── Linear (per-row i8 quantized) ────────────────────
 
 pub struct Linear {
@@ -527,7 +595,8 @@ impl BitNetFFN {
 
 pub enum Projection {
     F32(LinearF32),
-    Ternary(TernaryLinear),
+    Ternary(TernaryLinear),       // i8 커널 (bit-exact 비교용)
+    TernaryBM(TernaryBitmask),    // bitmask 커널
 }
 
 impl Projection {
@@ -535,7 +604,7 @@ impl Projection {
         let key = format!("{}.weight", prefix);
         let is_ternary = matches!(tensors.get(&key), Some(TensorData::Packed2Bit { .. }));
         if is_ternary {
-            eprintln!("    {} → Ternary", prefix);
+            eprintln!("    {} → Ternary(i8)", prefix);
             Ok(Projection::Ternary(TernaryLinear::load_bmmq(tensors, prefix)?))
         } else {
             Ok(Projection::F32(LinearF32::load_bmmq(tensors, prefix)?))
@@ -546,15 +615,24 @@ impl Projection {
         match self {
             Projection::F32(l) => l.forward_batch(x, seq_len, out),
             Projection::Ternary(l) => l.forward_batch(x, seq_len, out),
+            Projection::TernaryBM(l) => l.forward_batch(x, seq_len, out),
         }
     }
 
     pub fn out_dim(&self) -> usize {
-        match self { Projection::F32(l) => l.out_dim, Projection::Ternary(l) => l.out_dim }
+        match self {
+            Projection::F32(l) => l.out_dim,
+            Projection::Ternary(l) => l.out_dim,
+            Projection::TernaryBM(l) => l.out_dim,
+        }
     }
 
     pub fn in_dim(&self) -> usize {
-        match self { Projection::F32(l) => l.in_dim, Projection::Ternary(l) => l.in_dim }
+        match self {
+            Projection::F32(l) => l.in_dim,
+            Projection::Ternary(l) => l.in_dim,
+            Projection::TernaryBM(l) => l.in_dim,
+        }
     }
 }
 
