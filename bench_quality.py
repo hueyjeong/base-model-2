@@ -31,7 +31,7 @@ def load_tokenizer(name="keyboard"):
     return KeyboardTokenizer(os.path.join(PROJECT_ROOT, "keyboard_tokenizer", "keyboard_tokenizer.json"))
 
 
-MIXING_TYPES = ["xlstm", "mlstm", "rwkv", "retnet", "mamba", "mamba2", "fnet", "tcn", "attention"]
+MIXING_TYPES = ["xlstm", "mlstm", "rwkv", "retnet", "mamba", "mamba2", "fnet", "tcn", "attention", "hybrid"]
 
 
 def bench_quality_one(
@@ -59,7 +59,11 @@ def bench_quality_one(
     n_params = sum(p.numel() for p in model.parameters())
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, fused=torch.cuda.is_available())
-    criterion = nn.CrossEntropyLoss(ignore_index=-100)
+    # edit_loss_weight: non-KEEP 태그에 2배 가중치 (KEEP 편향 완화)
+    edit_loss_weight = 2.0
+    tag_weights = torch.ones(cfg.n_tags, device=device)
+    tag_weights[1:] = edit_loss_weight  # index 0 = TAG_KEEP
+    criterion = nn.CrossEntropyLoss(ignore_index=-100, weight=tag_weights)
 
     # 노이즈 (토큰 레벨 비활성)
     noise_cfg = NoiseConfig(token_mask_ratio=0.0, token_delete_ratio=0.0, text_infill_ratio=0.0)

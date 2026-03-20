@@ -36,7 +36,7 @@ class DenseEditorLayer(nn.Module):
         self.norm1 = RMSNorm(cfg.d_model, eps=cfg.rms_norm_eps)
         self.mixing = create_mixing_layer(cfg)
         self.norm2 = RMSNorm(cfg.d_model, eps=cfg.rms_norm_eps)
-        if cfg.mixing_type == "attention":
+        if cfg.mixing_type in ("attention", "hybrid"):
             self.ffn = SwiGLUFFN(cfg.d_model, cfg.d_ff, dropout=cfg.dropout)
         else:
             self.ffn = BitNetFFN(cfg.d_model, cfg.d_ff, dropout=cfg.dropout, fused_gate_up=True)
@@ -77,7 +77,7 @@ class DenseEditor(nn.Module):
 
         # Final norm + tag head
         self.final_norm = RMSNorm(cfg.d_model, eps=cfg.rms_norm_eps)
-        if cfg.mixing_type == "attention":
+        if cfg.mixing_type in ("attention", "hybrid"):
             self.tag_head = Int8Linear(cfg.d_model, cfg.n_tags, bias=False)
         else:
             self.tag_head = BitLinear(cfg.d_model, cfg.n_tags)
@@ -149,7 +149,7 @@ if __name__ == "__main__":
     print("DenseEditor 모델 검증")
     print("=" * 60)
 
-    for mixing_type in ["fnet", "tcn", "rwkv", "retnet", "mamba", "xlstm", "attention"]:
+    for mixing_type in ["fnet", "tcn", "rwkv", "retnet", "mamba", "xlstm", "attention", "hybrid"]:
         print(f"\n--- {mixing_type.upper()} ---")
         cfg = make_preset(mixing_type)
 

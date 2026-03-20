@@ -68,6 +68,10 @@ class DenseEditorConfig:
     # Attention 전용
     attn_n_kv_heads: int = 4          # GQA KV head 수 (n_heads와 동일이면 MHA)
 
+    # Hybrid (Conv1d + Window Attention + FFT) 전용
+    hybrid_conv_kernel: int = 4       # depthwise conv kernel size
+    hybrid_window_size: int = 64      # window attention 크기
+
     def save(self, path: str) -> None:
         """설정을 JSON 파일로 저장"""
         with open(path, "w", encoding="utf-8") as f:
@@ -89,10 +93,10 @@ class DenseEditorConfig:
             f"headdim({self.headdim})은 d_model//n_heads({self.d_model // self.n_heads})이어야 함"
         assert self.n_tags == 2 + 2 * self.vocab_size, \
             f"n_tags({self.n_tags})는 2 + 2*vocab_size({2 + 2 * self.vocab_size})이어야 함"
-        valid_types = {"mamba", "mamba2", "fnet", "tcn", "rwkv", "retnet", "xlstm", "xlstm_mamba", "mlstm", "attention"}
+        valid_types = {"mamba", "mamba2", "fnet", "tcn", "rwkv", "retnet", "xlstm", "xlstm_mamba", "mlstm", "attention", "hybrid"}
         assert self.mixing_type in valid_types, \
             f"mixing_type '{self.mixing_type}'은 {valid_types} 중 하나여야 함"
-        if self.mixing_type == "attention":
+        if self.mixing_type in ("attention", "hybrid"):
             assert self.n_heads % self.attn_n_kv_heads == 0, \
                 f"n_heads({self.n_heads})는 attn_n_kv_heads({self.attn_n_kv_heads})로 나누어떨어져야 함"
 
@@ -111,6 +115,7 @@ MIXING_PROJ_COUNT: dict[str, int] = {
     "xlstm_mamba": 0,  # 특수 (expand=2, calc_layer_params에서 직접 계산)
     "mlstm": 5,    # q,k,v,i,f
     "attention": 0, # 특수 (GQA로 직접 계산)
+    "hybrid": 0,    # 특수 (attention + conv1d, 직접 계산)
 }
 
 
@@ -155,6 +160,13 @@ def calc_layer_params(d_model: int, mixing_type: str) -> tuple[int, int, int]:
         headdim = 32
         d_kv = n_kv_heads * headdim
         mix_params = 2 * d * d + 2 * d * d_kv
+    elif mixing_type == "hybrid":
+        # attention + conv1d(depthwise)
+        n_kv_heads = 4
+        headdim = 32
+        d_kv = n_kv_heads * headdim
+        conv_k = 4
+        mix_params = 2 * d * d + 2 * d * d_kv + d * conv_k
     elif mixing_type == "tcn":
         mix_params = d * 7 * 6 + d * d  # 6 depthwise + 1 pointwise
     else:
@@ -193,7 +205,7 @@ def make_config(
         n_heads=n_heads,
         headdim=headdim,
     )
-    if mixing_type == "attention":
+    if mixing_type in ("attention", "hybrid"):
         kwargs.setdefault("attn_n_kv_heads", 4)
     kwargs.update(overrides)
     return DenseEditorConfig(**kwargs)
