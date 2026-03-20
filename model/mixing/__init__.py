@@ -45,5 +45,8 @@ def create_mixing_layer(cfg: "DenseEditorConfig") -> "MixingLayer":
     elif t == "attention":
         from model.mixing.full_attention import FullAttentionMixing
         return FullAttentionMixing(cfg)
+    elif t == "hybrid":
+        from model.mixing.hybrid import HybridMixing
+        return HybridMixing(cfg)
     else:
         raise ValueError(f"알 수 없는 mixing_type: {t}")

@@ -75,7 +75,7 @@ def load_tokenizer(name: str, path: str | None = None):
     return cls(path or preset["default_path"])
 
 
-VALID_MIXING_TYPES = ["mamba", "mamba2", "fnet", "tcn", "rwkv", "retnet", "xlstm", "mlstm", "attention"]
+VALID_MIXING_TYPES = ["mamba", "mamba2", "fnet", "tcn", "rwkv", "retnet", "xlstm", "mlstm", "attention", "hybrid"]
 
 
 def get_lr(
