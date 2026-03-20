@@ -42,6 +42,7 @@ exported/
 
 # Rust build artifacts
 inference/target/
+inference_dense/target/
 
 # Zone.Identifier (WSL)
 *.Zone.Identifier
@@ -50,3 +51,8 @@ inference/target/
 .DS_Store
 Thumbs.db
 corpus/sample_10g.zip
+
+*.bmmq
+
+exp-2-pass-consensus/exported_step2000/
+exp-2-pass-consensus/exported_step2000_f32/

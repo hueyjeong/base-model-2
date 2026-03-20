@@ -1,0 +1,32 @@
+합의 기반 2단계 반복 교정 실험 결과
+============================================================
+체크포인트: dense_mamba2_d640_step_26000.pt
+데이터: corpus/val_50k.jsonl (500개)
+반복: 2회
+Stochasticity: MC Dropout (p=0.1)
+INT8 CUDA: False
+
+Variation                 |       P_exact |       R_exact |    F0.5_exact |      F1_exact |     Avg Edits
+---------------------------------------------------------------------------------------------------------
+V1 single-pass            | 0.7607±0.0012 | 0.6442±0.0030 | 0.7341±0.0017 | 0.6976±0.0023 | 10.7630±0.0325
+V2 2-pass                 | 0.7125±0.0017 | 0.6314±0.0029 | 0.6947±0.0020 | 0.6695±0.0024 | 11.2610±0.0240
+V3 consensus-2            | 0.8168±0.0028 | 0.6268±0.0014 | 0.7701±0.0025 | 0.7093±0.0020 | 9.7520±0.0113
+V4 2-stage consensus      | 0.7748±0.0010 | 0.6235±0.0008 | 0.7389±0.0005 | 0.6909±0.0001 | 10.2260±0.0255
+
+Raw per-run 결과:
+
+  V1 single-pass:
+    repeat 0: P=0.7615 R=0.6464 F0.5=0.7353 F1=0.6992 edits/sent=10.79 (infer 1.79s, eval 0.07s)
+    repeat 1: P=0.7598 R=0.6421 F0.5=0.7329 F1=0.6960 edits/sent=10.74 (infer 1.81s, eval 0.09s)
+
+  V2 2-pass:
+    repeat 0: P=0.7138 R=0.6335 F0.5=0.6961 F1=0.6712 edits/sent=11.28 (infer 3.58s, eval 0.08s)
+    repeat 1: P=0.7113 R=0.6294 F0.5=0.6933 F1=0.6678 edits/sent=11.24 (infer 3.79s, eval 0.07s)
+
+  V3 consensus-2:
+    repeat 0: P=0.8188 R=0.6278 F0.5=0.7718 F1=0.7107 edits/sent=9.74 (infer 5.92s, eval 0.09s)
+    repeat 1: P=0.8148 R=0.6257 F0.5=0.7683 F1=0.7079 edits/sent=9.76 (infer 3.87s, eval 0.08s)
+
+  V4 2-stage consensus:
+    repeat 0: P=0.7755 R=0.6229 F0.5=0.7393 F1=0.6909 edits/sent=10.21 (infer 7.22s, eval 0.07s)
+    repeat 1: P=0.7741 R=0.6240 F0.5=0.7386 F1=0.6910 edits/sent=10.24 (infer 7.19s, eval 0.07s)

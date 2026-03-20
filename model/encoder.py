@@ -1,23 +1,43 @@
-"""Encoder — Mamba SSM + BitNet FFN 인코더
+"""공통 빌딩 블록 — RMSNorm, BitNetFFN, BatchedBitNetFFN
 
-인코더 구조 (per layer):
-    x → Mamba → (+residual) → RMSNorm → BitNet FFN → (+residual) → RMSNorm
-
-Mamba 버전 선택:
-    mamba_version=1: Mamba-1 (selective scan, d_state=16)
-    mamba_version=2: Mamba-2 SSD (chunk-parallel, d_state=128)
+BitEditor의 여러 모듈에서 재사용되는 기본 구성 요소.
+Triton fused 커널 자동 감지 → 폴백: 순수 PyTorch.
 """
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint
+import torch.nn.functional as F
 
-from model.mamba_block import MambaBlock
-from model.bitlinear import BitLinear
+from model.bitlinear import BitLinear, BatchedBitLinear, Int8Linear
+
+# Triton fused 커널 감지
+_TRITON_KERNELS = False
+_fused_rms_norm = None
+_fused_sigmoid_mul = None
+
+try:
+    from model.triton_kernels import fused_rms_norm as _fused_rms_norm_fn
+    from model.triton_kernels import fused_sigmoid_mul as _fused_sigmoid_mul_fn
+    _TRITON_KERNELS = True
+    _fused_rms_norm = _fused_rms_norm_fn
+    _fused_sigmoid_mul = _fused_sigmoid_mul_fn
+except ImportError:
+    pass
+
+
+@torch.compiler.disable
+def _triton_rms_norm_wrapper(x, weight, eps):
+    return _fused_rms_norm(x, weight, eps)
+
+
+@torch.compiler.disable
+def _triton_sigmoid_mul_wrapper(gate, up):
+    return _fused_sigmoid_mul(gate, up)
 
 
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization
 
+    CUDA 사용 시 Triton fused 커널 자동 적용.
     bf16 안전성:
       - bf16 exponent = 8bit (f32과 동일) → overflow/underflow 없음
       - rsqrt(eps) = rsqrt(1e-6) = 1000 → bf16 범위(~65504) 이내
@@ -30,155 +50,98 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # bf16/f16: exponent 범위 충분, float32 캐스팅 생략하여 커널 2회 절감
+        if _TRITON_KERNELS and x.is_cuda:
+            return _triton_rms_norm_wrapper(x, self.weight, self.eps)
         rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        # weight를 입력 dtype으로 캐스팅하여 BF16 → FP32 promotion 방지
         return (x * rms) * self.weight.to(x.dtype)
 
 
 class BitNetFFN(nn.Module):
-    """BitNet Feed-Forward Network
+    """BitNet Feed-Forward Network (ReLU gating)
 
-    x → BitLinear(d_model → d_ff) → SiLU → BitLinear(d_ff → d_model)
-    
-    SwiGLU variant:
-    x → [BitLinear(gate), BitLinear(up)] → gate*SiLU(up) → BitLinear(down)
+    x → [BitLinear(gate), BitLinear(up)] → relu(gate)*up → BitLinear(down)
+
+    fused_gate_up=True: gate+up을 1개 BitLinear(d, 2*d_ff)로 처리
+    → 양자화+RMSNorm 1회로 ~30% 가속 (DenseEditor 전용)
     """
 
-    def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1):
+    def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1,
+                 fused_gate_up: bool = False):
         super().__init__()
-        self.gate_proj = BitLinear(d_model, d_ff)
-        self.up_proj = BitLinear(d_model, d_ff)
+        self.d_ff = d_ff
+        self.fused = fused_gate_up
+
+        if fused_gate_up:
+            self.gate_up_proj = BitLinear(d_model, 2 * d_ff)
+        else:
+            self.gate_proj = BitLinear(d_model, d_ff)
+            self.up_proj = BitLinear(d_model, d_ff)
+
         self.down_proj = BitLinear(d_ff, d_model)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate = torch.sigmoid(self.gate_proj(x))
-        up = self.up_proj(x)
-        x = gate * up
+        if self.fused:
+            gu = self.gate_up_proj(x)
+            gate_out, up = gu.split(self.d_ff, dim=-1)
+        else:
+            gate_out = self.gate_proj(x)
+            up = self.up_proj(x)
+
+        x = F.relu(gate_out) * up
         x = self.dropout(x)
         x = self.down_proj(x)
         return x
 
 
-class EncoderLayer(nn.Module):
-    """인코더 레이어: Mamba → RMSNorm → BitNet FFN → RMSNorm"""
+class SwiGLUFFN(nn.Module):
+    """SwiGLU FFN (Int8Linear QAT, SiLU activation)
 
-    def __init__(
-        self,
-        d_model: int,
-        d_inner: int,
-        d_state: int,
-        d_conv: int,
-        dt_rank: int,
-        d_ff: int,
-        dropout: float = 0.1,
-        rms_norm_eps: float = 1e-6,
-        mamba_version: int = 1,
-        headdim: int = 64,
-        ngroups: int = 1,
-        chunk_size: int = 256,
-    ):
+    Attention 모델용 FFN. INT8 QAT 적용.
+    x → gate_up_proj(INT8) → SiLU(gate) * up → dropout → down_proj(INT8)
+    """
+
+    def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1):
         super().__init__()
-        if mamba_version == 2:
-            from model.mamba2_block import Mamba2Block
-            self.mamba = Mamba2Block(
-                d_model=d_model,
-                d_inner=d_inner,
-                d_state=d_state,
-                d_conv=d_conv,
-                headdim=headdim,
-                ngroups=ngroups,
-                chunk_size=chunk_size,
-            )
-        else:
-            self.mamba = MambaBlock(
-                d_model=d_model,
-                d_inner=d_inner,
-                d_state=d_state,
-                d_conv=d_conv,
-                dt_rank=dt_rank,
-            )
-        self.norm1 = RMSNorm(d_model, eps=rms_norm_eps)
-        self.ffn = BitNetFFN(d_model, d_ff, dropout=dropout)
-        self.norm2 = RMSNorm(d_model, eps=rms_norm_eps)
+        self.d_ff = d_ff
+        self.gate_up_proj = Int8Linear(d_model, 2 * d_ff, bias=False)
+        self.down_proj = Int8Linear(d_ff, d_model, bias=False)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, reset_mask: torch.Tensor | None = None) -> torch.Tensor:
-        """
-        Args:
-            x: (batch, seq_len, d_model)
-            reset_mask: (batch, seq_len) bool — True인 위치에서 SSM state 리셋
-        Returns:
-            (batch, seq_len, d_model)
-        """
-        # Mamba + residual
-        residual = x
-        x = self.mamba(x, reset_mask=reset_mask)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gu = self.gate_up_proj(x)
+        gate, up = gu.split(self.d_ff, dim=-1)
+        x = F.silu(gate) * up
         x = self.dropout(x)
-        x = self.norm1(residual + x)
-
-        # FFN + residual
-        residual = x
-        x = self.ffn(x)
-        x = self.dropout(x)
-        x = self.norm2(residual + x)
-
+        x = self.down_proj(x)
         return x
 
 
-class Encoder(nn.Module):
-    """N-layer 인코더 스택"""
+class BatchedBitNetFFN(nn.Module):
+    """Batched BitNet FFN: E개 expert를 단일 batched 연산으로 처리
 
-    def __init__(
-        self,
-        n_layers: int,
-        d_model: int,
-        d_inner: int,
-        d_state: int,
-        d_conv: int,
-        dt_rank: int,
-        d_ff: int,
-        dropout: float = 0.1,
-        rms_norm_eps: float = 1e-6,
-        mamba_version: int = 1,
-        headdim: int = 64,
-        ngroups: int = 1,
-        chunk_size: int = 256,
-    ):
+    16회 sequential expert forward → 1회 batched bmm.
+    MoE 커널 호출 수: ~288/layer → ~18/layer.
+    수학적으로 E개 독립 BitNetFFN과 동일.
+    """
+
+    def __init__(self, n_experts: int, d_model: int, d_ff: int, dropout: float = 0.1):
         super().__init__()
-        self.gradient_checkpointing = False
-        # N 레이어마다 1개만 checkpoint (1=전체, 2=50%, 3=33% ...)
-        self.gradient_checkpointing_every: int = 1
-        self.layers = nn.ModuleList([
-            EncoderLayer(
-                d_model=d_model,
-                d_inner=d_inner,
-                d_state=d_state,
-                d_conv=d_conv,
-                dt_rank=dt_rank,
-                d_ff=d_ff,
-                dropout=dropout,
-                rms_norm_eps=rms_norm_eps,
-                mamba_version=mamba_version,
-                headdim=headdim,
-                ngroups=ngroups,
-                chunk_size=chunk_size,
-            )
-            for _ in range(n_layers)
-        ])
+        self.gate_proj = BatchedBitLinear(n_experts, d_model, d_ff)
+        self.up_proj = BatchedBitLinear(n_experts, d_model, d_ff)
+        self.down_proj = BatchedBitLinear(n_experts, d_ff, d_model)
+        self.dropout = nn.Dropout(dropout)
 
-    def forward(self, x: torch.Tensor, reset_mask: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: (batch, seq_len, d_model)  — 임베딩 출력
-            reset_mask: (batch, seq_len) bool — True인 위치에서 SSM state 리셋
+            x: (E, capacity, d_model)
         Returns:
-            (batch, seq_len, d_model)  — 인코더 최종 출력
+            (E, capacity, d_model)
         """
-        for i, layer in enumerate(self.layers):
-            if self.gradient_checkpointing and self.training and (i % self.gradient_checkpointing_every == 0):
-                x = checkpoint(layer, x, reset_mask, use_reentrant=False)
-            else:
-                x = layer(x, reset_mask=reset_mask)
+        gate = self.gate_proj(x)   # (E, C, d_ff)
+        up = self.up_proj(x)       # (E, C, d_ff)
+        x = F.relu(gate) * up
+        x = self.dropout(x)
+        x = self.down_proj(x)      # (E, C, d_model)
         return x

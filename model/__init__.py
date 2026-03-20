@@ -1,14 +1,10 @@
-# BitNet-Mamba Seq2Seq Model
-from model.config import BitMambaSeq2SeqConfig
-from model.seq2seq import BitMambaSeq2Seq
+# BitEditor — 비자기회귀 편집 태깅 모델
+from model.editor_config import BitEditorConfig
+from model.editor import BitEditor
 from model.bitlinear import BitLinear
-from model.mamba_block import MambaBlock
-from model.cross_attention import CrossAttention
 
 __all__ = [
-    "BitMambaSeq2SeqConfig",
-    "BitMambaSeq2Seq",
+    "BitEditorConfig",
+    "BitEditor",
     "BitLinear",
-    "MambaBlock",
-    "CrossAttention",
 ]

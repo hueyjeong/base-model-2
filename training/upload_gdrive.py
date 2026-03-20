@@ -30,19 +30,18 @@ def upload_and_cleanup(ckpt_path: str, log_path: str, remote_dest: str, keep_lat
 
             # 3. 로컬 체크포인트 정리 (업로드가 모두 성공한 경우에만)
             save_dir = os.path.dirname(ckpt_path)
-            # step_*.pt 형태의 모든 체크포인트 검출 (final_*.pt 등 제외 가능)
-            all_ckpts = glob.glob(os.path.join(save_dir, "step_*.pt"))
+            # step/editor 체크포인트 패턴 자동 감지 (final_*.pt 제외)
+            all_ckpts = sorted(
+                glob.glob(os.path.join(save_dir, "step_*.pt"))
+                + glob.glob(os.path.join(save_dir, "editor_*_step*.pt")),
+                key=os.path.getmtime,
+            )
             if not all_ckpts:
                 return
-            
-            # 구체적 list 변환을 통해 slice 문제 해결
-            ckpt_list = [str(f) for f in all_ckpts]
-            
-            # 남길 갯수를 제외한 나머지 삭제 대상 선별
-            if len(ckpt_list) > keep_latest_n:
-                to_delete = ckpt_list[:-keep_latest_n]
+
+            if len(all_ckpts) > keep_latest_n:
+                to_delete = all_ckpts[:-keep_latest_n]
                 for old_ckpt in to_delete:
-                    # 삭제 전 안전 확인 (현재 방금 저장한 파일과 일치하지 않는지)
                     if old_ckpt != ckpt_path:
                         try:
                             os.remove(old_ckpt)

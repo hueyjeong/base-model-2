@@ -1,0 +1,7 @@
+{
+  "model_type": "BitEditor",
+  "source_checkpoint": "editor_128M_step_400000.pt",
+  "step": 400000,
+  "format": "bmmq",
+  "param_count": 110661088
+}
