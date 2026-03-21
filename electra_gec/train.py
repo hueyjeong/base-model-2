@@ -501,7 +501,7 @@ def train(args):
                     )
 
                 if val_loader is not None and global_step % args.val_every == 0:
-                    m = validate(raw_model, val_loader, device, n_batches=args.val_batches, use_amp=use_amp)
+                    m = validate(raw_model, val_loader, device, n_batches=args.val_steps, use_amp=use_amp)
                     if is_main and m:
                         print(
                             f"  [VAL] loss={m['val_loss']:.4f} act_acc={m['act_acc']:.3f} "
@@ -540,7 +540,7 @@ def train(args):
 
             # 에포크 검증
             if val_loader is not None:
-                m = validate(raw_model, val_loader, device, n_batches=args.val_batches * 2, use_amp=use_amp)
+                m = validate(raw_model, val_loader, device, n_batches=args.val_steps * 2, use_amp=use_amp)
                 if is_main and m:
                     vl = m["val_loss"]
                     print(
@@ -633,7 +633,7 @@ def main():
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--log_interval", type=int, default=100)
     p.add_argument("--val_every", type=int, default=500)
-    p.add_argument("--val_batches", type=int, default=50)
+    p.add_argument("--val_steps", type=int, default=50)
     p.add_argument("--bf16", action="store_true", default=True, help="BF16 AMP (기본 활성)")
     p.add_argument("--no_bf16", dest="bf16", action="store_false")
     p.add_argument("--compile", action="store_true", help="torch.compile 적용")
