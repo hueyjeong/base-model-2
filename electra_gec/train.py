@@ -322,11 +322,6 @@ def train(args):
             "dataset_state": train_dataset.state_dict(),
         }
 
-    # ── DDP 래핑 ──
-    if is_ddp:
-        # find_unused_parameters 불필요 — frozen params는 requires_grad=False이므로 DDP scope 밖
-        model = DDP(model, device_ids=[local_rank], gradient_as_bucket_view=True)
-
     train_start = time.time()
 
     if is_main:
@@ -334,12 +329,22 @@ def train(args):
         print(f"  α={args.content_loss_weight}, edit_weight={args.edit_loss_weight}")
 
     epoch = 0
+    ddp_model = None  # stage마다 재래핑
     for stage in stages:
         if stage["epochs"] <= 0:
             continue
 
         stage["setup"]()
         trainable = [p for p in raw_model.parameters() if p.requires_grad]
+
+        # DDP: stage마다 재래핑 (frozen/unfrozen 파라미터 셋 변경에 대응)
+        if is_ddp:
+            if ddp_model is not None:
+                del ddp_model
+            ddp_model = DDP(raw_model, device_ids=[local_rank], gradient_as_bucket_view=True)
+            model = ddp_model
+        else:
+            model = raw_model
         optimizer = torch.optim.AdamW(
             trainable, lr=stage["lr"],
             betas=(0.9, 0.999), weight_decay=0.01,
