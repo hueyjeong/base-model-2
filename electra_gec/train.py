@@ -439,7 +439,9 @@ def train(args):
                     if tb > 0 and br > 0:
                         pct = br / tb * 100
                         eta_ep = ep_elapsed * (tb - br) / br
-                        progress = f" {fmt_bytes(br)}/{fmt_bytes(tb)} ({pct:.1f}% ETA {fmt_time(eta_ep)})"
+                        remaining_epochs = args.max_epochs - epoch
+                        eta_total = eta_ep + remaining_epochs * (ep_elapsed / max(pct / 100, 1e-6))
+                        progress = f" {fmt_bytes(br)}/{fmt_bytes(tb)} ({pct:.1f}% ETA {fmt_time(eta_total)})"
 
                     print(
                         f"  [{fmt_time(elapsed)}] ep{epoch}/{args.max_epochs} s{global_step}{progress} | "
