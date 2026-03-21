@@ -13,7 +13,12 @@ import torch
 from torch.utils.data import IterableDataset
 from transformers import AutoTokenizer
 
-from model.edit_tags import compute_edit_tags, TAG_KEEP, TAG_DELETE
+# C++ 가속 Levenshtein 우선 사용 (51x faster), 없으면 Python fallback
+from model.edit_tags import TAG_KEEP, TAG_DELETE
+try:
+    from training.editor_dataset import compute_edit_tags
+except ImportError:
+    from model.edit_tags import compute_edit_tags
 
 
 # ── Two-head 태그 상수 ──
