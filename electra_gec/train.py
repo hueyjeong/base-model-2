@@ -187,6 +187,7 @@ def train(args):
         print(f"  총 파라미터: {total_params:,}")
 
     # ── 노이즈 ──
+    # DDP: rank 0이 먼저 noiser 초기화 (nltk/g2pk 코퍼스 다운로드 race condition 방지)
     from keyboard_tokenizer.keyboard_wrapper import KeyboardTokenizer
     kb_tok_path = os.path.join(
         os.path.dirname(__file__), "..", "keyboard_tokenizer", "keyboard_tokenizer.json"
@@ -198,6 +199,12 @@ def train(args):
         korean_error_count=args.error_count,
         weight_preset=args.noise_preset,
     )
+    if is_ddp:
+        if is_main:
+            # rank 0이 먼저 초기화 — nltk 코퍼스 다운로드/unzip 완료
+            _noiser_init = DenoisingNoiser(kb_tok, noise_cfg, seed=0, use_korean_errors=True)
+            del _noiser_init
+        dist.barrier()  # 다른 rank 대기 후 진행
     noiser = DenoisingNoiser(kb_tok, noise_cfg, seed=args.seed + global_rank, use_korean_errors=True)
     if is_main:
         print(f"  noise: preset={args.noise_preset}, error_prob={args.error_prob}, count={args.error_count}")
