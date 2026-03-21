@@ -197,10 +197,14 @@ def train(args):
     if args.compile:
         mode = args.compile_mode
         # grad accum > 1이면 CUDA graph 비활성 (micro step 간 텐서 덮어쓰기 충돌)
-        if args.grad_accum_steps > 1 and mode in ("reduce-overhead", "max-autotune"):
+        if args.grad_accum_steps > 1:
             torch._inductor.config.triton.cudagraphs = False
+            torch._inductor.config.triton.cudagraph_trees = False
+            # max-autotune에서 CUDA graph 강제 비활성 → default로 전환
+            if mode in ("reduce-overhead", "max-autotune"):
+                mode = "max-autotune-no-cudagraphs"
             if is_main:
-                print(f"  torch.compile (mode={mode}, cudagraphs=off — grad_accum={args.grad_accum_steps})")
+                print(f"  torch.compile (mode={mode}, grad_accum={args.grad_accum_steps})")
         else:
             if is_main:
                 print(f"  torch.compile (mode={mode})")
