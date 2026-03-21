@@ -8,7 +8,11 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import logging
 from transformers import AutoModel
+
+# HuggingFace LOAD REPORT 경고 숨기기 (RTD head UNEXPECTED는 정상)
+logging.getLogger("transformers.modeling_utils").setLevel(logging.ERROR)
 
 
 # 액션 상수
