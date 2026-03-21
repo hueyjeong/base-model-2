@@ -21,6 +21,7 @@ import time
 from contextlib import nullcontext
 
 import torch
+import torch._inductor.config
 import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -175,8 +176,13 @@ def train(args):
     is_main = (global_rank == 0)
     use_amp = args.bf16 and device.type == "cuda"
 
+    # TF32 활성화 (BF16 AMP와 함께 사용, matmul 2x 가속)
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
     if is_main:
-        print(f"Device: {device} | World: {world_size} | AMP: {'BF16' if use_amp else 'off'}")
+        print(f"Device: {device} | World: {world_size} | AMP: {'BF16' if use_amp else 'off'} | TF32: on")
 
     # ── 모델 ──
     if is_main:
@@ -189,9 +195,16 @@ def train(args):
 
     # torch.compile — raw_model은 원본 유지, compiled는 forward용
     if args.compile:
-        if is_main:
-            print(f"  torch.compile (mode={args.compile_mode})...")
-        compiled_model = torch.compile(raw_model, mode=args.compile_mode)
+        mode = args.compile_mode
+        # grad accum > 1이면 CUDA graph 비활성 (micro step 간 텐서 덮어쓰기 충돌)
+        if args.grad_accum_steps > 1 and mode in ("reduce-overhead", "max-autotune"):
+            torch._inductor.config.triton.cudagraphs = False
+            if is_main:
+                print(f"  torch.compile (mode={mode}, cudagraphs=off — grad_accum={args.grad_accum_steps})")
+        else:
+            if is_main:
+                print(f"  torch.compile (mode={mode})")
+        compiled_model = torch.compile(raw_model, mode=mode)
     else:
         compiled_model = raw_model
 
@@ -424,7 +437,6 @@ def train(args):
                 ctx = ddp_model.no_sync() if no_sync else nullcontext()
 
                 with ctx:
-                    torch.compiler.cudagraph_mark_step_begin()
                     with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
                         act_logits, cont_logits = train_model(input_ids, attn_mask)
                         V = cont_logits.size(-1)
