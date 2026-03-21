@@ -165,6 +165,72 @@ def _compose_hangul(cho: int, jung: int, jong: int = 0) -> str:
     return chr(_HANGUL_BASE + cho * _JUNG_COUNT * _JONG_COUNT + jung * _JONG_COUNT + jong)
 
 
+# ── 가중치 프리셋 ────────────────────────────────────────────────────
+
+WEIGHT_PRESETS: dict[str, dict[str, float]] = {
+    "default": {
+        "spacing_errors": 4.0,
+        "punctuation_errors": 2.0,
+        "number_errors": 1.0,
+        "grammar_remove": 1.0,
+        "grammar_addition": 1.0,
+        "common_misspellings": 1.0,
+        "vowel_confusion": 0.5,
+        "consonant_errors": 0.5,
+        "word_substitution": 0.5,
+        "jamo_separation": 0.5,
+        "phoneme_errors": 1.0,
+        "g2pk_pronunciation": 2.0,
+        "heterograph_errors": 1.5,
+        "foreign_word_errors": 1.0,
+        "typing_language_errors": 1.0,
+        "word_order_errors": 1.0,
+        "tense_errors": 1.0,
+        "semantic_errors": 2.0,
+        "conjugation_errors": 0.5,
+        "suffix_errors": 0.5,
+        "particle_errors": 0.5,
+        "saisiot_errors": 0.5,
+        "double_expression": 0.5,
+        "foreign_style": 0.5,
+        "misc_errors": 0.5,
+        "chat_style_errors": 0.5,
+        "honorific_errors": 0.5,
+    },
+    "realistic": {
+        # KoGEC 2025 + 이경미 2018 실제 오류 분포 반영
+        # 가중치 = 목표 비율 / hit rate 로 보정 (hit rate 높은 모듈은 가중치를 낮춤)
+        "spacing_errors": 6.5,              # WS 25% 목표
+        "punctuation_errors": 6.0,          # PUNCT 30% 목표
+        "conjugation_errors": 2.0,          # VERB_ADJ 10.6% 목표 (hit rate 82% → 가중치 낮춤)
+        "tense_errors": 1.5,               # VERB_ADJ 보조
+        "common_misspellings": 0.5,         # SPELL 과다 방지 (hit rate 5%)
+        "vowel_confusion": 0.3,             # SPELL 과다 방지 (hit rate 91%)
+        "consonant_errors": 0.3,            # SPELL 과다 방지
+        "g2pk_pronunciation": 0.5,          # SPELL 과다 방지 (hit rate 88%)
+        "heterograph_errors": 0.3,          # SPELL 과다 방지 (hit rate 94%)
+        "word_substitution": 1.5,           # PRO_NOUN 10.6% 목표
+        "semantic_errors": 2.5,             # PRO_NOUN 주력 (hit rate 91%)
+        "grammar_remove": 2.5,              # DEL 10.6% 목표
+        "grammar_addition": 1.0,            # INS 6.4% 목표
+        "suffix_errors": 4.0,              # END 4.3% 목표 (hit rate 19% → 높은 가중치 필요)
+        "particle_errors": 0.5,             # PART 2.1% 목표 (초과 방지)
+        "number_errors": 0.5,
+        "jamo_separation": 0.1,             # SPELL 과다 방지
+        "phoneme_errors": 0.1,              # SPELL 과다 방지 (hit rate 98%)
+        "foreign_word_errors": 0.3,
+        "typing_language_errors": 0.1,      # SPELL 과다 방지 (hit rate 95%)
+        "word_order_errors": 0.3,
+        "saisiot_errors": 0.2,
+        "double_expression": 0.2,
+        "foreign_style": 0.4,              # MODIFIER 1.1% 목표
+        "misc_errors": 0.2,
+        "chat_style_errors": 0.2,
+        "honorific_errors": 0.2,
+    },
+}
+
+
 # ── 노이즈 설정 ──────────────────────────────────────────────────────
 
 @dataclass
@@ -201,6 +267,9 @@ class NoiseConfig:
     # 한국어 error_generation 모듈별 가중치 (0 = 비활성화, 기본값 = 코드 하드코딩 값)
     # 빈 dict({}) 이면 ERROR_GENERATORS의 기본 가중치를 그대로 사용
     korean_error_weights: dict = None  # type: ignore
+
+    # 가중치 프리셋 ("default" | "realistic")
+    weight_preset: str = "default"
 
     def __post_init__(self):
         if self.korean_error_weights is None:
@@ -534,9 +603,15 @@ class DenoisingNoiser:
         if use_korean_errors:
             try:
                 from error_generation import KoreanErrorGenerator
+                # 프리셋 → korean_error_weights 병합 (명시적 override가 우선)
+                if self.cfg.weight_preset != "default" and self.cfg.weight_preset in WEIGHT_PRESETS:
+                    preset_weights = WEIGHT_PRESETS[self.cfg.weight_preset]
+                    merged = {**preset_weights, **(self.cfg.korean_error_weights or {})}
+                else:
+                    merged = self.cfg.korean_error_weights or {}
                 self._error_gen = KoreanErrorGenerator(
                     seed=seed,
-                    weights_override=self.cfg.korean_error_weights or {},
+                    weights_override=merged,
                 )
             except ImportError:
                 pass

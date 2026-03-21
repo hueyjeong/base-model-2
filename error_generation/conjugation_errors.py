@@ -1,7 +1,11 @@
 """
 활용형 오류 — 용언 활용에서 발생하는 오류들.
 
--든/-던, -되/-돼, ㅡ탈락, 모음조화, ㅂ불규칙, 관형사형 등.
+두 가지 모드:
+1. 패턴 기반: -든/-던, -되/-돼, ㅡ탈락, 모음조화 등 고정 패턴
+2. 동적 생성: MeCab 형태소 분석 기반 어미 교체
+
+동적 규칙: -았/-었 혼동, -는/-은 관형사형 혼동, -아/-어 혼동 등.
 """
 
 import random
@@ -93,9 +97,90 @@ OTHER_CONJUGATION: dict[str, list[str]] = {
 
 import re
 
+# ── 동적 어미 교체 규칙 ──
+
+# 어미(E*) 토큰 전체 매칭 규칙 — surface 전체를 교체
+_EOMI_SWAP_RULES: dict[str, list[str]] = {
+    # 시제/상 혼동
+    "었": ["았"],           # 과거 모음조화 혼동
+    "았": ["었"],
+    # 관형사형 혼동
+    "는": ["은"],           # 현재/과거 관형사형
+    "은": ["는"],
+    "던": ["든"],           # 회상/선택 혼동
+    "든": ["던"],
+    # 연결어미 혼동
+    "어": ["아"],           # 모음조화
+    "아": ["어"],
+    "며": ["고"],           # 나열 연결어미
+    "고": ["며"],
+    "지만": ["는데"],       # 대조 연결어미
+    "면": ["며"],           # 조건 → 나열 혼동
+    "면서": ["며"],         # 동시 → 나열 혼동
+    "게": ["도록"],         # 결과/목적 혼동
+    "도록": ["게"],
+    # 종결어미 혼동
+    "다": ["다고"],         # 평서 → 인용 (한 글자 추가)
+    "다고": ["다"],         # 인용 → 평서 (한 글자 제거)
+}
+
+# V*/XS* 토큰 접미 매칭 규칙 — surface 끝에서 매칭 (surface > pattern 길이)
+_VERB_SUFFIX_RULES: list[tuple[str, str]] = [
+    ("았다", "었다"),
+    ("었다", "았다"),
+    ("았어", "었어"),
+    ("었어", "았어"),
+    ("았는데", "었는데"),
+    ("었는데", "았는데"),
+    ("아서", "어서"),
+    ("어서", "아서"),
+    ("아요", "어요"),
+    ("어요", "아요"),
+]
+
+
+def _dynamic_conjugation_error(text: str, rng: random.Random) -> Optional[str]:
+    """MeCab 기반 동적 활용형 오류 생성.
+
+    두 가지 전략:
+    1. 어미(E*) 토큰 직접 교체 — 독립 어미 토큰의 surface 전체를 스왑
+    2. 동사(V*/XS*) 토큰 접미 교체 — 어절 끝의 활용형 변환
+    """
+    try:
+        from error_generation.utils import get_mecab_offsets
+        tokens = get_mecab_offsets(text)
+    except Exception:
+        return None
+
+    candidates = []
+
+    for t in tokens:
+        # 전략 1: 어미(E*) 토큰 전체 매칭
+        if t.pos.startswith('E') and t.surface in _EOMI_SWAP_RULES:
+            for replacement in _EOMI_SWAP_RULES[t.surface]:
+                candidates.append((t.start, t.end, replacement))
+
+        # 전략 2: 동사/접미사 토큰 접미 매칭
+        if t.pos.startswith(('V', 'XS')):
+            for pattern, replacement in _VERB_SUFFIX_RULES:
+                if t.surface.endswith(pattern) and len(t.surface) > len(pattern):
+                    new_surface = t.surface[:-len(pattern)] + replacement
+                    if new_surface != t.surface:
+                        candidates.append((t.start, t.end, new_surface))
+
+    if not candidates:
+        return None
+
+    start, end, new_surface = rng.choice(candidates)
+    return text[:start] + new_surface + text[end:]
+
+
 def apply_conjugation_error(text: str, rng: random.Random) -> Optional[str]:
     """
     텍스트에 활용형 오류를 적용.
+
+    1단계: 패턴 기반 매칭 시도.
+    2단계: 실패 시 동적 생성 (MeCab 기반 어미 교체).
 
     Args:
         text: 올바른 한국어 문장
@@ -110,6 +195,7 @@ def apply_conjugation_error(text: str, rng: random.Random) -> Optional[str]:
         NOLLADA_MAP, OTHER_CONJUGATION,
     ]
 
+    # 1. 패턴 기반
     candidates = []
     for m in all_maps:
         for correct, wrongs in m.items():
@@ -118,11 +204,12 @@ def apply_conjugation_error(text: str, rng: random.Random) -> Optional[str]:
                     for wrong in wrongs:
                         candidates.append((match.start(), match.end(), wrong))
 
-    if not candidates:
-        return None
+    if candidates:
+        start, end, wrong = rng.choice(candidates)
+        return text[:start] + wrong + text[end:]
 
-    start, end, wrong = rng.choice(candidates)
-    return text[:start] + wrong + text[end:]
+    # 2. 동적 생성
+    return _dynamic_conjugation_error(text, rng)
 
 
 def get_error_count() -> int:

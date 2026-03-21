@@ -47,9 +47,66 @@ OTHER_PARTICLE_MAP: dict[str, list[str]] = {
 
 import re
 
+# ── 동적 조사 교체 규칙 ──
+# (조사, 대체 조사) — MeCab 조사(J*) 토큰에서 매칭
+_DYNAMIC_JOSA_RULES: list[tuple[str, str]] = [
+    # 주격 조사 자음/모음 뒤 혼동
+    ("이", "가"),
+    ("가", "이"),
+    # 목적격 조사 자음/모음 뒤 혼동
+    ("을", "를"),
+    ("를", "을"),
+    # 보조사 혼동
+    ("은", "는"),
+    ("는", "은"),
+    # 장소 조사 혼동
+    ("에서", "에"),
+    ("에", "에서"),
+    # 방향 조사 혼동
+    ("으로", "로"),
+    ("로", "으로"),
+    # 인용 조사 혼동
+    ("라고", "다고"),
+    ("이라고", "이다고"),
+    # 도구/자격 혼동
+    ("로서", "로써"),
+    ("로써", "로서"),
+]
+
+
+def _dynamic_particle_error(text: str, rng: random.Random) -> Optional[str]:
+    """MeCab 기반 동적 조사 교체."""
+    try:
+        from error_generation.utils import get_mecab_offsets
+        tokens = get_mecab_offsets(text)
+    except Exception:
+        return None
+
+    # 조사 토큰 찾기 (J로 시작하는 POS)
+    josa_tokens = [t for t in tokens if t.pos.startswith('J')]
+    if not josa_tokens:
+        return None
+
+    # 교체 가능한 후보 수집
+    candidates = []
+    for t in josa_tokens:
+        for pattern, replacement in _DYNAMIC_JOSA_RULES:
+            if t.surface == pattern:
+                candidates.append((t.start, t.end, replacement))
+
+    if not candidates:
+        return None
+
+    start, end, replacement = rng.choice(candidates)
+    return text[:start] + replacement + text[end:]
+
+
 def apply_particle_error(text: str, rng: random.Random) -> Optional[str]:
     """
     텍스트에 조사 오류를 적용.
+
+    1단계: 패턴 기반 매칭 시도.
+    2단계: 실패 시 MeCab 기반 동적 조사 교체.
 
     Args:
         text: 올바른 한국어 문장
@@ -60,6 +117,7 @@ def apply_particle_error(text: str, rng: random.Random) -> Optional[str]:
     """
     all_maps = [ROSEO_ROSSEO_MAP, E_UI_MAP, OTHER_PARTICLE_MAP]
 
+    # 1. 패턴 기반
     candidates = []
     for m in all_maps:
         for correct, wrongs in m.items():
@@ -68,11 +126,12 @@ def apply_particle_error(text: str, rng: random.Random) -> Optional[str]:
                     for wrong in wrongs:
                         candidates.append((match.start(), match.end(), wrong))
 
-    if not candidates:
-        return None
+    if candidates:
+        start, end, wrong = rng.choice(candidates)
+        return text[:start] + wrong + text[end:]
 
-    start, end, wrong = rng.choice(candidates)
-    return text[:start] + wrong + text[end:]
+    # 2. 동적 생성
+    return _dynamic_particle_error(text, rng)
 
 
 def get_error_count() -> int:

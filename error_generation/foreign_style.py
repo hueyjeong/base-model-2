@@ -48,9 +48,70 @@ FOREIGN_WORD_MAP: dict[str, list[str]] = {
 
 import re
 
+# ── 동적 수식어 오류 규칙 ──
+
+# 관형사(MM) / 관형형 어미(ETM) 앞뒤에 번역투 삽입
+_MODIFIER_INSERTIONS = [
+    "적인 ",       # ~적인 (번역투)
+    "에 있어서 ",   # ~에 있어서 (번역투)
+    "에 대한 ",     # ~에 대한 (번역투)
+]
+
+# 관형사/부사 교체 규칙 (surface → 혼동형)
+_MODIFIER_SWAPS: dict[str, str] = {
+    "다른": "틀린",
+    "틀린": "다른",
+    "이런": "이러한",
+    "이러한": "이런",
+    "그런": "그러한",
+    "그러한": "그런",
+    "저런": "저러한",
+    "저러한": "저런",
+    "새로운": "새로",
+    "같은": "같이",
+    "많은": "많이",
+    "여러": "다양한",
+    "모든": "전부의",
+}
+
+
+def _dynamic_foreign_style(text: str, rng: random.Random) -> Optional[str]:
+    """동적 수식어/번역투 오류 생성."""
+    try:
+        from error_generation.utils import get_mecab_offsets
+        tokens = get_mecab_offsets(text)
+    except Exception:
+        return None
+
+    candidates = []
+
+    for t in tokens:
+        # 관형사(MM) 교체
+        if t.pos == 'MM' and t.surface in _MODIFIER_SWAPS:
+            candidates.append((t.start, t.end, _MODIFIER_SWAPS[t.surface]))
+
+        # 관형형 어미(ETM) 뒤에 번역투 삽입
+        if t.pos == 'ETM' and rng.random() < 0.3:
+            insertion = rng.choice(_MODIFIER_INSERTIONS)
+            candidates.append((t.end, t.end, insertion))
+
+        # 명사 앞에 "~적인" 삽입 (번역투)
+        if t.pos.startswith('NN') and len(t.surface) >= 2 and rng.random() < 0.1:
+            candidates.append((t.start, t.start, "다양한 "))
+
+    if not candidates:
+        return None
+
+    start, end, replacement = rng.choice(candidates)
+    return text[:start] + replacement + text[end:]
+
+
 def apply_foreign_style(text: str, rng: random.Random) -> Optional[str]:
     """
-    텍스트에 번역체/외래어 오류를 적용.
+    텍스트에 번역체/수식어 오류를 적용.
+
+    1단계: 패턴 기반 번역투 매칭.
+    2단계: MeCab 기반 동적 수식어 교체/삽입.
 
     Args:
         text: 올바른 한국어 문장
@@ -61,6 +122,7 @@ def apply_foreign_style(text: str, rng: random.Random) -> Optional[str]:
     """
     all_maps = [ENGLISH_STYLE_MAP, JAPANESE_STYLE_MAP, FOREIGN_WORD_MAP]
 
+    # 1. 패턴 기반
     candidates = []
     for m in all_maps:
         for correct, wrongs in m.items():
@@ -69,11 +131,12 @@ def apply_foreign_style(text: str, rng: random.Random) -> Optional[str]:
                     for wrong in wrongs:
                         candidates.append((match.start(), match.end(), wrong))
 
-    if not candidates:
-        return None
+    if candidates:
+        start, end, wrong = rng.choice(candidates)
+        return text[:start] + wrong + text[end:]
 
-    start, end, wrong = rng.choice(candidates)
-    return text[:start] + wrong + text[end:]
+    # 2. 동적 생성
+    return _dynamic_foreign_style(text, rng)
 
 
 def get_error_count() -> int:

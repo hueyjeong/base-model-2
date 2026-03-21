@@ -17,7 +17,8 @@ def get_tagger() -> MeCab.Tagger:
     if _TAGGER is None:
         try:
             import mecab_ko_dic
-            dicdir = mecab_ko_dic.DICDIR
+            # python-mecab-ko-dic >= 2.x 는 DICDIR 대신 dictionary_path 사용
+            dicdir = getattr(mecab_ko_dic, "DICDIR", None) or str(mecab_ko_dic.dictionary_path)
             _TAGGER = MeCab.Tagger(f"-r /dev/null -d {dicdir}")
         except ImportError:
             # mecab-ko-dic이 없는 경우 시스템 기본값 사용 시도

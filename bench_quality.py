@@ -38,6 +38,7 @@ def bench_quality_one(
     mixing_type: str, d_model: int, corpus: str, text_key: str,
     max_steps: int, log_interval: int, seq_len: int, batch_size: int,
     use_bf16: bool, target_params: int, grad_accum: int = 1,
+    noise_preset: str = "default",
     **config_overrides,
 ):
     """단일 아키텍처 오버핏 테스트
@@ -66,7 +67,10 @@ def bench_quality_one(
     criterion = nn.CrossEntropyLoss(ignore_index=-100, weight=tag_weights)
 
     # 노이즈 (토큰 레벨 비활성)
-    noise_cfg = NoiseConfig(token_mask_ratio=0.0, token_delete_ratio=0.0, text_infill_ratio=0.0)
+    noise_cfg = NoiseConfig(
+        token_mask_ratio=0.0, token_delete_ratio=0.0, text_infill_ratio=0.0,
+        weight_preset=noise_preset,
+    )
     noiser = DenoisingNoiser(tokenizer, noise_cfg, seed=42, use_korean_errors=True)
 
     dataset = EditorDataset(
@@ -172,6 +176,9 @@ def main():
     parser.add_argument("--n_layers", type=int, default=None,
                         help="레이어 수 직접 지정 (미지정 시 target_params로 자동 계산)")
     parser.add_argument("--mixing_types", nargs="+", default=MIXING_TYPES)
+    parser.add_argument("--noise_preset", type=str, default="default",
+                        choices=["default", "realistic"],
+                        help="한국어 오류 가중치 프리셋 (default | realistic)")
     args = parser.parse_args()
 
     eff_batch = args.batch_size * args.grad_accum
@@ -192,6 +199,7 @@ def main():
                 mt, args.d_model, args.corpus, args.text_key,
                 args.max_steps, args.log_interval, args.seq_len, args.batch_size,
                 args.bf16, args.target_params, grad_accum=args.grad_accum,
+                noise_preset=args.noise_preset,
                 **overrides,
             )
             all_results[mt] = r

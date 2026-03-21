@@ -299,9 +299,10 @@ def train(args):
         text_infill_ratio=0.0,
         korean_error_prob=args.error_prob,
         korean_error_count=args.error_count,
+        weight_preset=args.noise_preset,
     )
     if global_rank == 0:
-        print(f"  noise: error_prob={args.error_prob}, error_count={args.error_count}")
+        print(f"  noise: error_prob={args.error_prob}, error_count={args.error_count}, preset={args.noise_preset}")
     noiser = DenoisingNoiser(
         tokenizer, noise_cfg,
         seed=args.seed + global_rank,
@@ -862,6 +863,9 @@ def main():
                         help="한국어 오류 주입 확률 (NoiseConfig.korean_error_prob)")
     parser.add_argument("--error_count", type=int, default=3,
                         help="오류 주입 시 오류 수 (NoiseConfig.korean_error_count)")
+    parser.add_argument("--noise_preset", type=str, default="default",
+                        choices=["default", "realistic"],
+                        help="한국어 오류 가중치 프리셋 (default | realistic)")
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=42)
 

@@ -11,7 +11,7 @@ import os
 # 프로젝트 루트를 sys.path에 추가
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from error_generation import KoreanErrorGenerator
+from error_generation import KoreanErrorGenerator, _HAS_G2PK
 
 
 def test_module_stats():
@@ -49,7 +49,12 @@ def test_individual_modules():
         ("jamo_separation",      "안녕"),
         ("punctuation_errors",   "안녕!"),
         ("honorific_errors",     "제가 했습니다."),
+        ("heterograph_errors",   "예상하지 못했거든요"),
     ]
+
+    # g2pk 설치 시 추가 테스트
+    if _HAS_G2PK:
+        test_cases.append(("g2pk_pronunciation", "독립문에서 밥을 먹었다"))
 
     print("=== 개별 모듈 테스트 ===")
     passed = 0
@@ -157,7 +162,9 @@ def test_error_types_list():
         print(f"  - {t}")
     print(f"  총 {len(types)}개 유형")
     print()
-    return len(types) == 16
+    # g2pk 유무에 따라 유형 수 변동 (기존 25 + heterograph + g2pk)
+    expected = 27 if _HAS_G2PK else 26
+    return len(types) == expected
 
 
 def main():

@@ -88,9 +88,58 @@ TTURIDA_MAP: dict[str, list[str]] = {
 
 import re
 
+
+def _dynamic_suffix_error(text: str, rng: random.Random) -> Optional[str]:
+    """MeCab 기반 동적 접미사 오류 생성.
+
+    부사(MAG) 중 -이/-히로 끝나는 것을 교체.
+    또한 -려고/-ㄹ려고 혼동을 동사 어미에서 동적 적용.
+    """
+    try:
+        from error_generation.utils import get_mecab_offsets
+        tokens = get_mecab_offsets(text)
+    except Exception:
+        return None
+
+    candidates = []
+
+    for t in tokens:
+        # -이/-히 혼동 (부사)
+        if t.pos == 'MAG':
+            if t.surface.endswith('이') and len(t.surface) >= 2:
+                new = t.surface[:-1] + '히'
+                candidates.append((t.start, t.end, new))
+            elif t.surface.endswith('히') and len(t.surface) >= 2:
+                new = t.surface[:-1] + '이'
+                candidates.append((t.start, t.end, new))
+
+        # -려고 → -ㄹ려고 혼동 (연결어미)
+        if t.pos.startswith('E') and t.surface == '려고':
+            candidates.append((t.start, t.end, 'ㄹ려고'))
+        elif t.pos.startswith('E') and t.surface == '려면':
+            candidates.append((t.start, t.end, 'ㄹ려면'))
+
+        # -ㄹ게 → -ㄹ께 혼동
+        if t.surface.endswith('게') and t.pos.startswith('E'):
+            new = t.surface[:-1] + '께'
+            candidates.append((t.start, t.end, new))
+        elif t.surface.endswith('걸') and t.pos.startswith('E'):
+            new = t.surface[:-1] + '껄'
+            candidates.append((t.start, t.end, new))
+
+    if not candidates:
+        return None
+
+    start, end, new = rng.choice(candidates)
+    return text[:start] + new + text[end:]
+
+
 def apply_suffix_error(text: str, rng: random.Random) -> Optional[str]:
     """
     텍스트에 접미사 오류를 적용.
+
+    1단계: 패턴 기반 매칭 시도.
+    2단계: 실패 시 MeCab 기반 동적 접미사 교체.
 
     Args:
         text: 올바른 한국어 문장
@@ -105,6 +154,7 @@ def apply_suffix_error(text: str, rng: random.Random) -> Optional[str]:
         GEOL_GE_MAP, TTURIDA_MAP,
     ]
 
+    # 1. 패턴 기반
     candidates = []
     for m in all_maps:
         for correct, wrongs in m.items():
@@ -113,11 +163,12 @@ def apply_suffix_error(text: str, rng: random.Random) -> Optional[str]:
                     for wrong in wrongs:
                         candidates.append((match.start(), match.end(), wrong))
 
-    if not candidates:
-        return None
+    if candidates:
+        start, end, wrong = rng.choice(candidates)
+        return text[:start] + wrong + text[end:]
 
-    start, end, wrong = rng.choice(candidates)
-    return text[:start] + wrong + text[end:]
+    # 2. 동적 생성
+    return _dynamic_suffix_error(text, rng)
 
 
 def get_error_count() -> int:

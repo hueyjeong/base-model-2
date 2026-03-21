@@ -1,10 +1,13 @@
 """
 띄어쓰기 오류 — 붙여 써야 할 것을 띄어 쓰거나, 그 반대.
 
-보조사, 접미사, 의존명사 등의 띄어쓰기 혼동을 다룸.
+두 가지 모드:
+1. 패턴 기반: 보조사, 접미사, 의존명사 등의 고정 패턴 매칭
+2. 동적 생성: MeCab 형태소 분석 기반 어절 합치기/쪼개기/의존명사 결합
 """
 
 import random
+import re
 from typing import Optional
 
 
@@ -68,9 +71,80 @@ DATE_SPACING: list[tuple[str, str]] = [
 ]
 
 
+def _dynamic_spacing_error(text: str, rng: random.Random) -> Optional[str]:
+    """동적 띄어쓰기 오류 생성 — 패턴 매칭 실패 시 fallback.
+
+    세 가지 전략을 랜덤 선택:
+    a) 어절 합치기: 인접 어절 2개를 붙임 (가장 흔한 띄어쓰기 오류)
+    b) 어절 내부 쪼개기: MeCab 형태소 경계에서 공백 삽입
+    c) 의존명사 결합: 의존명사 앞 공백 제거 ("할 수" → "할수")
+    """
+    words = text.split()
+    if len(words) < 2:
+        return None
+
+    strategy = rng.choice(["join", "join", "split", "dep_noun"])  # join 빈도 2배
+
+    if strategy == "join":
+        # 어절 합치기: 랜덤 위치에서 인접 어절 결합
+        idx = rng.randrange(len(words) - 1)
+        merged = list(words)
+        merged[idx] = merged[idx] + merged.pop(idx + 1)
+        return " ".join(merged)
+
+    elif strategy == "split":
+        # 어절 내부 쪼개기: MeCab 형태소 경계에서 공백 삽입
+        try:
+            from error_generation.utils import get_mecab_offsets
+            tokens = get_mecab_offsets(text)
+        except Exception:
+            return None
+
+        # 같은 어절 내 인접 형태소 경계 찾기
+        split_candidates = []
+        for i in range(len(tokens) - 1):
+            t1, t2 = tokens[i], tokens[i + 1]
+            # 공백 없이 붙어있는 형태소 쌍 (같은 어절)
+            if t1.end == t2.start and len(t1.surface) > 0 and len(t2.surface) > 0:
+                # 명사+조사 또는 어간+어미 경계
+                if (t1.pos.startswith('N') and t2.pos.startswith('J')) or \
+                   (t1.pos.startswith('V') and t2.pos.startswith('E')):
+                    split_candidates.append(t1.end)
+
+        if not split_candidates:
+            return None
+
+        pos = rng.choice(split_candidates)
+        return text[:pos] + " " + text[pos:]
+
+    elif strategy == "dep_noun":
+        # 의존명사(NNB) 앞 공백 제거: "할 수" → "할수"
+        try:
+            from error_generation.utils import get_mecab_offsets
+            tokens = get_mecab_offsets(text)
+        except Exception:
+            return None
+
+        dep_noun_candidates = []
+        for i, t in enumerate(tokens):
+            if t.pos == 'NNB' and t.start > 0 and text[t.start - 1] == ' ':
+                dep_noun_candidates.append(t.start - 1)
+
+        if not dep_noun_candidates:
+            return None
+
+        pos = rng.choice(dep_noun_candidates)
+        return text[:pos] + text[pos + 1:]
+
+    return None
+
+
 def apply_spacing_error(text: str, rng: random.Random) -> Optional[str]:
     """
     텍스트에 띄어쓰기 오류를 적용.
+
+    1단계: 패턴 기반 매칭 시도.
+    2단계: 실패 시 동적 생성 (어절 합치기/쪼개기/의존명사 결합).
 
     Args:
         text: 올바른 한국어 문장
@@ -79,14 +153,25 @@ def apply_spacing_error(text: str, rng: random.Random) -> Optional[str]:
     Returns:
         오류가 적용된 문장. 적용 가능한 패턴이 없으면 None.
     """
+    # 1. 패턴 기반 (30% 확률로 우선 시도)
     all_patterns = JOIN_TO_SPLIT + SPLIT_TO_JOIN + DEPENDENT_NOUN_SPACING + DATE_SPACING
     candidates = [(correct, wrong) for correct, wrong in all_patterns if correct in text]
 
-    if not candidates:
-        return None
+    if candidates and rng.random() < 0.3:
+        correct, wrong = rng.choice(candidates)
+        return text.replace(correct, wrong, 1)
 
-    correct, wrong = rng.choice(candidates)
-    return text.replace(correct, wrong, 1)
+    # 2. 동적 생성
+    result = _dynamic_spacing_error(text, rng)
+    if result is not None:
+        return result
+
+    # 3. 패턴 기반 fallback
+    if candidates:
+        correct, wrong = rng.choice(candidates)
+        return text.replace(correct, wrong, 1)
+
+    return None
 
 
 def get_error_count() -> int:

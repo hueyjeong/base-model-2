@@ -42,6 +42,14 @@ from error_generation.phoneme_errors import apply_phoneme_error
 from error_generation.word_order_errors import apply_word_order_error
 from error_generation.tense_errors import apply_tense_error
 from error_generation.semantic_errors import apply_semantic_error
+from error_generation.heterograph import apply_heterograph_error
+
+# g2pk 기반 발음→철자 노이즈 (g2pk 미설치 시 비활성)
+try:
+    from error_generation.g2pk_noise import apply_g2pk_error
+    _HAS_G2PK = True
+except ImportError:
+    _HAS_G2PK = False
 
 from error_generation import common_misspellings
 from error_generation import spacing_errors
@@ -67,6 +75,9 @@ from error_generation import phoneme_errors
 from error_generation import word_order_errors
 from error_generation import tense_errors
 from error_generation import semantic_errors
+from error_generation import heterograph
+if _HAS_G2PK:
+    from error_generation import g2pk_noise
 
 
 # 오류 생성 함수 목록과 가중치
@@ -94,8 +105,9 @@ ERROR_GENERATORS: list[tuple[str, ErrorFn, float]] = [
     ("word_substitution",    apply_word_substitution,  0.5),
     ("jamo_separation",      apply_jamo_separation,    0.5),
     
-    # D-3. 발음/외래어 오류 (10%)
+    # D-3. 발음/외래어/이형문자 오류 (10%)
     ("phoneme_errors",       apply_phoneme_error,      1.0),
+    ("heterograph_errors",   apply_heterograph_error,  1.5),
     ("foreign_word_errors",  apply_foreign_word_error, 1.0),
     
     # D-4. 타이핑 언어 오류 (5%)
@@ -120,6 +132,11 @@ ERROR_GENERATORS: list[tuple[str, ErrorFn, float]] = [
     ("honorific_errors",     apply_honorific_error,    0.5),
 ]
 
+# g2pk 설치 시 발음→철자 노이즈 추가 (phoneme_errors 다음 위치)
+if _HAS_G2PK:
+    _g2pk_idx = next(i for i, (n, _, _) in enumerate(ERROR_GENERATORS) if n == "phoneme_errors") + 1
+    ERROR_GENERATORS.insert(_g2pk_idx, ("g2pk_pronunciation", apply_g2pk_error, 2.0))
+
 # 모든 모듈 목록 (패턴 수 집계용)
 ALL_MODULES = [
     common_misspellings, spacing_errors, vowel_confusion,
@@ -129,8 +146,11 @@ ALL_MODULES = [
     chat_style_errors, jamo_separation, punctuation_errors,
     honorific_errors, number_errors, grammar_structure_errors,
     typing_language_errors, foreign_word_errors, phoneme_errors,
-    word_order_errors, tense_errors, semantic_errors
+    word_order_errors, tense_errors, semantic_errors,
+    heterograph,
 ]
+if _HAS_G2PK:
+    ALL_MODULES.append(g2pk_noise)
 
 
 class KoreanErrorGenerator:
