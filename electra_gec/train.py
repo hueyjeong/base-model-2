@@ -186,6 +186,14 @@ def train(args):
     if is_main:
         print(f"  총 파라미터: {total_params:,}")
 
+    # torch.compile — raw_model은 원본 유지, compiled는 forward용
+    if args.compile:
+        if is_main:
+            print(f"  torch.compile (mode={args.compile_mode})...")
+        compiled_model = torch.compile(raw_model, mode=args.compile_mode)
+    else:
+        compiled_model = raw_model
+
     # ── 노이즈 ──
     # DDP: rank 0이 먼저 noiser 초기화 (nltk/g2pk 코퍼스 다운로드 race condition 방지)
     from keyboard_tokenizer.keyboard_wrapper import KeyboardTokenizer
@@ -341,10 +349,10 @@ def train(args):
         if is_ddp:
             if ddp_model is not None:
                 del ddp_model
-            ddp_model = DDP(raw_model, device_ids=[local_rank], gradient_as_bucket_view=True)
-            model = ddp_model
+            ddp_model = DDP(compiled_model, device_ids=[local_rank], gradient_as_bucket_view=True)
+            train_model = ddp_model
         else:
-            model = raw_model
+            train_model = compiled_model
         optimizer = torch.optim.AdamW(
             trainable, lr=stage["lr"],
             betas=(0.9, 0.999), weight_decay=0.01,
@@ -403,7 +411,7 @@ def train(args):
                 content_tags = batch["content_tags"].to(device)
 
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
-                    act_logits, cont_logits = model(input_ids, attn_mask)
+                    act_logits, cont_logits = train_model(input_ids, attn_mask)
                     V = cont_logits.size(-1)
                     act_loss = act_criterion(act_logits.view(-1, 4), action_tags.view(-1))
                     cont_loss = cont_criterion(cont_logits.view(-1, V), content_tags.view(-1))
@@ -575,6 +583,8 @@ def main():
     p.add_argument("--val_batches", type=int, default=50)
     p.add_argument("--bf16", action="store_true", default=True, help="BF16 AMP (기본 활성)")
     p.add_argument("--no_bf16", dest="bf16", action="store_false")
+    p.add_argument("--compile", action="store_true", help="torch.compile 적용")
+    p.add_argument("--compile_mode", default="reduce-overhead", choices=["default", "reduce-overhead", "max-autotune"])
     p.add_argument("--resume", default=None, help="체크포인트 경로 또는 디렉토리")
     p.add_argument("--save_interval", type=int, default=0, help="step 단위 체크포인트 주기 (0=에포크만)")
     p.add_argument("--gdrive_remote", default=None, help="rclone 대상 (예: 'gdrive:electra-gec-ckpts/')")
