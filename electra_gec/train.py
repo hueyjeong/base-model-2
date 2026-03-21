@@ -64,6 +64,35 @@ def compute_f(p: float, r: float, beta: float = 0.5) -> float:
     return (1 + b2) * p * r / (b2 * p + r)
 
 
+class GPUPrefetcher:
+    """다음 배치를 별도 CUDA stream에서 미리 GPU로 전송"""
+
+    def __init__(self, loader, device):
+        self.loader = loader
+        self.device = device
+        self.stream = torch.cuda.Stream(device=device)
+
+    def __iter__(self):
+        self._iter = iter(self.loader)
+        self._prefetch()
+        while self._next is not None:
+            batch = self._next
+            torch.cuda.current_stream(self.device).wait_stream(self.stream)
+            self._prefetch()
+            yield batch
+
+    def _prefetch(self):
+        try:
+            batch = next(self._iter)
+            with torch.cuda.stream(self.stream):
+                self._next = {
+                    k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+                    for k, v in batch.items()
+                }
+        except StopIteration:
+            self._next = None
+
+
 def collate_dynamic_pad(batch: list[dict]) -> dict:
     """배치 내 최대 길이로 동적 패딩"""
     max_len = max(b["attention_mask"].sum().item() for b in batch)
@@ -196,15 +225,11 @@ def train(args):
     # torch.compile — raw_model은 원본 유지, compiled는 forward용
     if args.compile:
         mode = args.compile_mode
-        # grad accum > 1이면 CUDA graph 비활성 (micro step 간 텐서 덮어쓰기 충돌)
-        if args.grad_accum_steps > 1:
-            torch._inductor.config.triton.cudagraphs = False
-            torch._inductor.config.triton.cudagraph_trees = False
-            # max-autotune에서 CUDA graph 강제 비활성 → default로 전환
-            if mode in ("reduce-overhead", "max-autotune"):
-                mode = "max-autotune-no-cudagraphs"
+        # grad accum > 1이면 CUDA graph 사용 모드 차단
+        if args.grad_accum_steps > 1 and mode in ("reduce-overhead", "max-autotune"):
+            mode = "default"
             if is_main:
-                print(f"  torch.compile (mode={mode}, grad_accum={args.grad_accum_steps})")
+                print(f"  torch.compile (mode=default — grad_accum={args.grad_accum_steps}, CUDA graph 비호환)")
         else:
             if is_main:
                 print(f"  torch.compile (mode={mode})")
@@ -249,7 +274,7 @@ def train(args):
         train_dataset, batch_size=args.batch_size,
         num_workers=args.num_workers, pin_memory=True, drop_last=True,
         collate_fn=collate_dynamic_pad,
-        prefetch_factor=4 if args.num_workers > 0 else None,
+        prefetch_factor=8 if args.num_workers > 0 else None,
         persistent_workers=args.num_workers > 0,
     )
 
@@ -269,7 +294,7 @@ def train(args):
             val_dataset, batch_size=args.batch_size,
             num_workers=max(args.num_workers, 1), pin_memory=True, drop_last=True,
             collate_fn=collate_dynamic_pad,
-            prefetch_factor=4, persistent_workers=True,
+            prefetch_factor=8, persistent_workers=True,
         )
         if is_main:
             print(f"  검증: {args.val_corpus}")
@@ -428,13 +453,14 @@ def train(args):
             _acc_cont = 0.0
             _acc_tok = 0
 
-            for batch in train_loader:
+            prefetcher = GPUPrefetcher(train_loader, device)
+            for batch in prefetcher:
                 micro_step += 1
 
-                input_ids = batch["input_ids"].to(device)
-                attn_mask = batch["attention_mask"].to(device)
-                action_tags = batch["action_tags"].to(device)
-                content_tags = batch["content_tags"].to(device)
+                input_ids = batch["input_ids"]
+                attn_mask = batch["attention_mask"]
+                action_tags = batch["action_tags"]
+                content_tags = batch["content_tags"]
 
                 # DDP: 마지막 micro step에서만 grad sync (나머지는 no_sync)
                 no_sync = is_ddp and (micro_step % accum != 0)
@@ -630,7 +656,7 @@ def main():
     p.add_argument("--error_prob", type=float, default=0.5)
     p.add_argument("--error_count", type=int, default=3)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--num_workers", type=int, default=2)
+    p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--log_interval", type=int, default=100)
     p.add_argument("--val_every", type=int, default=500)
     p.add_argument("--val_steps", type=int, default=50)
