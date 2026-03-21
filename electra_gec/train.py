@@ -324,7 +324,8 @@ def train(args):
 
     # ── DDP 래핑 ──
     if is_ddp:
-        model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+        # find_unused_parameters 불필요 — frozen params는 requires_grad=False이므로 DDP scope 밖
+        model = DDP(model, device_ids=[local_rank], gradient_as_bucket_view=True)
 
     train_start = time.time()
 
@@ -415,7 +416,7 @@ def train(args):
                 if is_main and global_step % args.log_interval == 0:
                     elapsed = time.time() - train_start
                     ep_elapsed = time.time() - t0
-                    tps = ep_tokens / max(ep_elapsed, 0.001)
+                    tps = ep_tokens * world_size / max(ep_elapsed, 0.001)
                     avg = ep_loss / max(ep_tokens, 1)
                     seq_len = input_ids.size(1)
 
@@ -468,7 +469,7 @@ def train(args):
             if is_main:
                 print(
                     f"\n  Epoch {epoch}/{args.max_epochs}: avg_loss={avg:.4f} | "
-                    f"{fmt_time(dt)} ({ep_tokens:,} tok) | "
+                    f"{fmt_time(dt)} ({ep_tokens * world_size:,} tok) | "
                     f"경과 {fmt_time(total_elapsed)} / 잔여 ~{fmt_time(eta_total)}"
                 )
 
