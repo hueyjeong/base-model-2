@@ -406,6 +406,10 @@ def train(args):
 
             accum = args.grad_accum_steps
             micro_step = 0
+            # micro batch 누적용 버퍼
+            _acc_act = 0.0
+            _acc_cont = 0.0
+            _acc_tok = 0
 
             for batch in train_loader:
                 micro_step += 1
@@ -428,6 +432,11 @@ def train(args):
                         loss = (act_loss + args.content_loss_weight * cont_loss) / accum
                     loss.backward()
 
+                # micro batch 통계 누적 (unscaled)
+                _acc_act += act_loss.item()
+                _acc_cont += cont_loss.item()
+                _acc_tok += (action_tags != IGNORE).sum().item()
+
                 if micro_step % accum != 0:
                     continue  # gradient 누적 중 — optimizer step 건너뜀
 
@@ -436,9 +445,19 @@ def train(args):
                 optimizer.zero_grad()
                 global_step += 1
 
-                n_tok = (action_tags != IGNORE).sum().item() * accum  # 누적된 전체 토큰
-                ep_loss += loss.item() * accum * n_tok / accum  # unscaled loss
-                ep_tokens += n_tok
+                # 누적된 micro batch 평균
+                step_act_loss = _acc_act / accum
+                step_cont_loss = _acc_cont / accum
+                step_loss = step_act_loss + args.content_loss_weight * step_cont_loss
+                step_tok = _acc_tok
+
+                ep_loss += step_loss * step_tok
+                ep_tokens += step_tok
+
+                # 버퍼 리셋
+                _acc_act = 0.0
+                _acc_cont = 0.0
+                _acc_tok = 0
 
                 if is_main and global_step % args.log_interval == 0:
                     elapsed = time.time() - train_start
@@ -459,8 +478,8 @@ def train(args):
 
                     print(
                         f"  [{fmt_time(elapsed)}] ep{epoch}/{args.max_epochs} s{global_step}{progress} | "
-                        f"loss={loss.item():.4f} avg={avg:.4f} | "
-                        f"act={act_loss.item():.4f} cont={cont_loss.item():.4f} | "
+                        f"loss={step_loss:.4f} avg={avg:.4f} | "
+                        f"act={step_act_loss:.4f} cont={step_cont_loss:.4f} | "
                         f"lr={cur_lr:.1e} {tps:.0f} tok/s seq={seq_len}"
                     )
 
