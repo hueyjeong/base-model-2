@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from electra_gec.model import KoELECTRAGECToR, ACTION_KEEP
 from electra_gec.dataset import WordPieceGECDataset, IGNORE
 from training.noising import DenoisingNoiser, NoiseConfig
+from training.upload_gdrive import upload_and_cleanup
 
 
 # ── 유틸 ──
@@ -275,11 +276,14 @@ def train(args):
     if args.resume:
         ckpt_path = args.resume
         if os.path.isdir(ckpt_path):
+            # epoch_*.pt와 step_*.pt 모두 검색, 가장 최근 수정 파일 선택
+            import glob
             candidates = sorted(
-                [f for f in os.listdir(ckpt_path) if f.startswith("epoch_") and f.endswith(".pt")],
-                key=lambda f: int(f.split("_")[1].split(".")[0]),
+                glob.glob(os.path.join(ckpt_path, "epoch_*.pt"))
+                + glob.glob(os.path.join(ckpt_path, "step_*.pt")),
+                key=os.path.getmtime,
             )
-            ckpt_path = os.path.join(ckpt_path, candidates[-1]) if candidates else None
+            ckpt_path = candidates[-1] if candidates else None
 
         if ckpt_path and os.path.exists(ckpt_path):
             ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -289,9 +293,27 @@ def train(args):
             best_val_loss = ckpt.get("best_val_loss", float("inf"))
             no_improve = ckpt.get("no_improve", 0)
             resume_stage = ckpt.get("stage")
+
+            # 데이터셋 + 노이저 RNG 상태 복원
+            data_state = ckpt.get("data_state")
+            if data_state:
+                if "noiser_state" in data_state:
+                    noiser.load_state_dict(data_state["noiser_state"])
+                if "dataset_state" in data_state:
+                    train_dataset.load_state_dict(data_state["dataset_state"])
+
             if is_main:
                 print(f"\n  Resume: {ckpt_path}")
                 print(f"  epoch={start_epoch}, step={global_step}, stage={resume_stage}")
+                if data_state:
+                    print(f"  data state 복원: noiser={'noiser_state' in data_state}, dataset={'dataset_state' in data_state}")
+
+    def _make_data_state():
+        """데이터셋 + 노이저 RNG 상태 스냅샷"""
+        return {
+            "noiser_state": noiser.state_dict(),
+            "dataset_state": train_dataset.state_dict(),
+        }
 
     # ── DDP 래핑 ──
     if is_ddp:
@@ -414,6 +436,22 @@ def train(args):
                             f"P={m['edit_p']:.3f} R={m['edit_r']:.3f} F0.5={m['edit_f05']:.3f}"
                         )
 
+                # step 단위 체크포인트
+                if is_main and args.save_interval and global_step % args.save_interval == 0:
+                    ckpt_path = os.path.join(ckpt_dir, f"step_{global_step}.pt")
+                    torch.save({
+                        "epoch": epoch, "global_step": global_step,
+                        "model_state_dict": raw_model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "stage": stage["name"],
+                        "best_val_loss": best_val_loss,
+                        "no_improve": no_improve,
+                        "data_state": _make_data_state(),
+                    }, ckpt_path)
+                    print(f"  [SAVE] {ckpt_path}")
+                    if args.gdrive_remote:
+                        upload_and_cleanup(ckpt_path, args.log_file, args.gdrive_remote, keep_latest_n=1)
+
             # 에포크 종료
             dt = time.time() - t0
             total_elapsed = time.time() - train_start
@@ -442,6 +480,7 @@ def train(args):
                         best_val_loss = vl
                         no_improve = 0
                         if is_main:
+                            best_path = os.path.join(ckpt_dir, "best.pt")
                             torch.save({
                                 "epoch": epoch, "global_step": global_step,
                                 "model_state_dict": raw_model.state_dict(),
@@ -450,8 +489,11 @@ def train(args):
                                 "stage": stage["name"],
                                 "best_val_loss": best_val_loss,
                                 "no_improve": no_improve,
-                            }, os.path.join(ckpt_dir, "best.pt"))
+                                "data_state": _make_data_state(),
+                            }, best_path)
                             print(f"  -> best 저장 (val_loss={vl:.4f})")
+                            if args.gdrive_remote:
+                                upload_and_cleanup(best_path, args.log_file, args.gdrive_remote, keep_latest_n=1)
                     else:
                         no_improve += 1
                         if no_improve >= args.patience:
@@ -461,6 +503,7 @@ def train(args):
 
             # 에포크 체크포인트
             if is_main:
+                ep_ckpt_path = os.path.join(ckpt_dir, f"epoch_{epoch}.pt")
                 torch.save({
                     "epoch": epoch, "global_step": global_step,
                     "model_state_dict": raw_model.state_dict(),
@@ -468,7 +511,11 @@ def train(args):
                     "stage": stage["name"],
                     "best_val_loss": best_val_loss,
                     "no_improve": no_improve,
-                }, os.path.join(ckpt_dir, f"epoch_{epoch}.pt"))
+                    "data_state": _make_data_state(),
+                }, ep_ckpt_path)
+                print(f"  [SAVE] {ep_ckpt_path}")
+                if args.gdrive_remote:
+                    upload_and_cleanup(ep_ckpt_path, args.log_file, args.gdrive_remote, keep_latest_n=1)
 
             if is_ddp:
                 dist.barrier()
@@ -516,6 +563,9 @@ def main():
     p.add_argument("--bf16", action="store_true", default=True, help="BF16 AMP (기본 활성)")
     p.add_argument("--no_bf16", dest="bf16", action="store_false")
     p.add_argument("--resume", default=None, help="체크포인트 경로 또는 디렉토리")
+    p.add_argument("--save_interval", type=int, default=0, help="step 단위 체크포인트 주기 (0=에포크만)")
+    p.add_argument("--gdrive_remote", default=None, help="rclone 대상 (예: 'gdrive:electra-gec-ckpts/')")
+    p.add_argument("--log_file", default=None, help="동기화할 로그 파일")
     args = p.parse_args()
     train(args)
 

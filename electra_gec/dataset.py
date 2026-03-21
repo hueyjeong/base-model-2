@@ -88,6 +88,24 @@ class WordPieceGECDataset(IterableDataset):
         self._epoch = epoch
         self.rng = random.Random(42 + epoch)
         self._bytes_read = 0
+        self._resume_line = 0
+
+    def state_dict(self) -> dict:
+        """데이터셋 RNG + 진행 상태 직렬화"""
+        return {
+            "rng_state": self.rng.getstate(),
+            "line_counter": self._line_counter,
+            "epoch": self._epoch,
+            "bytes_read": self._bytes_read,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """저장된 상태 복원 — 다음 이터레이션에서 건너뛸 라인 수 설정"""
+        self.rng.setstate(state["rng_state"])
+        self._line_counter = state.get("line_counter", 0)
+        self._resume_line = state.get("line_counter", 0)
+        self._epoch = state.get("epoch", 0)
+        self._bytes_read = state.get("bytes_read", 0)
 
     def _iter_lines(self, skip_worker_id=None, skip_total=None):
         """JSONL/TXT 파일에서 텍스트 스트리밍"""
@@ -170,11 +188,16 @@ class WordPieceGECDataset(IterableDataset):
         global_worker_id = (self.rank * num_workers) + worker_id
 
         pad_id = self.tokenizer.pad_token_id
+        resume_line = getattr(self, "_resume_line", 0)
 
         for text in self._iter_lines(
             skip_worker_id=global_worker_id, skip_total=total_workers
         ):
             self._line_counter += 1
+
+            # Resume: 이미 처리한 라인 건너뛰기 (fast-forward)
+            if self._line_counter <= resume_line:
+                continue
             result = self._tokenize_pair(text)
             if result is None:
                 continue
