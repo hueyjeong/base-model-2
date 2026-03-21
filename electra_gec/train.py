@@ -18,6 +18,7 @@ import math
 import os
 import sys
 import time
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
@@ -333,7 +334,8 @@ def train(args):
     train_start = time.time()
 
     if is_main:
-        print(f"\n학습 시작 (max_epochs={args.max_epochs}, batch={args.batch_size}x{world_size}, seq≤{args.max_seq_len})")
+        eff_batch = args.batch_size * world_size * args.grad_accum_steps
+        print(f"\n학습 시작 (max_epochs={args.max_epochs}, batch={args.batch_size}x{world_size}x{args.grad_accum_steps}={eff_batch}, seq≤{args.max_seq_len})")
         print(f"  α={args.content_loss_weight}, edit_weight={args.edit_loss_weight}")
 
     epoch = 0
@@ -402,28 +404,40 @@ def train(args):
             ep_tokens = 0
             t0 = time.time()
 
+            accum = args.grad_accum_steps
+            micro_step = 0
+
             for batch in train_loader:
-                global_step += 1
+                micro_step += 1
 
                 input_ids = batch["input_ids"].to(device)
                 attn_mask = batch["attention_mask"].to(device)
                 action_tags = batch["action_tags"].to(device)
                 content_tags = batch["content_tags"].to(device)
 
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
-                    act_logits, cont_logits = train_model(input_ids, attn_mask)
-                    V = cont_logits.size(-1)
-                    act_loss = act_criterion(act_logits.view(-1, 4), action_tags.view(-1))
-                    cont_loss = cont_criterion(cont_logits.view(-1, V), content_tags.view(-1))
-                    loss = act_loss + args.content_loss_weight * cont_loss
+                # DDP: 마지막 micro step에서만 grad sync (나머지는 no_sync)
+                no_sync = is_ddp and (micro_step % accum != 0)
+                ctx = ddp_model.no_sync() if no_sync else nullcontext()
 
-                optimizer.zero_grad()
-                loss.backward()
+                with ctx:
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
+                        act_logits, cont_logits = train_model(input_ids, attn_mask)
+                        V = cont_logits.size(-1)
+                        act_loss = act_criterion(act_logits.view(-1, 4), action_tags.view(-1))
+                        cont_loss = cont_criterion(cont_logits.view(-1, V), content_tags.view(-1))
+                        loss = (act_loss + args.content_loss_weight * cont_loss) / accum
+                    loss.backward()
+
+                if micro_step % accum != 0:
+                    continue  # gradient 누적 중 — optimizer step 건너뜀
+
                 torch.nn.utils.clip_grad_norm_(trainable, args.grad_clip)
                 optimizer.step()
+                optimizer.zero_grad()
+                global_step += 1
 
-                n_tok = (action_tags != IGNORE).sum().item()
-                ep_loss += loss.item() * n_tok
+                n_tok = (action_tags != IGNORE).sum().item() * accum  # 누적된 전체 토큰
+                ep_loss += loss.item() * accum * n_tok / accum  # unscaled loss
                 ep_tokens += n_tok
 
                 if is_main and global_step % args.log_interval == 0:
@@ -571,6 +585,7 @@ def main():
     p.add_argument("--stage3_lr", type=float, default=1e-5)
     p.add_argument("--unfreeze_layers", type=int, default=6)
     p.add_argument("--grad_clip", type=float, default=1.0)
+    p.add_argument("--grad_accum_steps", type=int, default=1, help="gradient accumulation steps")
     p.add_argument("--content_loss_weight", type=float, default=0.5)
     p.add_argument("--edit_loss_weight", type=float, default=2.0)
     p.add_argument("--label_smoothing", type=float, default=0.1)
