@@ -274,7 +274,7 @@ def train(args):
         train_dataset, batch_size=args.batch_size,
         num_workers=args.num_workers, pin_memory=True, drop_last=True,
         collate_fn=collate_dynamic_pad,
-        prefetch_factor=8 if args.num_workers > 0 else None,
+        prefetch_factor=16 if args.num_workers > 0 else None,
         persistent_workers=args.num_workers > 0,
     )
 
@@ -294,7 +294,7 @@ def train(args):
             val_dataset, batch_size=args.batch_size,
             num_workers=max(args.num_workers, 1), pin_memory=True, drop_last=True,
             collate_fn=collate_dynamic_pad,
-            prefetch_factor=8, persistent_workers=True,
+            prefetch_factor=16, persistent_workers=True,
         )
         if is_main:
             print(f"  검증: {args.val_corpus}")
