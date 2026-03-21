@@ -54,6 +54,12 @@ python -m training.pretrain \
 python keyboard_tokenizer/ko_keyboard.py
 python keyboard_tokenizer/keyboard_wrapper.py
 python error_generation/test_errors.py
+
+# ── 노이즈 엔진 검증 ──
+
+# 1000문장 통계 검증 (오류 분포 + hit rate)
+python error_generation/test_distribution.py \
+    --corpus corpus/val_50k.jsonl --n_samples 1000
 ```
 
 테스트 프레임워크(pytest 등) 없음. 모든 테스트는 `if __name__ == "__main__"` 블록으로 직접 실행.
@@ -87,7 +93,7 @@ Embedding (vocab=303, d_model=640) × sqrt(d_model)
 - **DenseEditorConfig** (`model/dense_editor_config.py`): `make_config(mixing_type, d_model, target_params)`
 
 **Mixing layer 레지스트리** (`model/mixing/__init__.py`):
-mamba, mamba2, fnet, tcn, rwkv, retnet, xlstm, mlstm
+mamba, mamba2, fnet, tcn, rwkv, retnet, xlstm, mlstm, attention, hybrid
 
 **확정 아키텍처**: Mamba-2 ds=64 (loss 37%↓, recall +19.5pp vs Mamba-1, CPU 22% 빠름)
 
@@ -98,7 +104,7 @@ mamba, mamba2, fnet, tcn, rwkv, retnet, xlstm, mlstm
   - cosine: warmup → 전 구간 cosine decay
 - Label smoothing: `--label_smoothing 0.1` (기본 활성)
 - Edit loss weight: `--edit_loss_weight 2.0` (non-KEEP 태그 2배 가중치)
-- 한국어 오류 증강: `--error_prob 0.5 --error_count 3`
+- 한국어 오류 증강: `--error_prob 0.5 --error_count 3 --noise_preset default|realistic`
 - Min LR: `--min_lr_ratio 0.01` (max_lr의 1%)
 - 패킹: `[BOS]문장1[EOS][BOS]문장2[EOS]...` → max_seq_len까지 연결, BOS에서 state 리셋
 - Iterative refinement: `--n_iterations 1` (기본), fine-tuning 시 2-3
@@ -144,9 +150,36 @@ export BITLINEAR_CUDA_FUSED_WEIGHT=1
 - **Mamba-1 (Seq2Seq)**: BOS 위치에서 dt=1e4로 SSM state 완전 리셋
 - **Cross-Attention (Seq2Seq)**: per-document context matrix + CUDA scatter/gather
 
+### 노이즈 엔진 (`error_generation/`, `training/noising.py`)
+
+한국어 오류 생성 + 텍스트/토큰 레벨 노이즈. GEC 학습 데이터 증강.
+
+- **error_generation**: 27개 오류 타입 (패턴 기반 + MeCab 동적 생성)
+  - 패턴 기반: `common_misspellings`, `consonant_errors` 등 (고정 사전 매칭)
+  - 동적 생성: `spacing_errors`, `conjugation_errors`, `particle_errors`, `suffix_errors`, `foreign_style` (MeCab 형태소 분석 기반 fallback)
+  - G2PK 발음→철자: `g2pk_noise` (g2pk 패키지 필요, soft import)
+  - 이형문자: `heterograph` (종성/모음 혼동)
+  - KAGAS 매핑: `kagas_mapping` (11-type 표준 분류)
+- **가중치 프리셋** (`training/noising.py: WEIGHT_PRESETS`):
+  - `default`: 기존 가중치 (하위호환)
+  - `realistic`: KoGEC 2025 실제 오류 분포 기반 (hit rate 보정 포함)
+- **NoiseConfig**: `weight_preset` 필드로 프리셋 선택
+- **CLI**: `--noise_preset default|realistic`
+
+### ELECTRA GEC 실험 (`exp-electra-gec/`)
+
+Pretrained encoder + Two-head GEC 편집 태깅 실험 (브랜치: `exp-electra-gec`).
+
+- Phase 0: 노이즈 엔진 개선 (완료) — G2PK, heterograph, 가중치 리밸런싱, KAGAS 매핑
+- Phase 1: KoELECTRA-Small-v3 + GECToR Two-head (계획)
+- Phase 2: Keyboard 토크나이저 + ELECTRA RTD pretrain (계획)
+- Two-head 태그 체계: Action(4-class) + Content(vocab-class) 분리
+- 확신도 기반 편집 결정 + Gumbel consensus
+
 ## Key References
 
 - `inference_dense/BENCHMARK.md`: CPU 인퍼런스 + GPU 품질 벤치마크 결과
 - `AGENTS.md`: AI 어시스턴트용 상세 프로젝트 컨텍스트
 - `training/noise_config.example.json`: 노이즈 설정 템플릿
+- `exp-electra-gec/OVERVIEW.md`: ELECTRA GEC 실험 전체 개요
 - Docker: `nvidia/cuda:12.8.0-devel-ubuntu24.04` 기반, Python 3.12, CUDA 12.8
