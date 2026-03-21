@@ -424,6 +424,7 @@ def train(args):
                 ctx = ddp_model.no_sync() if no_sync else nullcontext()
 
                 with ctx:
+                    torch.compiler.cudagraph_mark_step_begin()
                     with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
                         act_logits, cont_logits = train_model(input_ids, attn_mask)
                         V = cont_logits.size(-1)
