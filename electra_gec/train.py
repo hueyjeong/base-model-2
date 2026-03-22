@@ -327,7 +327,7 @@ def train(args):
     )
 
     # ── Progressive Unfreezing (step 기반) ──
-    # max_steps=0: 해당 stage 건너뜀, stage3의 0은 "max_epochs까지"
+    # max_steps=-1: 건너뜀, max_steps=0: max_epochs까지 무제한
     stages = [
         {"name": "heads_only", "max_steps": args.stage1_steps, "lr": args.stage1_lr,
          "warmup": args.warmup_steps,
@@ -407,9 +407,9 @@ def train(args):
     ddp_model = None
 
     for stage in stages:
-        if stage["max_steps"] == 0:
+        if stage["max_steps"] < 0:
             if is_main:
-                print(f"\n  Stage '{stage['name']}' 건너뜀 (max_steps=0)")
+                print(f"\n  Stage '{stage['name']}' 건너뜀 (max_steps={stage['max_steps']})")
             continue
 
         stage["setup"]()
@@ -730,11 +730,11 @@ def main():
     p.add_argument("--max_epochs", type=int, default=10)
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--stage1_lr", type=float, default=5e-4)
-    p.add_argument("--stage1_steps", type=int, default=50000, help="Stage 1 (heads only) step 수, 0=건너뜀")
+    p.add_argument("--stage1_steps", type=int, default=50000, help="Stage 1 (heads only) step 수, -1=건너뜀")
     p.add_argument("--stage2_lr", type=float, default=4e-5)
-    p.add_argument("--stage2_steps", type=int, default=200000, help="Stage 2 (top-N layers) step 수, 0=건너뜀")
+    p.add_argument("--stage2_steps", type=int, default=200000, help="Stage 2 (top-N layers) step 수, -1=건너뜀")
     p.add_argument("--stage3_lr", type=float, default=2e-5)
-    p.add_argument("--stage3_steps", type=int, default=0, help="Stage 3 (full) step 수, 0=max_epochs까지")
+    p.add_argument("--stage3_steps", type=int, default=0, help="Stage 3 (full) step 수, 0=max_epochs까지, -1=건너뜀")
     p.add_argument("--warmup_steps", type=int, default=1000, help="각 stage 시작 시 warmup step 수")
     p.add_argument("--unfreeze_layers", type=int, default=6)
     p.add_argument("--grad_clip", type=float, default=1.0)
