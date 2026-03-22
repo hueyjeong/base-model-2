@@ -541,6 +541,11 @@ def train(args):
                 _acc_cont = 0.0
                 _acc_tok = 0
 
+                # 메인 프로세스 dataset에 worker의 bytes_read 반영 (체크포인트용)
+                br_now = batch.get("_bytes_read", 0)
+                if br_now > 0:
+                    train_dataset._bytes_read = br_now
+
                 # 로그
                 if is_main and global_step % args.log_interval == 0:
                     elapsed = time.time() - train_start
