@@ -731,7 +731,7 @@ def main():
     p.add_argument("--bf16", action="store_true", default=True, help="BF16 AMP (기본 활성)")
     p.add_argument("--no_bf16", dest="bf16", action="store_false")
     p.add_argument("--compile", action="store_true", help="torch.compile 적용")
-    p.add_argument("--compile_mode", default="reduce-overhead", choices=["default", "reduce-overhead", "max-autotune"])
+    p.add_argument("--compile_mode", default="default", choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"])
     p.add_argument("--resume", default=None, help="체크포인트 경로 또는 디렉토리")
     p.add_argument("--save_interval", type=int, default=0, help="step 단위 체크포인트 주기 (0=에포크만)")
     p.add_argument("--gdrive_remote", default=None, help="rclone 대상 (예: 'gdrive:electra-gec-ckpts/')")

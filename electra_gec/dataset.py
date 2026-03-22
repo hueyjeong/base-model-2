@@ -89,11 +89,18 @@ class WordPieceGECDataset(IterableDataset):
         self._bytes_read = 0
 
     def set_epoch(self, epoch: int):
-        """에포크 시작 시 호출하여 셔플 시드 변경"""
+        """에포크 시작 시 호출하여 셔플 시드 변경
+
+        resume 중이면 리셋하지 않음 (load_state_dict에서 설정된 상태 유지).
+        """
         self._epoch = epoch
-        self.rng = random.Random(42 + epoch)
-        self._bytes_read = 0
-        self._resume_line = 0
+        if not getattr(self, "_resuming", False):
+            self.rng = random.Random(42 + epoch)
+            self._bytes_read = 0
+            self._line_counter = 0
+            self._resume_bytes = 0
+        else:
+            self._resuming = False  # resume은 1회만
 
     def state_dict(self) -> dict:
         """데이터셋 RNG + 진행 상태 직렬화"""
@@ -105,25 +112,45 @@ class WordPieceGECDataset(IterableDataset):
         }
 
     def load_state_dict(self, state: dict) -> None:
-        """저장된 상태 복원 — 다음 이터레이션에서 건너뛸 라인 수 설정"""
+        """저장된 상태 복원 — 바이트 위치 기반 fast-forward
+
+        _resume_bytes: worker fork 이후에도 __init__ 시점에 설정되어 있으므로
+        worker에서 _iter_lines 호출 시 자동으로 건너뛰기 적용됨.
+        """
         self.rng.setstate(state["rng_state"])
         self._line_counter = state.get("line_counter", 0)
         self._resume_line = state.get("line_counter", 0)
         self._epoch = state.get("epoch", 0)
         self._bytes_read = state.get("bytes_read", 0)
+        self._resume_bytes = state.get("bytes_read", 0)
+        self._resuming = True
 
     def _iter_lines(self, skip_worker_id=None, skip_total=None):
-        """JSONL/TXT 파일에서 텍스트 스트리밍"""
+        """JSONL/TXT 파일에서 텍스트 스트리밍
+
+        resume_bytes > 0이면 해당 바이트까지 빠르게 seek/skip 후 이어서 읽기.
+        """
         files = list(self.file_paths)
         if self.shuffle_files:
             self.rng.shuffle(files)
+
+        # Resume: 이전에 읽은 바이트 위치까지 빠르게 건너뛰기
+        resume_bytes = getattr(self, "_resume_bytes", 0)
+        skipped_bytes = 0
 
         line_idx = 0
         for fpath in files:
             is_jsonl = fpath.endswith((".jsonl", ".json"))
             with open(fpath, "r", encoding="utf-8") as f:
                 for raw_line in f:
-                    self._bytes_read += len(raw_line.encode("utf-8"))
+                    line_bytes = len(raw_line.encode("utf-8"))
+                    self._bytes_read += line_bytes
+
+                    # Resume fast-forward: 이전 위치까지 건너뛰기
+                    if skipped_bytes < resume_bytes:
+                        skipped_bytes += line_bytes
+                        line_idx += 1
+                        continue
                     line = raw_line.strip()
                     if len(line) < self.min_length:
                         continue
