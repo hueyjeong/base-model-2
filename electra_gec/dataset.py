@@ -225,7 +225,10 @@ class WordPieceGECDataset(IterableDataset):
             skip_worker_id=global_worker_id, skip_total=total_workers
         ):
             self._line_counter += 1
-            result = self._tokenize_pair(text)
+            try:
+                result = self._tokenize_pair(text)
+            except Exception:
+                continue
             if result is None:
                 continue
 

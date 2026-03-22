@@ -18,6 +18,10 @@ import math
 import os
 import sys
 import time
+
+# Rust rayon/tokenizer 스레드 풀 제한 (worker 수 많을 때 OS 스레드 한계 초과 방지)
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("RAYON_NUM_THREADS", "1")
 from contextlib import nullcontext
 
 import torch
@@ -223,6 +227,8 @@ def train(args):
 
     if is_main:
         print(f"Device: {device} | World: {world_size} | AMP: {'BF16' if use_amp else 'off'} | TF32: on")
+        if args.num_workers > 32:
+            print(f"  경고: num_workers={args.num_workers}는 과도할 수 있음 (권장: 8~16)")
 
     # ── 모델 ──
     if is_main:
@@ -605,6 +611,23 @@ def train(args):
                 if stage_max > 0 and stage_step >= stage_max:
                     if is_main:
                         print(f"\n  Stage '{stage['name']}' 완료 ({stage_step} steps)")
+                        # Stage 전환 직전 체크포인트 (크래시 대비)
+                        ckpt_path = os.path.join(ckpt_dir, f"stage_{stage['name']}_done.pt")
+                        torch.save({
+                            "epoch": epoch, "global_step": global_step,
+                            "stage_step": stage_step,
+                            "model_state_dict": raw_model.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "stage": stage["name"],
+                            "best_val_loss": best_val_loss,
+                            "no_improve": no_improve,
+                            "data_state": _make_data_state(),
+                        }, ckpt_path)
+                        print(f"  [SAVE] Stage 전환 전: {ckpt_path}")
+                        if args.gdrive_remote:
+                            upload_and_cleanup(ckpt_path, args.log_file, args.gdrive_remote, keep_latest_n=1)
+                    if is_ddp:
+                        dist.barrier()
                     break
 
             # Stage step 제한 도달 시 에포크 루프 탈출
