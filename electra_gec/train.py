@@ -340,16 +340,15 @@ def train(args):
         os.makedirs(ckpt_dir, exist_ok=True)
 
     # ── Resume ──
-    start_epoch = 0
     global_step = 0
     best_val_loss = float("inf")
     no_improve = 0
     resume_stage = None
+    resume_stage_step = 0
 
     if args.resume:
         ckpt_path = args.resume
         if os.path.isdir(ckpt_path):
-            # epoch_*.pt와 step_*.pt 모두 검색, 가장 최근 수정 파일 선택
             import glob
             candidates = sorted(
                 glob.glob(os.path.join(ckpt_path, "epoch_*.pt"))
@@ -361,11 +360,11 @@ def train(args):
         if ckpt_path and os.path.exists(ckpt_path):
             ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
             raw_model.load_state_dict(ckpt["model_state_dict"])
-            start_epoch = ckpt["epoch"]
             global_step = ckpt.get("global_step", 0)
             best_val_loss = ckpt.get("best_val_loss", float("inf"))
             no_improve = ckpt.get("no_improve", 0)
             resume_stage = ckpt.get("stage")
+            resume_stage_step = ckpt.get("stage_step", 0)
 
             # 데이터셋 + 노이저 RNG 상태 복원
             data_state = ckpt.get("data_state")
@@ -377,7 +376,7 @@ def train(args):
 
             if is_main:
                 print(f"\n  Resume: {ckpt_path}")
-                print(f"  epoch={start_epoch}, step={global_step}, stage={resume_stage}")
+                print(f"  global_step={global_step}, stage={resume_stage}, stage_step={resume_stage_step}")
                 if data_state:
                     print(f"  data state 복원: noiser={'noiser_state' in data_state}, dataset={'dataset_state' in data_state}")
 
@@ -422,22 +421,22 @@ def train(args):
             fused=device.type == "cuda",
         )
 
-        stage_step = 0  # 이 stage 내 step 카운터 (LR 스케줄용)
         stage_max = stage["max_steps"]  # 0이면 무제한 (max_epochs까지)
         stage_warmup = stage["warmup"]
         cur_lr = stage["lr"]
 
         # Resume: 이미 완료된 stage 건너뛰기
         if resume_stage and resume_stage != stage["name"]:
-            # resume_stage가 현재보다 뒤 stage면 건너뜀
             stage_names = [s["name"] for s in stages]
             if stage_names.index(stage["name"]) < stage_names.index(resume_stage):
                 if is_main:
                     print(f"\n  Stage '{stage['name']}' 건너뜀 (resume → {resume_stage})")
                 continue
 
-        # Resume: optimizer state 복원
+        # Resume: stage_step 복원 + optimizer state
+        stage_step = 0
         if resume_stage == stage["name"] and args.resume:
+            stage_step = resume_stage_step
             ckpt_path_opt = args.resume
             if os.path.isdir(ckpt_path_opt):
                 import glob as _glob
@@ -454,11 +453,10 @@ def train(args):
                     try:
                         optimizer.load_state_dict(ckpt_opt["optimizer_state_dict"])
                         if is_main:
-                            print(f"  optimizer state 복원 완료")
+                            print(f"  optimizer state 복원 완료 (stage_step={stage_step})")
                     except Exception as e:
                         if is_main:
                             print(f"  optimizer state 복원 실패 (무시): {e}")
-                stage_step = ckpt_opt.get("stage_step", 0)
                 del ckpt_opt
             resume_stage = None  # 복원 완료, 이후 stage는 fresh start
 
@@ -475,11 +473,6 @@ def train(args):
             if epoch > args.max_epochs:
                 stage_done = True
                 break
-
-            if epoch <= start_epoch:
-                if is_main:
-                    print(f"  Epoch {epoch}/{args.max_epochs}: skip (resumed)")
-                continue
 
             train_dataset.set_epoch(epoch)
             ep_loss = 0.0

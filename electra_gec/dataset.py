@@ -220,16 +220,11 @@ class WordPieceGECDataset(IterableDataset):
         global_worker_id = (self.rank * num_workers) + worker_id
 
         pad_id = self.tokenizer.pad_token_id
-        resume_line = getattr(self, "_resume_line", 0)
 
         for text in self._iter_lines(
             skip_worker_id=global_worker_id, skip_total=total_workers
         ):
             self._line_counter += 1
-
-            # Resume: 이미 처리한 라인 건너뛰기 (fast-forward)
-            if self._line_counter <= resume_line:
-                continue
             result = self._tokenize_pair(text)
             if result is None:
                 continue
