@@ -64,6 +64,17 @@ def compute_f(p: float, r: float, beta: float = 0.5) -> float:
     return (1 + b2) * p * r / (b2 * p + r)
 
 
+def get_lr(stage_step: int, warmup: int, max_lr: float, total_steps: int,
+           min_lr_ratio: float = 0.01) -> float:
+    """Stage 내 linear warmup + cosine decay"""
+    min_lr = max_lr * min_lr_ratio
+    if stage_step < warmup:
+        return min_lr + (max_lr - min_lr) * stage_step / max(warmup, 1)
+    progress = (stage_step - warmup) / max(total_steps - warmup, 1)
+    progress = min(progress, 1.0)
+    return min_lr + (max_lr - min_lr) * 0.5 * (1 + math.cos(math.pi * progress))
+
+
 class GPUPrefetcher:
     """다음 배치를 별도 CUDA stream에서 미리 GPU로 전송"""
 
@@ -309,13 +320,17 @@ def train(args):
         ignore_index=IGNORE, label_smoothing=args.label_smoothing,
     )
 
-    # ── Progressive Unfreezing ──
+    # ── Progressive Unfreezing (step 기반) ──
+    # max_steps=0: 해당 stage 건너뜀, stage3의 0은 "max_epochs까지"
     stages = [
-        {"name": "heads_only", "epochs": 1, "lr": args.stage1_lr,
+        {"name": "heads_only", "max_steps": args.stage1_steps, "lr": args.stage1_lr,
+         "warmup": args.warmup_steps,
          "setup": lambda: raw_model.freeze_encoder()},
-        {"name": "top6_unfreeze", "epochs": 2, "lr": args.stage2_lr,
-         "setup": lambda: raw_model.unfreeze_top_layers(args.unfreeze_layers)},
-        {"name": "full_finetune", "epochs": max(args.max_epochs - 3, 1), "lr": args.stage3_lr,
+        {"name": "top6_unfreeze", "max_steps": args.stage2_steps, "lr": args.stage2_lr,
+         "warmup": args.warmup_steps,
+         "setup": lambda: raw_model.unfreeze_top_layers(args.unfreeze_layers, unfreeze_embeddings=True)},
+        {"name": "full_finetune", "max_steps": args.stage3_steps, "lr": args.stage3_lr,
+         "warmup": args.warmup_steps,
          "setup": lambda: raw_model.unfreeze_all()},
     ]
 
@@ -381,9 +396,13 @@ def train(args):
         print(f"  α={args.content_loss_weight}, edit_weight={args.edit_loss_weight}")
 
     epoch = 0
-    ddp_model = None  # stage마다 재래핑
+    stage_done = False
+    ddp_model = None
+
     for stage in stages:
-        if stage["epochs"] <= 0:
+        if stage["max_steps"] == 0:
+            if is_main:
+                print(f"\n  Stage '{stage['name']}' 건너뜀 (max_steps=0)")
             continue
 
         stage["setup"]()
@@ -402,18 +421,33 @@ def train(args):
             betas=(0.9, 0.999), weight_decay=0.01,
             fused=device.type == "cuda",
         )
+
+        stage_step = 0  # 이 stage 내 step 카운터 (LR 스케줄용)
+        stage_max = stage["max_steps"]  # 0이면 무제한 (max_epochs까지)
+        stage_warmup = stage["warmup"]
         cur_lr = stage["lr"]
+
+        # Resume: 이미 완료된 stage 건너뛰기
+        if resume_stage and resume_stage != stage["name"]:
+            # resume_stage가 현재보다 뒤 stage면 건너뜀
+            stage_names = [s["name"] for s in stages]
+            if stage_names.index(stage["name"]) < stage_names.index(resume_stage):
+                if is_main:
+                    print(f"\n  Stage '{stage['name']}' 건너뜀 (resume → {resume_stage})")
+                continue
 
         # Resume: optimizer state 복원
         if resume_stage == stage["name"] and args.resume:
             ckpt_path_opt = args.resume
             if os.path.isdir(ckpt_path_opt):
+                import glob as _glob
                 candidates = sorted(
-                    [f for f in os.listdir(ckpt_path_opt) if f.startswith("epoch_") and f.endswith(".pt")],
-                    key=lambda f: int(f.split("_")[1].split(".")[0]),
+                    _glob.glob(os.path.join(ckpt_path_opt, "step_*.pt"))
+                    + _glob.glob(os.path.join(ckpt_path_opt, "epoch_*.pt")),
+                    key=os.path.getmtime,
                 )
                 if candidates:
-                    ckpt_path_opt = os.path.join(ckpt_path_opt, candidates[-1])
+                    ckpt_path_opt = candidates[-1]
             if os.path.exists(ckpt_path_opt):
                 ckpt_opt = torch.load(ckpt_path_opt, map_location=device, weights_only=False)
                 if "optimizer_state_dict" in ckpt_opt:
@@ -424,16 +458,22 @@ def train(args):
                     except Exception as e:
                         if is_main:
                             print(f"  optimizer state 복원 실패 (무시): {e}")
+                stage_step = ckpt_opt.get("stage_step", 0)
                 del ckpt_opt
+            resume_stage = None  # 복원 완료, 이후 stage는 fresh start
 
         if is_main:
+            max_info = f"{stage_max} steps" if stage_max > 0 else "max_epochs까지"
             print(f"\n{'='*60}")
-            print(f"Stage: {stage['name']} | LR={stage['lr']} | trainable={raw_model.count_trainable():,}")
+            print(f"Stage: {stage['name']} | LR={stage['lr']} | warmup={stage_warmup} | {max_info}")
+            print(f"  trainable={raw_model.count_trainable():,}")
             print(f"{'='*60}")
 
-        for _ in range(stage["epochs"]):
+        # Stage 내 에포크 루프
+        while True:
             epoch += 1
             if epoch > args.max_epochs:
+                stage_done = True
                 break
 
             if epoch <= start_epoch:
@@ -444,11 +484,11 @@ def train(args):
             train_dataset.set_epoch(epoch)
             ep_loss = 0.0
             ep_tokens = 0
+            ep_loss_count = 0
             t0 = time.time()
 
             accum = args.grad_accum_steps
             micro_step = 0
-            # micro batch 누적용 버퍼
             _acc_act = 0.0
             _acc_cont = 0.0
             _acc_tok = 0
@@ -462,7 +502,6 @@ def train(args):
                 action_tags = batch["action_tags"]
                 content_tags = batch["content_tags"]
 
-                # DDP: 마지막 micro step에서만 grad sync (나머지는 no_sync)
                 no_sync = is_ddp and (micro_step % accum != 0)
                 ctx = ddp_model.no_sync() if no_sync else nullcontext()
 
@@ -471,37 +510,45 @@ def train(args):
                         act_logits, cont_logits = train_model(input_ids, attn_mask)
                         V = cont_logits.size(-1)
                         act_loss = act_criterion(act_logits.view(-1, 4), action_tags.view(-1))
-                        cont_loss = cont_criterion(cont_logits.view(-1, V), content_tags.view(-1))
+                        # 편집 위치가 없으면 cont_loss=0 (nan 방지)
+                        has_edit = (content_tags != IGNORE).any()
+                        if has_edit:
+                            cont_loss = cont_criterion(cont_logits.view(-1, V), content_tags.view(-1))
+                        else:
+                            cont_loss = act_loss.new_zeros(())
                         loss = (act_loss + args.content_loss_weight * cont_loss) / accum
                     loss.backward()
 
-                # micro batch 통계 누적 (unscaled)
                 _acc_act += act_loss.item()
                 _acc_cont += cont_loss.item()
                 _acc_tok += (action_tags != IGNORE).sum().item()
 
                 if micro_step % accum != 0:
-                    continue  # gradient 누적 중 — optimizer step 건너뜀
+                    continue
+
+                # LR 스케줄 적용
+                total_for_decay = stage_max if stage_max > 0 else stage_step + 100000
+                cur_lr = get_lr(stage_step, stage_warmup, stage["lr"], total_for_decay)
+                for pg in optimizer.param_groups:
+                    pg["lr"] = cur_lr
 
                 torch.nn.utils.clip_grad_norm_(trainable, args.grad_clip)
                 optimizer.step()
                 optimizer.zero_grad()
                 global_step += 1
+                stage_step += 1
 
-                # 누적된 micro batch 평균
                 step_act_loss = _acc_act / accum
                 step_cont_loss = _acc_cont / accum
                 step_loss = step_act_loss + args.content_loss_weight * step_cont_loss
                 step_tok = _acc_tok
-
                 ep_loss += step_loss * step_tok
                 ep_tokens += step_tok
-
-                # 버퍼 리셋
                 _acc_act = 0.0
                 _acc_cont = 0.0
                 _acc_tok = 0
 
+                # 로그
                 if is_main and global_step % args.log_interval == 0:
                     elapsed = time.time() - train_start
                     ep_elapsed = time.time() - t0
@@ -519,13 +566,15 @@ def train(args):
                         eta_total = eta_ep + remaining_epochs * (ep_elapsed / max(pct / 100, 1e-6))
                         progress = f" {fmt_bytes(br)}/{fmt_bytes(tb)} ({pct:.1f}% ETA {fmt_time(eta_total)})"
 
+                    stage_pct = f" stg{stage_step}/{stage_max}" if stage_max > 0 else ""
                     print(
-                        f"  [{fmt_time(elapsed)}] ep{epoch}/{args.max_epochs} s{global_step}{progress} | "
+                        f"  [{fmt_time(elapsed)}] ep{epoch}/{args.max_epochs} s{global_step}{stage_pct}{progress} | "
                         f"loss={step_loss:.4f} avg={avg:.4f} | "
                         f"act={step_act_loss:.4f} cont={step_cont_loss:.4f} | "
                         f"lr={cur_lr:.1e} {tps:.0f} tok/s seq={seq_len}"
                     )
 
+                # 검증
                 if val_loader is not None and global_step % args.val_every == 0:
                     m = validate(raw_model, val_loader, device, n_batches=args.val_steps, use_amp=use_amp)
                     if is_main and m:
@@ -535,11 +584,12 @@ def train(args):
                             f"P={m['edit_p']:.3f} R={m['edit_r']:.3f} F0.5={m['edit_f05']:.3f}"
                         )
 
-                # step 단위 체크포인트
+                # 체크포인트
                 if is_main and args.save_interval and global_step % args.save_interval == 0:
                     ckpt_path = os.path.join(ckpt_dir, f"step_{global_step}.pt")
                     torch.save({
                         "epoch": epoch, "global_step": global_step,
+                        "stage_step": stage_step,
                         "model_state_dict": raw_model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
                         "stage": stage["name"],
@@ -551,7 +601,19 @@ def train(args):
                     if args.gdrive_remote:
                         upload_and_cleanup(ckpt_path, args.log_file, args.gdrive_remote, keep_latest_n=1)
 
-            # 에포크 종료
+                # Stage step 제한 도달 → 다음 stage로
+                if stage_max > 0 and stage_step >= stage_max:
+                    if is_main:
+                        print(f"\n  Stage '{stage['name']}' 완료 ({stage_step} steps)")
+                    break
+
+            # Stage step 제한 도달 시 에포크 루프 탈출
+            # 에포크 미완료 상태이므로 되돌림 (다음 stage가 이 에포크를 재사용)
+            if stage_max > 0 and stage_step >= stage_max:
+                epoch -= 1
+                break
+
+            # 에포크 종료 통계
             dt = time.time() - t0
             total_elapsed = time.time() - train_start
             avg = ep_loss / max(ep_tokens, 1)
@@ -564,7 +626,7 @@ def train(args):
                     f"경과 {fmt_time(total_elapsed)} / 잔여 ~{fmt_time(eta_total)}"
                 )
 
-            # 에포크 검증
+            # 에포크 검증 + best 저장
             if val_loader is not None:
                 m = validate(raw_model, val_loader, device, n_batches=args.val_steps * 2, use_amp=use_amp)
                 if is_main and m:
@@ -574,7 +636,6 @@ def train(args):
                         f"cont_acc={m['cont_acc']:.3f} | "
                         f"P={m['edit_p']:.3f} R={m['edit_r']:.3f} F0.5={m['edit_f05']:.3f}"
                     )
-
                     if vl < best_val_loss:
                         best_val_loss = vl
                         no_improve = 0
@@ -582,6 +643,7 @@ def train(args):
                             best_path = os.path.join(ckpt_dir, "best.pt")
                             torch.save({
                                 "epoch": epoch, "global_step": global_step,
+                                "stage_step": stage_step,
                                 "model_state_dict": raw_model.state_dict(),
                                 "optimizer_state_dict": optimizer.state_dict(),
                                 "val_loss": vl, "metrics": m,
@@ -598,6 +660,7 @@ def train(args):
                         if no_improve >= args.patience:
                             if is_main:
                                 print(f"\n  Early stop: {args.patience}ep 개선 없음")
+                            stage_done = True
                             break
 
             # 에포크 체크포인트
@@ -605,6 +668,7 @@ def train(args):
                 ep_ckpt_path = os.path.join(ckpt_dir, f"epoch_{epoch}.pt")
                 torch.save({
                     "epoch": epoch, "global_step": global_step,
+                    "stage_step": stage_step,
                     "model_state_dict": raw_model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "stage": stage["name"],
@@ -619,7 +683,7 @@ def train(args):
             if is_ddp:
                 dist.barrier()
 
-        if epoch > args.max_epochs or no_improve >= args.patience:
+        if stage_done:
             break
 
     total_time = time.time() - train_start
@@ -643,8 +707,12 @@ def main():
     p.add_argument("--max_epochs", type=int, default=10)
     p.add_argument("--batch_size", type=int, default=32)
     p.add_argument("--stage1_lr", type=float, default=5e-4)
-    p.add_argument("--stage2_lr", type=float, default=2e-5)
-    p.add_argument("--stage3_lr", type=float, default=1e-5)
+    p.add_argument("--stage1_steps", type=int, default=50000, help="Stage 1 (heads only) step 수, 0=건너뜀")
+    p.add_argument("--stage2_lr", type=float, default=4e-5)
+    p.add_argument("--stage2_steps", type=int, default=200000, help="Stage 2 (top-N layers) step 수, 0=건너뜀")
+    p.add_argument("--stage3_lr", type=float, default=2e-5)
+    p.add_argument("--stage3_steps", type=int, default=0, help="Stage 3 (full) step 수, 0=max_epochs까지")
+    p.add_argument("--warmup_steps", type=int, default=1000, help="각 stage 시작 시 warmup step 수")
     p.add_argument("--unfreeze_layers", type=int, default=6)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--grad_accum_steps", type=int, default=1, help="gradient accumulation steps")

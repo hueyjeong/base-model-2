@@ -80,13 +80,16 @@ class KoELECTRAGECToR(nn.Module):
         for p in self.electra.parameters():
             p.requires_grad = False
 
-    def unfreeze_top_layers(self, n: int = 6):
-        """상위 n개 encoder layer + heads 학습"""
+    def unfreeze_top_layers(self, n: int = 6, unfreeze_embeddings: bool = False):
+        """상위 n개 encoder layer + heads 학습, 선택적 embedding unfreeze"""
         for p in self.electra.parameters():
             p.requires_grad = False
         total_layers = self.electra.config.num_hidden_layers
         for i in range(total_layers - n, total_layers):
             for p in self.electra.encoder.layer[i].parameters():
+                p.requires_grad = True
+        if unfreeze_embeddings:
+            for p in self.electra.embeddings.parameters():
                 p.requires_grad = True
 
     def unfreeze_all(self):
