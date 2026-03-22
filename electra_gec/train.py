@@ -341,6 +341,7 @@ def train(args):
 
     # ── Resume ──
     global_step = 0
+    resume_epoch = 0
     best_val_loss = float("inf")
     no_improve = 0
     resume_stage = None
@@ -361,6 +362,7 @@ def train(args):
             ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
             raw_model.load_state_dict(ckpt["model_state_dict"])
             global_step = ckpt.get("global_step", 0)
+            resume_epoch = ckpt.get("epoch", 0)
             best_val_loss = ckpt.get("best_val_loss", float("inf"))
             no_improve = ckpt.get("no_improve", 0)
             resume_stage = ckpt.get("stage")
@@ -394,7 +396,7 @@ def train(args):
         print(f"\n학습 시작 (max_epochs={args.max_epochs}, batch={args.batch_size}x{world_size}x{args.grad_accum_steps}={eff_batch}, seq≤{args.max_seq_len})")
         print(f"  α={args.content_loss_weight}, edit_weight={args.edit_loss_weight}")
 
-    epoch = 0
+    epoch = resume_epoch - 1 if args.resume else 0  # while루프에서 +1되므로 -1
     stage_done = False
     ddp_model = None
 
