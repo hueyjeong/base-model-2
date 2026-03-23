@@ -1,39 +1,79 @@
-"""KoELECTRA-Base-v3 + Two-head GECToR 모델
+"""KoELECTRA-Base-v3 + GECToR 모델
 
 pretrained ELECTRA discriminator encoder 위에
-Action Head (4-class) + Content Head (vocab-tied)를 얹은 GEC 편집 태깅 모델.
+Two-head (Action 4-class + Content vocab-tied) 또는
+Single-head (편집 태그 70K-class)를 얹은 GEC 편집 태깅 모델.
 """
 from __future__ import annotations
 
+import os
+import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import logging
 from transformers import AutoModel
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from model.edit_tags import TAG_KEEP, TAG_DELETE
+
 # HuggingFace LOAD REPORT 경고 숨기기 (RTD head UNEXPECTED는 정상)
 logging.getLogger("transformers.modeling_utils").setLevel(logging.ERROR)
 
 
-# 액션 상수
+# 액션 상수 (two-head용)
 ACTION_KEEP = 0
 ACTION_DELETE = 1
 ACTION_REPLACE = 2
 ACTION_INSERT = 3
 
 
+def _tags_to_action_content(
+    tags: torch.Tensor, vocab_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Single-head 태그 → (action, content) 텐서 변환 (벡터화)
+
+    Args:
+        tags: (B, T) 편집 태그 ID
+        vocab_size: 어휘 크기 V
+
+    Returns:
+        actions: (B, T) ACTION_KEEP/DELETE/REPLACE/INSERT
+        contents: (B, T) 콘텐츠 토큰 ID (KEEP/DELETE일 때 0)
+    """
+    actions = torch.zeros_like(tags)
+    contents = torch.zeros_like(tags)
+
+    is_keep = (tags == TAG_KEEP)
+    is_delete = (tags == TAG_DELETE)
+    is_replace = (tags >= 2) & (tags < 2 + vocab_size)
+    is_insert = (tags >= 2 + vocab_size)
+
+    actions[is_keep] = ACTION_KEEP
+    actions[is_delete] = ACTION_DELETE
+    actions[is_replace] = ACTION_REPLACE
+    actions[is_insert] = ACTION_INSERT
+
+    contents[is_replace] = tags[is_replace] - 2
+    contents[is_insert] = tags[is_insert] - 2 - vocab_size
+
+    return actions, contents
+
+
 class KoELECTRAGECToR(nn.Module):
-    """KoELECTRA encoder + Two-head GEC 편집 태깅 모델
+    """KoELECTRA encoder + GEC 편집 태깅 모델
 
     Args:
         model_name: HuggingFace 모델 이름
         dropout: head 드롭아웃 비율
+        single_head: True면 single-head (70K tags), False면 two-head (action+content)
     """
 
     def __init__(
         self,
         model_name: str = "monologg/koelectra-base-v3-discriminator",
         dropout: float = 0.1,
+        single_head: bool = False,
     ):
         super().__init__()
         self.electra = AutoModel.from_pretrained(model_name)
@@ -42,28 +82,37 @@ class KoELECTRAGECToR(nn.Module):
 
         self.d_model = d
         self.vocab_size = V
+        self.single_head = single_head
         self.dropout = nn.Dropout(dropout)
 
-        # Action head: KEEP/DELETE/REPLACE/INSERT
-        self.action_head = nn.Linear(d, 4)
-        nn.init.xavier_uniform_(self.action_head.weight)
-        nn.init.zeros_(self.action_head.bias)
-
-        # Content head (tied): h @ embedding.T + bias
-        self.content_bias = nn.Parameter(torch.zeros(V))
+        if single_head:
+            self.n_tags = 2 + 2 * V  # 70002
+            self.tag_head = nn.Linear(d, self.n_tags)
+            nn.init.xavier_uniform_(self.tag_head.weight)
+            nn.init.zeros_(self.tag_head.bias)
+        else:
+            # Two-head: Action + Content (tied)
+            self.action_head = nn.Linear(d, 4)
+            nn.init.xavier_uniform_(self.action_head.weight)
+            nn.init.zeros_(self.action_head.bias)
+            self.content_bias = nn.Parameter(torch.zeros(V))
 
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, ...]:
         """
         Returns:
-            action_logits: (B, T, 4)
-            content_logits: (B, T, V)
+            single_head: (tag_logits,)  — tag_logits: (B, T, n_tags)
+            two-head: (action_logits, content_logits) — (B,T,4), (B,T,V)
         """
         h = self.electra(input_ids, attention_mask=attention_mask).last_hidden_state
         h = self.dropout(h)  # (B, T, 768)
+
+        if self.single_head:
+            tag_logits = self.tag_head(h)  # (B, T, n_tags)
+            return (tag_logits,)
 
         action_logits = self.action_head(h)  # (B, T, 4)
 
@@ -119,6 +168,29 @@ class KoELECTRAGECToR(nn.Module):
             confidence: (B, T) 확신도
         """
         self.eval()
+
+        if self.single_head:
+            (tag_logits,) = self.forward(input_ids, attention_mask)
+
+            # Keep bias: TAG_KEEP(=0) 선호도 조정
+            tag_logits[:, :, TAG_KEEP] += keep_bias
+
+            tag_probs = F.softmax(tag_logits, dim=-1)
+            tags = tag_logits.argmax(dim=-1)
+            confidence = tag_probs.max(dim=-1).values
+
+            # tag → (action, content) 변환
+            actions, contents = _tags_to_action_content(tags, self.vocab_size)
+
+            # 확신도 미달 → KEEP으로 강제
+            if conf_threshold > 0:
+                is_edit = (tags != TAG_KEEP)
+                below = (confidence < conf_threshold) & is_edit
+                actions = torch.where(below, torch.zeros_like(actions), actions)
+
+            return actions, contents, confidence
+
+        # Two-head
         action_logits, content_logits = self.forward(input_ids, attention_mask)
 
         # Keep bias: KEEP 선호도 조정
@@ -168,11 +240,12 @@ def apply_two_head_tags(
 if __name__ == "__main__":
     print("=== KoELECTRAGECToR Smoke Test ===\n")
 
+    # ── Two-head 테스트 ──
+    print("--- Two-head ---")
     model = KoELECTRAGECToR()
     total = sum(p.numel() for p in model.parameters())
     print(f"총 파라미터: {total:,}")
 
-    # Forward pass
     B, T = 2, 64
     ids = torch.randint(1, 35000, (B, T))
     mask = torch.ones(B, T, dtype=torch.long)
@@ -180,18 +253,15 @@ if __name__ == "__main__":
     print(f"action_logits: {act_logits.shape}")
     print(f"content_logits: {cont_logits.shape}")
 
-    # Backward
     loss = act_logits.sum() + cont_logits.sum()
     loss.backward()
-    print(f"backward OK")
+    print("backward OK")
 
-    # Freeze/unfreeze 테스트
+    # Freeze/unfreeze
     model.freeze_encoder()
     print(f"\nfreeze_encoder → trainable: {model.count_trainable():,}")
-
     model.unfreeze_top_layers(6)
     print(f"unfreeze_top_6 → trainable: {model.count_trainable():,}")
-
     model.unfreeze_all()
     print(f"unfreeze_all → trainable: {model.count_trainable():,}")
 
@@ -206,5 +276,38 @@ if __name__ == "__main__":
     result = apply_two_head_tags(src, acts, conts)
     assert result == [10, 99, 40, 55], f"apply 실패: {result}"
     print(f"apply_two_head_tags OK: {result}")
+
+    # ── Single-head 테스트 ──
+    print("\n--- Single-head ---")
+    del model
+    model_sh = KoELECTRAGECToR(single_head=True)
+    total_sh = sum(p.numel() for p in model_sh.parameters())
+    print(f"총 파라미터: {total_sh:,} (n_tags={model_sh.n_tags})")
+
+    (tag_logits,) = model_sh(ids, mask)
+    print(f"tag_logits: {tag_logits.shape}")
+    assert tag_logits.shape == (B, T, model_sh.n_tags)
+
+    loss_sh = tag_logits.sum()
+    loss_sh.backward()
+    print("backward OK")
+
+    # Freeze/unfreeze
+    model_sh.freeze_encoder()
+    print(f"freeze_encoder → trainable: {model_sh.count_trainable():,}")
+    model_sh.unfreeze_all()
+    print(f"unfreeze_all → trainable: {model_sh.count_trainable():,}")
+
+    # Predict
+    actions_sh, contents_sh, conf_sh = model_sh.predict(ids, mask, keep_bias=1.0, conf_threshold=0.1)
+    print(f"predict → actions: {actions_sh.shape}, contents: {contents_sh.shape}")
+
+    # _tags_to_action_content 검증
+    V = model_sh.vocab_size
+    test_tags = torch.tensor([[TAG_KEEP, TAG_DELETE, 2 + 99, 2 + V + 55]])
+    a, c = _tags_to_action_content(test_tags, V)
+    assert a.tolist() == [[ACTION_KEEP, ACTION_DELETE, ACTION_REPLACE, ACTION_INSERT]]
+    assert c.tolist() == [[0, 0, 99, 55]]
+    print("_tags_to_action_content OK")
 
     print("\n모든 테스트 통과!")

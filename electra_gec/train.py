@@ -35,6 +35,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from electra_gec.model import KoELECTRAGECToR, ACTION_KEEP
 from electra_gec.dataset import WordPieceGECDataset, IGNORE
+from model.edit_tags import TAG_KEEP
 from training.noising import DenoisingNoiser, NoiseConfig
 from training.upload_gdrive import upload_and_cleanup
 
@@ -113,14 +114,18 @@ def collate_dynamic_pad(batch: list[dict]) -> dict:
     max_len = max(b["attention_mask"].sum().item() for b in batch)
     bytes_read = max(b.get("_bytes_read", 0) for b in batch)
     total_bytes = max(b.get("_total_bytes", 0) for b in batch)
-    return {
+    result = {
         "input_ids": torch.stack([b["input_ids"][:max_len] for b in batch]),
         "attention_mask": torch.stack([b["attention_mask"][:max_len] for b in batch]),
-        "action_tags": torch.stack([b["action_tags"][:max_len] for b in batch]),
-        "content_tags": torch.stack([b["content_tags"][:max_len] for b in batch]),
         "_bytes_read": bytes_read,
         "_total_bytes": total_bytes,
     }
+    if "edit_tags" in batch[0]:
+        result["edit_tags"] = torch.stack([b["edit_tags"][:max_len] for b in batch])
+    else:
+        result["action_tags"] = torch.stack([b["action_tags"][:max_len] for b in batch])
+        result["content_tags"] = torch.stack([b["content_tags"][:max_len] for b in batch])
+    return result
 
 
 # ── 검증 ──
@@ -128,17 +133,18 @@ def collate_dynamic_pad(batch: list[dict]) -> dict:
 @torch.no_grad()
 def validate(model, val_loader, device, n_batches=50, use_amp=False):
     model.eval()
+    is_single = getattr(model, "single_head", False)
 
-    total_act_loss = 0.0
-    total_cont_loss = 0.0
+    total_loss = 0.0
     total_tokens = 0
-    total_act_correct = 0
+    total_correct = 0
+    # two-head 전용
+    total_cont_loss = 0.0
     total_cont_correct = 0
     total_cont_tokens = 0
     edit_tp = edit_fp = edit_fn = 0
 
-    act_criterion = nn.CrossEntropyLoss(ignore_index=IGNORE)
-    cont_criterion = nn.CrossEntropyLoss(ignore_index=IGNORE)
+    criterion = nn.CrossEntropyLoss(ignore_index=IGNORE)
 
     val_iter = iter(val_loader)
     for _ in range(n_batches):
@@ -149,37 +155,59 @@ def validate(model, val_loader, device, n_batches=50, use_amp=False):
 
         input_ids = batch["input_ids"].to(device)
         attn_mask = batch["attention_mask"].to(device)
-        action_tags = batch["action_tags"].to(device)
-        content_tags = batch["content_tags"].to(device)
 
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
-            act_logits, cont_logits = model(input_ids, attn_mask)
+        if is_single:
+            edit_tags = batch["edit_tags"].to(device)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
+                (tag_logits,) = model(input_ids, attn_mask)
+            n_tags = tag_logits.size(-1)
+            loss = criterion(tag_logits.float().view(-1, n_tags), edit_tags.view(-1))
 
-        V = cont_logits.size(-1)
-        act_loss = act_criterion(act_logits.float().view(-1, 4), action_tags.view(-1))
-        cont_loss = cont_criterion(cont_logits.float().view(-1, V), content_tags.view(-1))
+            valid = (edit_tags != IGNORE)
+            n_tok = valid.sum().item()
+            total_loss += loss.item() * n_tok
+            total_tokens += n_tok
 
-        valid = (action_tags != IGNORE)
-        n_tok = valid.sum().item()
-        total_act_loss += act_loss.item() * n_tok
-        total_tokens += n_tok
+            preds = tag_logits.argmax(dim=-1)
+            total_correct += (preds[valid] == edit_tags[valid]).sum().item()
 
-        act_preds = act_logits.argmax(dim=-1)
-        total_act_correct += (act_preds[valid] == action_tags[valid]).sum().item()
+            pred_edit = preds[valid] != TAG_KEEP
+            true_edit = edit_tags[valid] != TAG_KEEP
+            edit_tp += (pred_edit & true_edit).sum().item()
+            edit_fp += (pred_edit & ~true_edit).sum().item()
+            edit_fn += (~pred_edit & true_edit).sum().item()
+        else:
+            action_tags = batch["action_tags"].to(device)
+            content_tags = batch["content_tags"].to(device)
 
-        edit_pos = (content_tags != IGNORE)
-        n_cont = edit_pos.sum().item()
-        if n_cont > 0:
-            cont_preds = cont_logits.argmax(dim=-1)
-            total_cont_correct += (cont_preds[edit_pos] == content_tags[edit_pos]).sum().item()
-            total_cont_tokens += n_cont
-            total_cont_loss += cont_loss.item() * n_cont
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
+                act_logits, cont_logits = model(input_ids, attn_mask)
 
-        pred_edit = act_preds[valid] != ACTION_KEEP
-        true_edit = action_tags[valid] != ACTION_KEEP
-        edit_tp += (pred_edit & true_edit).sum().item()
-        edit_fp += (pred_edit & ~true_edit).sum().item()
-        edit_fn += (~pred_edit & true_edit).sum().item()
+            V = cont_logits.size(-1)
+            act_loss = criterion(act_logits.float().view(-1, 4), action_tags.view(-1))
+            cont_loss = criterion(cont_logits.float().view(-1, V), content_tags.view(-1))
+
+            valid = (action_tags != IGNORE)
+            n_tok = valid.sum().item()
+            total_loss += act_loss.item() * n_tok
+            total_tokens += n_tok
+
+            act_preds = act_logits.argmax(dim=-1)
+            total_correct += (act_preds[valid] == action_tags[valid]).sum().item()
+
+            edit_pos = (content_tags != IGNORE)
+            n_cont = edit_pos.sum().item()
+            if n_cont > 0:
+                cont_preds = cont_logits.argmax(dim=-1)
+                total_cont_correct += (cont_preds[edit_pos] == content_tags[edit_pos]).sum().item()
+                total_cont_tokens += n_cont
+                total_cont_loss += cont_loss.item() * n_cont
+
+            pred_edit = act_preds[valid] != ACTION_KEEP
+            true_edit = action_tags[valid] != ACTION_KEEP
+            edit_tp += (pred_edit & true_edit).sum().item()
+            edit_fp += (pred_edit & ~true_edit).sum().item()
+            edit_fn += (~pred_edit & true_edit).sum().item()
 
     model.train()
     if total_tokens == 0:
@@ -187,11 +215,21 @@ def validate(model, val_loader, device, n_batches=50, use_amp=False):
 
     edit_p = edit_tp / max(edit_tp + edit_fp, 1)
     edit_r = edit_tp / max(edit_tp + edit_fn, 1)
+
+    if is_single:
+        return {
+            "val_loss": total_loss / total_tokens,
+            "tag_acc": total_correct / total_tokens,
+            "edit_p": edit_p,
+            "edit_r": edit_r,
+            "edit_f05": compute_f(edit_p, edit_r, 0.5),
+        }
+
     return {
-        "val_act_loss": total_act_loss / total_tokens,
+        "val_act_loss": total_loss / total_tokens,
         "val_cont_loss": total_cont_loss / max(total_cont_tokens, 1),
-        "val_loss": total_act_loss / total_tokens + 0.5 * total_cont_loss / max(total_cont_tokens, 1),
-        "act_acc": total_act_correct / total_tokens,
+        "val_loss": total_loss / total_tokens + 0.5 * total_cont_loss / max(total_cont_tokens, 1),
+        "act_acc": total_correct / total_tokens,
         "cont_acc": total_cont_correct / max(total_cont_tokens, 1),
         "edit_p": edit_p,
         "edit_r": edit_r,
@@ -232,8 +270,8 @@ def train(args):
 
     # ── 모델 ──
     if is_main:
-        print(f"\n모델 로드: {args.model_name}")
-    model = KoELECTRAGECToR(args.model_name, dropout=args.dropout).to(device)
+        print(f"\n모델 로드: {args.model_name} (single_head={args.single_head})")
+    model = KoELECTRAGECToR(args.model_name, dropout=args.dropout, single_head=args.single_head).to(device)
     raw_model = model  # DDP 래핑 전 참조 (state_dict, freeze/unfreeze용)
     total_params = sum(p.numel() for p in model.parameters())
     if is_main:
@@ -286,6 +324,7 @@ def train(args):
         seed=args.seed,
         rank=global_rank,
         world_size=world_size,
+        single_head=args.single_head,
     )
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size,
@@ -306,6 +345,7 @@ def train(args):
             seed=args.seed + 1,
             rank=global_rank,
             world_size=world_size,
+            single_head=args.single_head,
         )
         val_loader = DataLoader(
             val_dataset, batch_size=args.batch_size,
@@ -317,14 +357,24 @@ def train(args):
             print(f"  검증: {args.val_corpus}")
 
     # ── Loss ──
-    act_weight = torch.ones(4, device=device)
-    act_weight[1:] = args.edit_loss_weight
-    act_criterion = nn.CrossEntropyLoss(
-        weight=act_weight, ignore_index=IGNORE, label_smoothing=args.label_smoothing,
-    )
-    cont_criterion = nn.CrossEntropyLoss(
-        ignore_index=IGNORE, label_smoothing=args.label_smoothing,
-    )
+    if args.single_head:
+        n_tags = raw_model.n_tags
+        tag_weight = torch.ones(n_tags, device=device)
+        tag_weight[1:] = args.edit_loss_weight  # TAG_KEEP=0만 1.0
+        tag_criterion = nn.CrossEntropyLoss(
+            weight=tag_weight, ignore_index=IGNORE, label_smoothing=args.label_smoothing,
+        )
+        act_criterion = cont_criterion = None  # 사용 안 함
+    else:
+        act_weight = torch.ones(4, device=device)
+        act_weight[1:] = args.edit_loss_weight
+        act_criterion = nn.CrossEntropyLoss(
+            weight=act_weight, ignore_index=IGNORE, label_smoothing=args.label_smoothing,
+        )
+        cont_criterion = nn.CrossEntropyLoss(
+            ignore_index=IGNORE, label_smoothing=args.label_smoothing,
+        )
+        tag_criterion = None  # 사용 안 함
 
     # ── Progressive Unfreezing (step 기반) ──
     # max_steps=-1: 건너뜀, max_steps=0: max_epochs까지 무제한
@@ -500,29 +550,38 @@ def train(args):
 
                 input_ids = batch["input_ids"]
                 attn_mask = batch["attention_mask"]
-                action_tags = batch["action_tags"]
-                content_tags = batch["content_tags"]
 
                 no_sync = is_ddp and (micro_step % accum != 0)
                 ctx = ddp_model.no_sync() if no_sync else nullcontext()
 
                 with ctx:
                     with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
-                        act_logits, cont_logits = train_model(input_ids, attn_mask)
-                        V = cont_logits.size(-1)
-                        act_loss = act_criterion(act_logits.view(-1, 4), action_tags.view(-1))
-                        # 편집 위치가 없으면 cont_loss=0 (nan 방지)
-                        has_edit = (content_tags != IGNORE).any()
-                        if has_edit:
-                            cont_loss = cont_criterion(cont_logits.view(-1, V), content_tags.view(-1))
+                        if args.single_head:
+                            edit_tags = batch["edit_tags"]
+                            (tag_logits,) = train_model(input_ids, attn_mask)
+                            loss = tag_criterion(tag_logits.view(-1, n_tags), edit_tags.view(-1)) / accum
                         else:
-                            cont_loss = act_loss.new_zeros(())
-                        loss = (act_loss + args.content_loss_weight * cont_loss) / accum
+                            action_tags = batch["action_tags"]
+                            content_tags = batch["content_tags"]
+                            act_logits, cont_logits = train_model(input_ids, attn_mask)
+                            V = cont_logits.size(-1)
+                            act_loss = act_criterion(act_logits.view(-1, 4), action_tags.view(-1))
+                            has_edit = (content_tags != IGNORE).any()
+                            if has_edit:
+                                cont_loss = cont_criterion(cont_logits.view(-1, V), content_tags.view(-1))
+                            else:
+                                cont_loss = act_loss.new_zeros(())
+                            loss = (act_loss + args.content_loss_weight * cont_loss) / accum
                     loss.backward()
 
-                _acc_act += act_loss.item()
-                _acc_cont += cont_loss.item()
-                _acc_tok += (action_tags != IGNORE).sum().item()
+                if args.single_head:
+                    _acc_act += loss.item() * accum  # tag loss를 act에 기록
+                    _acc_cont += 0.0
+                    _acc_tok += (edit_tags != IGNORE).sum().item()
+                else:
+                    _acc_act += act_loss.item()
+                    _acc_cont += cont_loss.item()
+                    _acc_tok += (action_tags != IGNORE).sum().item()
 
                 if micro_step % accum != 0:
                     continue
@@ -584,11 +643,17 @@ def train(args):
                 if val_loader is not None and global_step % args.val_every == 0:
                     m = validate(raw_model, val_loader, device, n_batches=args.val_steps, use_amp=use_amp)
                     if is_main and m:
-                        print(
-                            f"  [VAL] loss={m['val_loss']:.4f} act_acc={m['act_acc']:.3f} "
-                            f"cont_acc={m['cont_acc']:.3f} | "
-                            f"P={m['edit_p']:.3f} R={m['edit_r']:.3f} F0.5={m['edit_f05']:.3f}"
-                        )
+                        if args.single_head:
+                            print(
+                                f"  [VAL] loss={m['val_loss']:.4f} tag_acc={m['tag_acc']:.3f} | "
+                                f"P={m['edit_p']:.3f} R={m['edit_r']:.3f} F0.5={m['edit_f05']:.3f}"
+                            )
+                        else:
+                            print(
+                                f"  [VAL] loss={m['val_loss']:.4f} act_acc={m['act_acc']:.3f} "
+                                f"cont_acc={m['cont_acc']:.3f} | "
+                                f"P={m['edit_p']:.3f} R={m['edit_r']:.3f} F0.5={m['edit_f05']:.3f}"
+                            )
 
                 # 체크포인트
                 if is_main and args.save_interval and global_step % args.save_interval == 0:
@@ -654,11 +719,17 @@ def train(args):
                 m = validate(raw_model, val_loader, device, n_batches=args.val_steps * 2, use_amp=use_amp)
                 if is_main and m:
                     vl = m["val_loss"]
-                    print(
-                        f"  [EPOCH VAL] loss={vl:.4f} act_acc={m['act_acc']:.3f} "
-                        f"cont_acc={m['cont_acc']:.3f} | "
-                        f"P={m['edit_p']:.3f} R={m['edit_r']:.3f} F0.5={m['edit_f05']:.3f}"
-                    )
+                    if args.single_head:
+                        print(
+                            f"  [EPOCH VAL] loss={vl:.4f} tag_acc={m['tag_acc']:.3f} | "
+                            f"P={m['edit_p']:.3f} R={m['edit_r']:.3f} F0.5={m['edit_f05']:.3f}"
+                        )
+                    else:
+                        print(
+                            f"  [EPOCH VAL] loss={vl:.4f} act_acc={m['act_acc']:.3f} "
+                            f"cont_acc={m['cont_acc']:.3f} | "
+                            f"P={m['edit_p']:.3f} R={m['edit_r']:.3f} F0.5={m['edit_f05']:.3f}"
+                        )
                     if vl < best_val_loss:
                         best_val_loss = vl
                         no_improve = 0
@@ -720,6 +791,7 @@ def main():
     p.add_argument("--val_corpus", default=None)
     p.add_argument("--text_key", default=None)
     p.add_argument("--model_name", default="monologg/koelectra-base-v3-discriminator")
+    p.add_argument("--single_head", action="store_true", help="Single-head 태그 모드 (70K tags)")
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--max_seq_len", type=int, default=512)
     p.add_argument("--max_epochs", type=int, default=10)

@@ -69,6 +69,7 @@ class WordPieceGECDataset(IterableDataset):
         seed: int = 42,
         rank: int = 0,
         world_size: int = 1,
+        single_head: bool = False,
     ):
         self.file_paths = [file_paths] if isinstance(file_paths, str) else list(file_paths)
         self.noiser = noiser
@@ -79,6 +80,7 @@ class WordPieceGECDataset(IterableDataset):
         self.text_key = text_key
         self.min_length = min_length
         self.shuffle_files = shuffle_files
+        self.single_head = single_head
         self.rng = random.Random(seed)
         self.rank = rank
         self.world_size = world_size
@@ -178,7 +180,11 @@ class WordPieceGECDataset(IterableDataset):
                     line_idx += 1
 
     def _tokenize_pair(self, text: str):
-        """텍스트 → (input_ids, action_tags, content_tags) 변환"""
+        """텍스트 → 태그 변환
+
+        single_head: (input_ids, edit_tags) — 2-tuple
+        two-head: (input_ids, action_tags, content_tags) — 3-tuple
+        """
         lang = self.noiser._detect_lang(text)
         noised_text = self.noiser._apply_text_noise(text, lang)
 
@@ -192,10 +198,19 @@ class WordPieceGECDataset(IterableDataset):
         orig_ids = orig_ids[:self.max_content]
         noised_ids = noised_ids[:self.max_content]
 
-        # Levenshtein DP → single-head 태그
+        # Levenshtein DP → 편집 태그
         single_tags = compute_edit_tags(noised_ids, orig_ids, self.vocab_size)
 
-        # single → two-head 변환
+        cls_id = self.tokenizer.cls_token_id
+        sep_id = self.tokenizer.sep_token_id
+        input_ids = [cls_id] + noised_ids + [sep_id]
+
+        if self.single_head:
+            # TAG_KEEP=0으로 CLS/SEP 추가
+            edit_tags = [TAG_KEEP] + single_tags + [TAG_KEEP]
+            return input_ids, edit_tags
+
+        # two-head 변환
         actions = []
         contents = []
         for tag in single_tags:
@@ -203,10 +218,6 @@ class WordPieceGECDataset(IterableDataset):
             actions.append(a)
             contents.append(c)
 
-        # CLS/SEP 추가 (항상 KEEP)
-        cls_id = self.tokenizer.cls_token_id
-        sep_id = self.tokenizer.sep_token_id
-        input_ids = [cls_id] + noised_ids + [sep_id]
         action_tags = [ACTION_KEEP] + actions + [ACTION_KEEP]
         content_tags = [IGNORE] + contents + [IGNORE]
 
@@ -233,33 +244,45 @@ class WordPieceGECDataset(IterableDataset):
             if result is None:
                 continue
 
-            input_ids, action_tags, content_tags = result
-            seq_len = len(input_ids)
-
-            if seq_len > self.max_seq_len:
-                input_ids = input_ids[:self.max_seq_len]
-                action_tags = action_tags[:self.max_seq_len]
-                content_tags = content_tags[:self.max_seq_len]
-                seq_len = self.max_seq_len
-
-            pad_len = self.max_seq_len - seq_len
-
-            yield {
-                "input_ids": torch.tensor(
-                    input_ids + [pad_id] * pad_len, dtype=torch.long
-                ),
-                "attention_mask": torch.tensor(
-                    [1] * seq_len + [0] * pad_len, dtype=torch.long
-                ),
-                "action_tags": torch.tensor(
-                    action_tags + [IGNORE] * pad_len, dtype=torch.long
-                ),
-                "content_tags": torch.tensor(
-                    content_tags + [IGNORE] * pad_len, dtype=torch.long
-                ),
-                "_bytes_read": self._bytes_read,
-                "_total_bytes": self.total_bytes,
-            }
+            if self.single_head:
+                input_ids, edit_tags = result
+                seq_len = len(input_ids)
+                if seq_len > self.max_seq_len:
+                    input_ids = input_ids[:self.max_seq_len]
+                    edit_tags = edit_tags[:self.max_seq_len]
+                    seq_len = self.max_seq_len
+                pad_len = self.max_seq_len - seq_len
+                yield {
+                    "input_ids": torch.tensor(
+                        input_ids + [pad_id] * pad_len, dtype=torch.long),
+                    "attention_mask": torch.tensor(
+                        [1] * seq_len + [0] * pad_len, dtype=torch.long),
+                    "edit_tags": torch.tensor(
+                        edit_tags + [IGNORE] * pad_len, dtype=torch.long),
+                    "_bytes_read": self._bytes_read,
+                    "_total_bytes": self.total_bytes,
+                }
+            else:
+                input_ids, action_tags, content_tags = result
+                seq_len = len(input_ids)
+                if seq_len > self.max_seq_len:
+                    input_ids = input_ids[:self.max_seq_len]
+                    action_tags = action_tags[:self.max_seq_len]
+                    content_tags = content_tags[:self.max_seq_len]
+                    seq_len = self.max_seq_len
+                pad_len = self.max_seq_len - seq_len
+                yield {
+                    "input_ids": torch.tensor(
+                        input_ids + [pad_id] * pad_len, dtype=torch.long),
+                    "attention_mask": torch.tensor(
+                        [1] * seq_len + [0] * pad_len, dtype=torch.long),
+                    "action_tags": torch.tensor(
+                        action_tags + [IGNORE] * pad_len, dtype=torch.long),
+                    "content_tags": torch.tensor(
+                        content_tags + [IGNORE] * pad_len, dtype=torch.long),
+                    "_bytes_read": self._bytes_read,
+                    "_total_bytes": self.total_bytes,
+                }
 
 
 if __name__ == "__main__":
