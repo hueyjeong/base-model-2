@@ -134,8 +134,9 @@ class WordPieceGECDataset(IterableDataset):
         if self.shuffle_files:
             self.rng.shuffle(files)
 
-        # Resume: 이전에 읽은 바이트 위치까지 빠르게 건너뛰기
+        # Resume: 이전에 읽은 바이트 위치까지 빠르게 건너뛰기 (1회만 적용)
         resume_bytes = getattr(self, "_resume_bytes", 0)
+        self._resume_bytes = 0  # persistent_workers에서 다음 에포크 재스킵 방지
         skipped_bytes = 0
 
         line_idx = 0
