@@ -269,9 +269,10 @@ def train(args):
             print(f"  경고: num_workers={args.num_workers}는 과도할 수 있음 (권장: 8~16)")
 
     # ── 모델 ──
+    tied_content = not args.no_tied_content
     if is_main:
-        print(f"\n모델 로드: {args.model_name} (single_head={args.single_head})")
-    model = KoELECTRAGECToR(args.model_name, dropout=args.dropout, single_head=args.single_head).to(device)
+        print(f"\n모델 로드: {args.model_name} (single_head={args.single_head}, tied_content={tied_content})")
+    model = KoELECTRAGECToR(args.model_name, dropout=args.dropout, single_head=args.single_head, tied_content=tied_content).to(device)
     raw_model = model  # DDP 래핑 전 참조 (state_dict, freeze/unfreeze용)
     total_params = sum(p.numel() for p in model.parameters())
     if is_main:
@@ -792,6 +793,7 @@ def main():
     p.add_argument("--text_key", default=None)
     p.add_argument("--model_name", default="monologg/koelectra-base-v3-discriminator")
     p.add_argument("--single_head", action="store_true", help="Single-head 태그 모드 (70K tags)")
+    p.add_argument("--no_tied_content", action="store_true", help="Two-head untied content head (독립 Linear)")
     p.add_argument("--dropout", type=float, default=0.1)
     p.add_argument("--max_seq_len", type=int, default=512)
     p.add_argument("--max_epochs", type=int, default=10)

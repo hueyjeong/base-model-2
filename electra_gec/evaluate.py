@@ -100,7 +100,7 @@ def evaluate(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # ── 모델 로드 ──
-    model = KoELECTRAGECToR(args.model_name, single_head=args.single_head).to(device)
+    model = KoELECTRAGECToR(args.model_name, single_head=args.single_head, tied_content=not args.no_tied_content).to(device)
     if args.checkpoint:
         ckpt = torch.load(args.checkpoint, map_location=device, weights_only=True)
         model.load_state_dict(ckpt["model_state_dict"])
@@ -242,6 +242,7 @@ def main():
     p.add_argument("--corpus", required=True)
     p.add_argument("--text_key", default=None)
     p.add_argument("--single_head", action="store_true", help="Single-head 태그 모드 (70K tags)")
+    p.add_argument("--no_tied_content", action="store_true", help="Two-head untied content head")
     p.add_argument("--model_name", default="monologg/koelectra-base-v3-discriminator")
     p.add_argument("--max_seq_len", type=int, default=512)
     p.add_argument("--n_samples", type=int, default=500)

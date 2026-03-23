@@ -74,6 +74,7 @@ class KoELECTRAGECToR(nn.Module):
         model_name: str = "monologg/koelectra-base-v3-discriminator",
         dropout: float = 0.1,
         single_head: bool = False,
+        tied_content: bool = True,
     ):
         super().__init__()
         self.electra = AutoModel.from_pretrained(model_name)
@@ -91,11 +92,17 @@ class KoELECTRAGECToR(nn.Module):
             nn.init.xavier_uniform_(self.tag_head.weight)
             nn.init.zeros_(self.tag_head.bias)
         else:
-            # Two-head: Action + Content (tied)
+            # Two-head: Action + Content
             self.action_head = nn.Linear(d, 4)
             nn.init.xavier_uniform_(self.action_head.weight)
             nn.init.zeros_(self.action_head.bias)
-            self.content_bias = nn.Parameter(torch.zeros(V))
+            self.tied_content = tied_content
+            if tied_content:
+                self.content_bias = nn.Parameter(torch.zeros(V))
+            else:
+                self.content_head = nn.Linear(d, V)
+                nn.init.xavier_uniform_(self.content_head.weight)
+                nn.init.zeros_(self.content_head.bias)
 
     def forward(
         self,
@@ -116,9 +123,11 @@ class KoELECTRAGECToR(nn.Module):
 
         action_logits = self.action_head(h)  # (B, T, 4)
 
-        # Tied content head: h @ word_embeddings.T + bias
-        embed_w = self.electra.embeddings.word_embeddings.weight  # (V, 768)
-        content_logits = F.linear(h, embed_w, self.content_bias)  # (B, T, V)
+        if self.tied_content:
+            embed_w = self.electra.embeddings.word_embeddings.weight  # (V, 768)
+            content_logits = F.linear(h, embed_w, self.content_bias)  # (B, T, V)
+        else:
+            content_logits = self.content_head(h)  # (B, T, V)
 
         return action_logits, content_logits
 
@@ -277,9 +286,23 @@ if __name__ == "__main__":
     assert result == [10, 99, 40, 55], f"apply 실패: {result}"
     print(f"apply_two_head_tags OK: {result}")
 
+    # ── Two-head untied 테스트 ──
+    print("\n--- Two-head untied ---")
+    del model
+    model_ut = KoELECTRAGECToR(tied_content=False)
+    total_ut = sum(p.numel() for p in model_ut.parameters())
+    print(f"총 파라미터: {total_ut:,} (untied, +{total_ut - total:,} vs tied)")
+    act_logits_ut, cont_logits_ut = model_ut(ids, mask)
+    print(f"action_logits: {act_logits_ut.shape}, content_logits: {cont_logits_ut.shape}")
+    loss_ut = act_logits_ut.sum() + cont_logits_ut.sum()
+    loss_ut.backward()
+    print("backward OK")
+    actions_ut, contents_ut, conf_ut = model_ut.predict(ids, mask, keep_bias=1.0)
+    print(f"predict → actions: {actions_ut.shape}, contents: {contents_ut.shape}")
+
     # ── Single-head 테스트 ──
     print("\n--- Single-head ---")
-    del model
+    del model_ut
     model_sh = KoELECTRAGECToR(single_head=True)
     total_sh = sum(p.numel() for p in model_sh.parameters())
     print(f"총 파라미터: {total_sh:,} (n_tags={model_sh.n_tags})")
