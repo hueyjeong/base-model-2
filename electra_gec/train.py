@@ -662,22 +662,6 @@ def train(args):
                     if vl < best_val_loss:
                         best_val_loss = vl
                         no_improve = 0
-                        if is_main:
-                            best_path = os.path.join(ckpt_dir, "best.pt")
-                            torch.save({
-                                "epoch": epoch, "global_step": global_step,
-                                "stage_step": stage_step,
-                                "model_state_dict": raw_model.state_dict(),
-                                "optimizer_state_dict": optimizer.state_dict(),
-                                "val_loss": vl, "metrics": m,
-                                "stage": stage["name"],
-                                "best_val_loss": best_val_loss,
-                                "no_improve": no_improve,
-                                "data_state": _make_data_state(),
-                            }, best_path)
-                            print(f"  -> best 저장 (val_loss={vl:.4f})")
-                            if args.gdrive_remote:
-                                upload_and_cleanup(best_path, args.log_file, args.gdrive_remote, keep_latest_n=1)
                     else:
                         no_improve += 1
                         if no_improve >= args.patience:
@@ -686,10 +670,13 @@ def train(args):
                             stage_done = True
                             break
 
-            # 에포크 체크포인트
+            # DDP 동기화 — 체크포인트 저장 전에 barrier (저장이 오래 걸려서 timeout 방지)
+            if is_ddp:
+                dist.barrier()
+
+            # 에포크 체크포인트 (rank 0만, barrier 이후)
             if is_main:
-                ep_ckpt_path = os.path.join(ckpt_dir, f"epoch_{epoch}.pt")
-                torch.save({
+                ckpt_data = {
                     "epoch": epoch, "global_step": global_step,
                     "stage_step": stage_step,
                     "model_state_dict": raw_model.state_dict(),
@@ -698,13 +685,21 @@ def train(args):
                     "best_val_loss": best_val_loss,
                     "no_improve": no_improve,
                     "data_state": _make_data_state(),
-                }, ep_ckpt_path)
+                }
+                ep_ckpt_path = os.path.join(ckpt_dir, f"epoch_{epoch}.pt")
+                torch.save(ckpt_data, ep_ckpt_path)
                 print(f"  [SAVE] {ep_ckpt_path}")
                 if args.gdrive_remote:
                     upload_and_cleanup(ep_ckpt_path, args.log_file, args.gdrive_remote, keep_latest_n=1)
 
-            if is_ddp:
-                dist.barrier()
+                if m and m["val_loss"] == best_val_loss:
+                    best_path = os.path.join(ckpt_dir, "best.pt")
+                    ckpt_data["val_loss"] = best_val_loss
+                    ckpt_data["metrics"] = m
+                    torch.save(ckpt_data, best_path)
+                    print(f"  -> best 저장 (val_loss={best_val_loss:.4f})")
+                    if args.gdrive_remote:
+                        upload_and_cleanup(best_path, args.log_file, args.gdrive_remote, keep_latest_n=1)
 
         if stage_done:
             break
