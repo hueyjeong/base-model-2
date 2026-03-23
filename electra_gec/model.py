@@ -134,7 +134,7 @@ class KoELECTRAGECToR(nn.Module):
         action_conf = action_probs.max(dim=-1).values
         content_conf = content_probs.max(dim=-1).values
 
-        is_edit = (actions == ACTION_REPLACE) | (actions == ACTION_INSERT)
+        is_edit = (actions == ACTION_DELETE) | (actions == ACTION_REPLACE) | (actions == ACTION_INSERT)
         confidence = torch.where(is_edit, action_conf * content_conf, action_conf)
 
         # 확신도 미달 → KEEP으로 강제
