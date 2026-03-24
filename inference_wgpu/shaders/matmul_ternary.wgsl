@@ -1,10 +1,10 @@
-// Packed2Bit ternary matmul: out[t, j] = gamma * Σ_k decode(packed[j, k/4]) * x[t, k]
+// Packed2Bit ternary matmul: 곱셈 없는 조건부 add/sub
 //
-// 2-bit 인코딩: 00=0, 01=+1, 11=-1 (10 미사용)
-// 리틀엔디안: u32 word의 byte[0]=LSB, byte 내 bit[7:6]=첫 번째 값
+// out[t, j] = gamma * Σ_k ternary(w[j,k]) * x[t, k]
+// ternary: {-1, 0, +1} → multiply 대신 add/sub/skip
 //
-// Ternary 모드 (mode=0): out = gamma * acc
-// BitLinear 모드 (mode=1): out = gamma * token_scales[col] * acc
+// 공유 메모리에 packed u32로 가중치 저장 (f32 대비 4x 절약)
+// inner loop에서 u32 → 4개 ternary 직접 처리
 
 @group(0) @binding(0) var<storage, read> packed_w: array<u32>;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
@@ -22,58 +22,35 @@ struct Params {
 @group(0) @binding(4) var<storage, read> token_scales: array<f32>;
 @group(0) @binding(5) var<storage, read> row_sums: array<i32>;
 
-// 타일 설정: 각 스레드가 4×4 출력 계산 → 워크그룹당 32×32 출력
-const WG: u32 = 8u;       // workgroup_size(8, 8)
-const BM: u32 = 32u;      // 출력 tile M 크기 (WG * TM)
-const BN: u32 = 32u;      // 출력 tile N 크기 (WG * TN)
-const BK: u32 = 32u;      // K-strip 크기
-const TM: u32 = 4u;       // 스레드당 M 출력
-const TN: u32 = 4u;       // 스레드당 N 출력
+const WG: u32 = 8u;
+const BM: u32 = 32u;
+const BN: u32 = 32u;
+const BK: u32 = 32u;   // K-strip, 4의 배수 (packed byte 정렬)
+const TM: u32 = 4u;
+const TN: u32 = 4u;
 
-// 공유 메모리: BN×BK + BM×BK = 32*32 + 32*32 = 2048 + 2048 = 4096 floats = 16KB
-var<workgroup> smem_x: array<f32, 1024>;  // BN × BK = 32 × 32
-var<workgroup> smem_w: array<f32, 1024>;  // BM × BK = 32 × 32
-
-fn decode_ternary_fast(packed_byte: u32, pos: u32) -> f32 {
-    let shift = (3u - pos) * 2u;
-    let code = (packed_byte >> shift) & 3u;
-    // 분기 없는 디코딩: code→f32 LUT
-    // 00=0, 01=+1, 10=0, 11=-1
-    // (code & 1) gives 0 for 0/2, 1 for 1/3
-    // (code >> 1) gives 0 for 0/1, 1 for 2/3
-    // sign = 1 - 2*(code>>1) = +1 or -1
-    // mask = code & 1  (0 or 1)
-    // result = mask * sign = 0, +1, 0, -1
-    let mask = f32(code & 1u);
-    let sign = 1.0 - 2.0 * f32(code >> 1u);
-    return mask * sign;
-}
+// 공유 메모리: x는 f32, w는 packed u32 (4 ternary per u32 byte)
+var<workgroup> smem_x: array<f32, 1024>;          // BN × BK = 32 × 32
+var<workgroup> smem_w_packed: array<u32, 256>;     // BM × (BK/4) = 32 × 8 packed bytes as u32
 
 @compute @workgroup_size(8, 8, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>,
-        @builtin(local_invocation_id) lid: vec3<u32>,
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         @builtin(workgroup_id) wid: vec3<u32>) {
+    let tx = lid.x;
+    let ty = lid.y;
+    let tid = ty * WG + tx;
+    let n_base = wid.x * BN;
+    let m_base = wid.y * BM;
 
-    let tx = lid.x;  // 0..7
-    let ty = lid.y;  // 0..7
-    let bx = wid.x;  // block col (N 방향)
-    let by = wid.y;  // block row (M 방향)
-
-    // 이 스레드의 4×4 누적기
-    var acc: array<f32, 16>;  // TM × TN = 4×4
+    var acc: array<f32, 16>;
     for (var i = 0u; i < 16u; i++) { acc[i] = 0.0; }
 
-    let n_base = bx * BN;  // 이 블록의 N 시작
-    let m_base = by * BM;  // 이 블록의 M 시작
-    let tid = ty * WG + tx; // 0..63
-
     for (var k_start: u32 = 0u; k_start < params.K; k_start += BK) {
-        // ── 공유 메모리 로드: smem_x[BN, BK] ──
-        // 64 스레드, 32×32=1024 원소 → 스레드당 16개
+        // ── x tile 로드 (f32) ──
         for (var i = 0u; i < 16u; i++) {
             let flat = tid * 16u + i;
-            let sn = flat / BK;  // 0..31 (N 차원)
-            let sk = flat % BK;  // 0..31 (K 차원)
+            let sn = flat / BK;
+            let sk = flat % BK;
             let gn = n_base + sn;
             let gk = k_start + sk;
             if (gn < params.N && gk < params.K) {
@@ -83,45 +60,75 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
             }
         }
 
-        // ── 공유 메모리 로드: smem_w[BM, BK] ── (packed2bit 디코드)
-        for (var i = 0u; i < 16u; i++) {
-            let flat = tid * 16u + i;
-            let sm = flat / BK;  // 0..31 (M 차원)
-            let sk = flat % BK;  // 0..31 (K 차원)
+        // ── w tile 로드 (packed bytes → u32) ──
+        // BM × BK/4 = 32 × 8 = 256 bytes → 64 u32 words
+        // 64 스레드, 스레드당 4 bytes (1 u32) → but we store as bytes in u32 array
+        // 실제로: 32 rows × 8 packed_bytes = 256 bytes
+        // u32로 저장: 256/4 = 64 words
+        let packed_per_row = BK / 4u;  // 8
+        for (var i = 0u; i < 4u; i++) {
+            let flat = tid * 4u + i;
+            let sm = flat / packed_per_row;  // row (0..31)
+            let sb = flat % packed_per_row;  // byte index within row (0..7)
             let gm = m_base + sm;
-            let gk = k_start + sk;
-            if (gm < params.M && gk < params.K) {
-                let byte_idx = gk / 4u;
-                let byte_pos = gk % 4u;
+            let gk_byte = (k_start / 4u) + sb;
+            if (gm < params.M && gk_byte * 4u < params.K) {
                 let row_base = gm * params.packed_stride;
-                let word_idx = (row_base + byte_idx) / 4u;
-                let word_off = (row_base + byte_idx) % 4u;
+                let word_idx = (row_base + gk_byte) / 4u;
+                let word_off = (row_base + gk_byte) % 4u;
                 let word = packed_w[word_idx];
-                let pbyte = (word >> (word_off * 8u)) & 0xFFu;
-                smem_w[sm * BK + sk] = decode_ternary_fast(pbyte, byte_pos);
+                // 1 byte 추출하여 u32로 저장 (smem에는 byte 값만)
+                smem_w_packed[sm * packed_per_row + sb] = (word >> (word_off * 8u)) & 0xFFu;
             } else {
-                smem_w[sm * BK + sk] = 0.0;
+                smem_w_packed[sm * packed_per_row + sb] = 0u;
             }
         }
 
         workgroupBarrier();
 
-        // ── 계산: 각 스레드가 TM×TN 출력 누적 ──
-        for (var k = 0u; k < BK; k++) {
-            // 이 스레드의 w 값 TM개 로드
-            var w_reg: array<f32, 4>;
-            for (var tm = 0u; tm < TM; tm++) {
-                w_reg[tm] = smem_w[(ty * TM + tm) * BK + k];
-            }
-            // 이 스레드의 x 값 TN개 로드
-            var x_reg: array<f32, 4>;
+        // ── 계산: packed byte에서 직접 ternary add/sub ──
+        // BK=32, 4 values per byte → 8 bytes per row per strip
+        for (var kb = 0u; kb < BK / 4u; kb++) {
+            // x 레지스터 로드 (4개씩)
+            var x_vals: array<array<f32, 4>, 4>;  // TN × 4
             for (var tn = 0u; tn < TN; tn++) {
-                x_reg[tn] = smem_x[(tx * TN + tn) * BK + k];
+                let x_base = (tx * TN + tn) * BK + kb * 4u;
+                x_vals[tn][0] = smem_x[x_base];
+                x_vals[tn][1] = smem_x[x_base + 1u];
+                x_vals[tn][2] = smem_x[x_base + 2u];
+                x_vals[tn][3] = smem_x[x_base + 3u];
             }
-            // outer product 누적
+
+            // w 디코드 + 조건부 add/sub (TM rows)
             for (var tm = 0u; tm < TM; tm++) {
+                let packed_byte = smem_w_packed[(ty * TM + tm) * (BK / 4u) + kb];
+                // 4개 ternary 값 추출
+                let c0 = (packed_byte >> 6u) & 3u;  // MSB pair
+                let c1 = (packed_byte >> 4u) & 3u;
+                let c2 = (packed_byte >> 2u) & 3u;
+                let c3 = packed_byte & 3u;            // LSB pair
+
+                // 각 ternary 값에 대해 조건부 add/sub (곱셈 없음)
                 for (var tn = 0u; tn < TN; tn++) {
-                    acc[tm * TN + tn] += w_reg[tm] * x_reg[tn];
+                    let idx = tm * TN + tn;
+                    // code: 00=0, 01=+1, 11=-1
+                    // bit0이 1이면 nonzero, bit1이 1이면 negative
+                    if ((c0 & 1u) != 0u) {
+                        if ((c0 & 2u) != 0u) { acc[idx] -= x_vals[tn][0]; }
+                        else                  { acc[idx] += x_vals[tn][0]; }
+                    }
+                    if ((c1 & 1u) != 0u) {
+                        if ((c1 & 2u) != 0u) { acc[idx] -= x_vals[tn][1]; }
+                        else                  { acc[idx] += x_vals[tn][1]; }
+                    }
+                    if ((c2 & 1u) != 0u) {
+                        if ((c2 & 2u) != 0u) { acc[idx] -= x_vals[tn][2]; }
+                        else                  { acc[idx] += x_vals[tn][2]; }
+                    }
+                    if ((c3 & 1u) != 0u) {
+                        if ((c3 & 2u) != 0u) { acc[idx] -= x_vals[tn][3]; }
+                        else                  { acc[idx] += x_vals[tn][3]; }
+                    }
                 }
             }
         }
