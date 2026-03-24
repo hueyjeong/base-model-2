@@ -174,7 +174,8 @@ impl AllPipelines {
 
             conv1d: create_pipeline(gpu, "conv1d",
                 include_str!("../shaders/conv1d.wgsl"), "main",
-                &[storage_ro(0), storage_ro(1), storage_ro(2), storage_rw(3), uniform(4)]),
+                &[storage_ro(0), storage_ro(1), storage_ro(2),
+                  storage_rw(3), storage_rw(4), storage_rw(5), uniform(6)]),
 
             extract_xbc_dt: create_pipeline(gpu, "extract_xbc_dt",
                 include_str!("../shaders/extract_xbc_dt.wgsl"), "main",
@@ -290,9 +291,11 @@ pub struct MatmulTernaryParams {
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct Conv1dParams {
     pub seq_len: u32,
-    pub channels: u32,
+    pub d_conv_in: u32,
     pub d_conv: u32,
-    pub _pad: u32,
+    pub d_inner: u32,
+    pub ng_ds: u32,
+    pub _pad: [u32; 3],
 }
 
 #[repr(C)]
@@ -506,16 +509,21 @@ pub fn dispatch_matmul_ternary(
     ], (div_ceil(n, 32), div_ceil(m, 32), 1));
 }
 
-pub fn dispatch_conv1d(
+/// Conv1d + SiLU + x/B/C split 퓨전
+pub fn dispatch_conv1d_silu_split(
     gpu: &GpuContext, encoder: &mut CommandEncoder, pipes: &AllPipelines,
-    x: &Buffer, weight: &Buffer, bias: &Buffer, out: &Buffer,
-    seq_len: u32, channels: u32, d_conv: u32,
+    xbc: &Buffer, weight: &Buffer, bias: &Buffer,
+    x_out: &Buffer, b_out: &Buffer, c_out: &Buffer,
+    seq_len: u32, d_conv_in: u32, d_conv: u32, d_inner: u32, ng_ds: u32,
 ) {
-    let params = make_uniform(gpu, &Conv1dParams { seq_len, channels, d_conv, _pad: 0 });
+    let params = make_uniform(gpu, &Conv1dParams {
+        seq_len, d_conv_in, d_conv, d_inner, ng_ds, _pad: [0; 3],
+    });
     dispatch(gpu, encoder, &pipes.conv1d, &[
-        buf_entry(0, x), buf_entry(1, weight), buf_entry(2, bias),
-        buf_entry(3, out), buf_entry(4, &params),
-    ], (div_ceil(seq_len * channels, 256), 1, 1));
+        buf_entry(0, xbc), buf_entry(1, weight), buf_entry(2, bias),
+        buf_entry(3, x_out), buf_entry(4, b_out), buf_entry(5, c_out),
+        buf_entry(6, &params),
+    ], (div_ceil(seq_len * d_conv_in, 256), 1, 1));
 }
 
 pub fn dispatch_ssd_stage1(

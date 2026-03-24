@@ -400,16 +400,11 @@ impl DenseEditorGpu {
             proj_buf, &weights.dt_bias, &self.pool.xbc, &self.pool.dt,
             sl, d_in_proj, d_inner, d_conv_in, nh);
 
-        // 3. depthwise causal conv1d on xBC
-        dispatch_conv1d(gpu, encoder, &self.pipes,
+        // 3+4. conv1d + SiLU + split (퓨전)
+        dispatch_conv1d_silu_split(gpu, encoder, &self.pipes,
             &self.pool.xbc, &weights.conv1d_weight, &weights.conv1d_bias,
-            &self.pool.xbc_conv, sl, d_conv_in, d_conv);
-
-        // 4. SiLU + split into x_conv, B_conv, C_conv
-        dispatch_silu_split(gpu, encoder, &self.pipes,
-            &self.pool.xbc_conv, &self.pool.x_conv,
-            &self.pool.b_conv, &self.pool.c_conv,
-            sl, d_inner, d_conv_in, ng_ds);
+            &self.pool.x_conv, &self.pool.b_conv, &self.pool.c_conv,
+            sl, d_conv_in, d_conv, d_inner, ng_ds);
 
         // 5. SSD scan: 4 stages
         dispatch_ssd_stage1(gpu, encoder, &self.pipes,
