@@ -4,7 +4,6 @@
 
 mod gpu;
 mod buffers;
-mod pipelines;
 mod model;
 mod dispatch;
 
