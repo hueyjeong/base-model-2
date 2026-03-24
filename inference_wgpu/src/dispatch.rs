@@ -577,7 +577,7 @@ pub fn dispatch_ssd_stage4(
         buf_entry(0, x), buf_entry(1, b), buf_entry(2, c), buf_entry(3, dt),
         buf_entry(4, da_cumsum), buf_entry(5, prev_states),
         buf_entry(6, d_skip), buf_entry(7, y), buf_entry(8, &params),
-    ], (nheads * nchunks * 64, 1, 1));
+    ], (nheads * nchunks * chunk_size, 1, 1));
 }
 
 pub fn dispatch_gate_norm(
