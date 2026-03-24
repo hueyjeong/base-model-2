@@ -138,6 +138,7 @@ impl DenseEditorGpu {
         );
 
         let pipes = AllPipelines::new(gpu);
+        init_uniform_pool(gpu);
 
         // 더미 버퍼 (ternary matmul에서 BitLinear 미사용 시 placeholder)
         let dummy_f32 = gpu.device.create_buffer(&BufferDescriptor {
@@ -166,6 +167,7 @@ impl DenseEditorGpu {
     /// Forward pass: input_ids → tags
     pub fn forward(&mut self, gpu: &GpuContext, input_ids: &[u32]) -> Result<Vec<u32>> {
         use wgpu::util::DeviceExt;
+        reset_uniform_pool();
 
         let seq_len = input_ids.len();
         let d = self.config.d_model as u32;

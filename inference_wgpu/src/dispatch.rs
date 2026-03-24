@@ -86,7 +86,7 @@ fn uniform(binding: u32) -> BindGroupLayoutEntry {
     }
 }
 
-/// Uniform 버퍼 생성 (임시, 매 dispatch마다)
+/// Uniform 버퍼 생성 (매 dispatch 할당)
 fn make_uniform<T: Pod>(gpu: &GpuContext, data: &T) -> Buffer {
     use wgpu::util::DeviceExt;
     gpu.device.create_buffer_init(&util::BufferInitDescriptor {
@@ -95,6 +95,10 @@ fn make_uniform<T: Pod>(gpu: &GpuContext, data: &T) -> Buffer {
         usage: BufferUsages::UNIFORM,
     })
 }
+
+// 하위 호환용 no-op
+pub fn init_uniform_pool(_gpu: &GpuContext) {}
+pub fn reset_uniform_pool() {}
 
 /// dispatch 워크그룹 수 계산 (올림 나눗셈)
 fn div_ceil(a: u32, b: u32) -> u32 {
@@ -406,6 +410,7 @@ pub fn dispatch(
     pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
 }
 
+
 /// Buffer를 BindGroupEntry로 매핑하는 헬퍼
 pub fn buf_entry(binding: u32, buffer: &Buffer) -> BindGroupEntry {
     BindGroupEntry {
@@ -482,7 +487,7 @@ pub fn dispatch_matmul_f32(
     dispatch(gpu, encoder, &pipes.matmul_f32, &[
         buf_entry(0, weight), buf_entry(1, x),
         buf_entry(2, out), buf_entry(3, &params),
-    ], (div_ceil(n, 16), div_ceil(m, 16), 1));
+    ], (div_ceil(n, 32), div_ceil(m, 32), 1));
 }
 
 pub fn dispatch_matmul_ternary(
@@ -498,7 +503,7 @@ pub fn dispatch_matmul_ternary(
         buf_entry(0, packed_w), buf_entry(1, x),
         buf_entry(2, out), buf_entry(3, &params),
         buf_entry(4, token_scales), buf_entry(5, row_sums),
-    ], (div_ceil(n, 16), div_ceil(m, 16), 1));
+    ], (div_ceil(n, 32), div_ceil(m, 32), 1));
 }
 
 pub fn dispatch_conv1d(

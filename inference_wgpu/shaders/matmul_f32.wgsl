@@ -1,66 +1,95 @@
 // F32 tiled matmul: out[t, j] = Σ_k weight[j, k] * x[t, k]
 // weight: [M, K] row-major, x: [N, K] row-major, out: [N, M] row-major
-// 16×16 output tile, K-strip 64
+// 32×32 output tile, 스레드당 4×4 출력
 
-@group(0) @binding(0) var<storage, read> weight: array<f32>;  // [M, K]
-@group(0) @binding(1) var<storage, read> x: array<f32>;       // [N, K]
-@group(0) @binding(2) var<storage, read_write> out: array<f32>; // [N, M]
+@group(0) @binding(0) var<storage, read> weight: array<f32>;
+@group(0) @binding(1) var<storage, read> x: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out: array<f32>;
 
 struct Params {
-    M: u32,  // weight rows (output dim)
-    N: u32,  // batch (seq_len)
-    K: u32,  // input dim
+    M: u32,
+    N: u32,
+    K: u32,
 };
 @group(0) @binding(3) var<uniform> params: Params;
 
-const TILE: u32 = 16u;
-const STRIP: u32 = 64u;
+const WG: u32 = 8u;
+const BM: u32 = 32u;
+const BN: u32 = 32u;
+const BK: u32 = 32u;
+const TM: u32 = 4u;
+const TN: u32 = 4u;
 
-var<workgroup> tile_x: array<f32, 1024>;   // TILE × STRIP = 16 × 64
-var<workgroup> tile_w: array<f32, 1024>;   // TILE × STRIP = 16 × 64
+var<workgroup> smem_x: array<f32, 1024>;  // BN × BK
+var<workgroup> smem_w: array<f32, 1024>;  // BM × BK
 
-@compute @workgroup_size(16, 16, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>,
-        @builtin(local_invocation_id) lid: vec3<u32>) {
-    let col = gid.x;  // N 차원 (batch/seq token)
-    let row = gid.y;  // M 차원 (output dim)
+@compute @workgroup_size(8, 8, 1)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wid: vec3<u32>) {
+    let tx = lid.x;
+    let ty = lid.y;
+    let n_base = wid.x * BN;
+    let m_base = wid.y * BM;
+    let tid = ty * WG + tx;
 
-    var acc: f32 = 0.0;
+    var acc: array<f32, 16>;
+    for (var i = 0u; i < 16u; i++) { acc[i] = 0.0; }
 
-    for (var k_start: u32 = 0u; k_start < params.K; k_start += STRIP) {
-        // 공유 메모리로 x tile 로드: tile_x[lid.x][k] = x[col, k_start+k]
-        for (var i: u32 = 0u; i < 4u; i++) {
-            let k = lid.y * 4u + i;
-            let k_abs = k_start + k;
-            if (col < params.N && k_abs < params.K) {
-                tile_x[lid.x * STRIP + k] = x[col * params.K + k_abs];
+    for (var k_start: u32 = 0u; k_start < params.K; k_start += BK) {
+        // 공유 메모리 로드 (64 스레드, 1024 원소 → 스레드당 16개)
+        for (var i = 0u; i < 16u; i++) {
+            let flat = tid * 16u + i;
+            let sn = flat / BK;
+            let sk = flat % BK;
+            let gn = n_base + sn;
+            let gk = k_start + sk;
+            if (gn < params.N && gk < params.K) {
+                smem_x[sn * BK + sk] = x[gn * params.K + gk];
             } else {
-                tile_x[lid.x * STRIP + k] = 0.0;
+                smem_x[sn * BK + sk] = 0.0;
             }
         }
-
-        // 공유 메모리로 weight tile 로드: tile_w[lid.y][k] = weight[row, k_start+k]
-        for (var i: u32 = 0u; i < 4u; i++) {
-            let k = lid.x * 4u + i;
-            let k_abs = k_start + k;
-            if (row < params.M && k_abs < params.K) {
-                tile_w[lid.y * STRIP + k] = weight[row * params.K + k_abs];
+        for (var i = 0u; i < 16u; i++) {
+            let flat = tid * 16u + i;
+            let sm = flat / BK;
+            let sk = flat % BK;
+            let gm = m_base + sm;
+            let gk = k_start + sk;
+            if (gm < params.M && gk < params.K) {
+                smem_w[sm * BK + sk] = weight[gm * params.K + gk];
             } else {
-                tile_w[lid.y * STRIP + k] = 0.0;
+                smem_w[sm * BK + sk] = 0.0;
             }
         }
 
         workgroupBarrier();
 
-        // dot product
-        for (var k: u32 = 0u; k < STRIP; k++) {
-            acc += tile_w[lid.y * STRIP + k] * tile_x[lid.x * STRIP + k];
+        for (var k = 0u; k < BK; k++) {
+            var w_reg: array<f32, 4>;
+            for (var tm = 0u; tm < TM; tm++) {
+                w_reg[tm] = smem_w[(ty * TM + tm) * BK + k];
+            }
+            var x_reg: array<f32, 4>;
+            for (var tn = 0u; tn < TN; tn++) {
+                x_reg[tn] = smem_x[(tx * TN + tn) * BK + k];
+            }
+            for (var tm = 0u; tm < TM; tm++) {
+                for (var tn = 0u; tn < TN; tn++) {
+                    acc[tm * TN + tn] += w_reg[tm] * x_reg[tn];
+                }
+            }
         }
 
         workgroupBarrier();
     }
 
-    if (row < params.M && col < params.N) {
-        out[col * params.M + row] = acc;
+    for (var tm = 0u; tm < TM; tm++) {
+        let gm = m_base + ty * TM + tm;
+        if (gm >= params.M) { continue; }
+        for (var tn = 0u; tn < TN; tn++) {
+            let gn = n_base + tx * TN + tn;
+            if (gn >= params.N) { continue; }
+            out[gn * params.M + gm] = acc[tm * TN + tn];
+        }
     }
 }
