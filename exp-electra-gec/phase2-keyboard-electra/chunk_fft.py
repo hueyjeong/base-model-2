@@ -31,15 +31,29 @@ class ChunkFFT(nn.Module):
         self.chunk_size = chunk_size
         freq_bins = chunk_size // 2 + 1  # rfft 출력 크기
 
+        # DFT 실수부 행렬 (ONNX 호환 — torch.fft.rfft 대체)
+        # rfft(x) ≈ dft_matrix @ x (실수부만, 표준 matmul)
+        dft = self._make_dft_matrix(chunk_size)  # (freq_bins, chunk_size)
+        self.register_buffer("dft_matrix", dft)
+
         # 주파수 축 projection: (freq_bins) → (1) per feature dim
         self.freq_proj = nn.Linear(freq_bins, 1, bias=False)
         self.mood_norm = RMSNorm(d_model, eps=eps)
 
-        # mood vectors끼리 self-attention (n_chunks=16개, 사실상 무료)
-        self.mood_attn = nn.MultiheadAttention(
-            d_model, num_heads=n_mood_heads, batch_first=True, dropout=0.0,
-        )
+        # mood self-mixing: 단순 linear projection (ONNX 호환)
+        # nn.MultiheadAttention은 dynamic n_chunks에서 ONNX reshape 문제
+        self.mood_proj = nn.Linear(d_model, d_model, bias=False)
         self.out_norm = RMSNorm(d_model, eps=eps)
+
+    @staticmethod
+    def _make_dft_matrix(n: int) -> Tensor:
+        """실수 DFT 행렬 생성: cos(2πkt/n), k=0..n//2, t=0..n-1"""
+        import math
+        freq_bins = n // 2 + 1
+        t = torch.arange(n, dtype=torch.float32)
+        k = torch.arange(freq_bins, dtype=torch.float32)
+        angles = 2 * math.pi * k.unsqueeze(1) * t.unsqueeze(0) / n
+        return angles.cos()  # (freq_bins, n)
 
     def forward(
         self, x: Tensor,
@@ -68,22 +82,25 @@ class ChunkFFT(nn.Module):
         # 청크 분할
         chunks = x_padded.reshape(B, n_chunks, cs, D)  # (B, C, cs, D)
 
-        # rfft (시퀀스 축) — float32로 수행
-        freq = torch.fft.rfft(chunks.float(), dim=2)   # (B, C, freq_bins, D) complex
-        freq_real = freq.real
+        # DFT matmul (rfft 실수부 대체, ONNX 호환)
+        # dft_matrix: (freq_bins, cs) @ chunks: (B, C, cs, D) → (B, C, freq_bins, D)
+        freq_real = torch.einsum("fn,bcnd->bcfd", self.dft_matrix, chunks.float())
 
         # 주파수 축 projection → mood vector
         mood = self.freq_proj(freq_real.permute(0, 1, 3, 2)).squeeze(-1)  # (B, C, D)
         mood = mood.to(x.dtype)
         mood = self.mood_norm(mood)
 
-        # mood self-attention (문서 격리 적용)
+        # mood self-mixing (문서 격리 적용)
+        # nn.MultiheadAttention 대신 linear projection — ONNX dynamic shape 호환
         mood_mask = self._make_mood_mask(reset_mask, n_chunks, T, x.device)
-        mood = mood + self.mood_attn(
-            mood, mood, mood,
-            attn_mask=mood_mask,
-            need_weights=False,
-        )[0]
+        if mood_mask is not None:
+            # 문서 격리: 다른 문서의 mood를 0으로 마스킹 후 mean pool → 재주입
+            # mood_mask: (B, C, C) — True=차단
+            weight = (~mood_mask).float()  # True=허용
+            weight = weight / weight.sum(dim=-1, keepdim=True).clamp(min=1.0)
+            mood = torch.bmm(weight, mood)  # (B, C, D) — 문서 내 평균
+        mood = mood + self.mood_proj(mood)
         mood = self.out_norm(mood)
 
         # broadcast: 각 토큰에 해당 청크의 mood 주입
@@ -130,11 +147,7 @@ class ChunkFFT(nn.Module):
         # (B, C, 1) != (B, 1, C) → (B, C, C)
         mask = doc_id_chunks.unsqueeze(2) != doc_id_chunks.unsqueeze(1)
 
-        # nn.MultiheadAttention 3D mask: (B*nheads, C, C)
-        nheads = self.mood_attn.num_heads
-        mask = mask.unsqueeze(1).expand(-1, nheads, -1, -1).reshape(B * nheads, n_chunks, n_chunks)
-
-        return mask
+        return mask  # (B, C, C)
 
 
 if __name__ == "__main__":

@@ -1,17 +1,18 @@
-"""AttentionLayer — Full 또는 Window Self-Attention + SwiGLU FFN
+"""AttentionLayer — 양방향 Linear Attention + SwiGLU FFN
 
-window_size=None이면 Full Attention, 정수이면 Window Attention.
-flash_attn 패키지 있으면 사용 (mask 0bytes), 없으면 F.scaled_dot_product_attention fallback.
+양방향 Linear Attention: φ(Q) · (φ(K)^T · V) — O(Td²), softmax 없음.
+모든 연산이 matmul + element-wise → ONNX 표준 op, CPU/GPU 모두 효율적.
+문서 격리: reset_mask에서 문서 경계 파악 → 문서별 독립 KV 집계.
+학습과 추론이 동일한 연산 — 배포 시 불일치 없음.
 
 구조 (pre-norm):
-    RMSNorm → Q/K/V proj (Int8Linear) → RoPE → GQA → Attention → O proj → (+residual)
+    RMSNorm → Q/K/V proj (Int8Linear) → RoPE → Linear Attention → O proj → (+residual)
     RMSNorm → SwiGLU FFN → (+residual)
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from torch.utils.checkpoint import checkpoint
 
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -19,55 +20,17 @@ from model.bitlinear import Int8Linear
 from model.encoder import RMSNorm, SwiGLUFFN
 from model.mixing.full_attention import RotaryEmbedding, _apply_rotary
 
-# flash_attn 선택적 import
-_FLASH_ATTN = False
-try:
-    from flash_attn import flash_attn_func, flash_attn_varlen_func
-    _FLASH_ATTN = True
-except ImportError:
-    pass
 
-
-def _reset_mask_to_cu_seqlens(reset_mask: Tensor) -> tuple[Tensor, int]:
-    """reset_mask(BOS 위치) → cu_seqlens 변환 (flash_attn_varlen_func용)
-
-    Args:
-        reset_mask: (B, T) bool — BOS 위치가 True
-
-    Returns:
-        cu_seqlens: (total_docs + 1,) int32 — 누적 문서 길이
-        max_seqlen: int — 최대 문서 길이
-    """
-    B, T = reset_mask.shape
-    cu_seqlens_list = [0]
-    max_seqlen = 0
-
-    for b in range(B):
-        bos_pos = reset_mask[b].nonzero(as_tuple=True)[0]
-        n_docs = bos_pos.size(0)
-        for i in range(n_docs):
-            start = bos_pos[i].item()
-            end = bos_pos[i + 1].item() if i + 1 < n_docs else T
-            doc_len = end - start
-            cu_seqlens_list.append(cu_seqlens_list[-1] + doc_len)
-            max_seqlen = max(max_seqlen, doc_len)
-
-    return torch.tensor(cu_seqlens_list, dtype=torch.int32, device=reset_mask.device), max_seqlen
+def _feature_map(x: Tensor) -> Tensor:
+    """Linear attention feature map: elu(x) + 1 (양수 보장)"""
+    return F.elu(x) + 1
 
 
 class AttentionLayer(nn.Module):
-    """Full 또는 Window self-attention + SwiGLU FFN
+    """양방향 Linear Attention + SwiGLU FFN
 
-    Args:
-        d_model: 모델 차원
-        d_ff: FFN 중간 차원
-        n_heads: Q head 수
-        n_kv_heads: KV head 수 (GQA)
-        headdim: head 당 차원
-        max_seq_len: 최대 시퀀스 길이
-        window_size: None=Full Attention, int=Window Attention(w)
-        dropout: 드롭아웃 비율
-        eps: RMSNorm epsilon
+    Linear Attention: φ(Q) · (φ(K)^T · V) — O(Td²)
+    학습과 추론 동일 연산. ONNX 표준 op만 사용.
     """
 
     def __init__(
@@ -78,7 +41,6 @@ class AttentionLayer(nn.Module):
         n_kv_heads: int,
         headdim: int,
         max_seq_len: int = 4096,
-        window_size: int | None = None,
         dropout: float = 0.1,
         eps: float = 1e-6,
     ):
@@ -87,7 +49,6 @@ class AttentionLayer(nn.Module):
         self.n_kv_heads = n_kv_heads
         self.headdim = headdim
         self.kv_repeat = n_heads // n_kv_heads
-        self.window_size = window_size
 
         d_kv = n_kv_heads * headdim
 
@@ -116,14 +77,6 @@ class AttentionLayer(nn.Module):
         pad_mask: Tensor | None = None,
         reset_mask: Tensor | None = None,
     ) -> Tensor:
-        """
-        Args:
-            x: (B, T, D)
-            pad_mask: (B, T) bool — True=유효
-            reset_mask: (B, T) bool — BOS 위치 True (문서 격리용)
-        Returns:
-            (B, T, D)
-        """
         # ── Attention ──
         h = self.norm1(x)
         attn_out = self._attention(h, pad_mask, reset_mask)
@@ -142,175 +95,169 @@ class AttentionLayer(nn.Module):
         H_kv = self.n_kv_heads
         d = self.headdim
 
-        q = self.q_proj(x).view(B, T, H, d)       # (B, T, H, d)
-        k = self.k_proj(x).view(B, T, H_kv, d)    # (B, T, H_kv, d)
-        v = self.v_proj(x).view(B, T, H_kv, d)    # (B, T, H_kv, d)
+        q = self.q_proj(x).view(B, T, H, d)
+        k = self.k_proj(x).view(B, T, H_kv, d)
+        v = self.v_proj(x).view(B, T, H_kv, d)
 
-        # RoPE — (B, H, T, d) 형태 필요
-        q_t = q.transpose(1, 2)  # (B, H, T, d)
-        k_t = k.transpose(1, 2)  # (B, H_kv, T, d)
+        # RoPE
+        q_t = q.transpose(1, 2)
+        k_t = k.transpose(1, 2)
         q_t, k_t = self.rope(q_t, k_t)
-        q = q_t.transpose(1, 2)  # (B, T, H, d)
-        k = k_t.transpose(1, 2)  # (B, T, H_kv, d)
+        q = q_t.transpose(1, 2)
+        k = k_t.transpose(1, 2)
 
-        if _FLASH_ATTN and x.is_cuda and q.dtype in (torch.float16, torch.bfloat16):
-            out = self._flash_attention(q, k, v, pad_mask, reset_mask)
-        else:
-            out = self._sdpa_attention(q, k, v, pad_mask, reset_mask, B, T, D)
+        out = self._linear_attention(q, k, v, pad_mask, reset_mask)
 
         return self.o_proj(out)
 
-    def _flash_attention(
+    # ── Linear Attention (ONNX/CPU 호환) ──
+
+    def _linear_attention(
         self, q: Tensor, k: Tensor, v: Tensor,
         pad_mask: Tensor | None, reset_mask: Tensor | None,
     ) -> Tensor:
-        """flash_attn 사용 — mask 할당 0bytes"""
+        """양방향 Linear Attention: φ(Q) · (φ(K)^T · V)
+
+        O(Td²) — T×T 행렬 생성 없음, ONNX 표준 op만 사용.
+        문서 격리: reset_mask에서 문서별 독립 KV 집계.
+        """
         B, T, H, d = q.shape
+        H_kv = self.n_kv_heads
 
-        if self.window_size is not None:
-            # Window Attention
-            w = self.window_size
-            # flash_attn_func: (B, T, H, d) 형태 직접 사용, GQA 자동 처리
-            out = flash_attn_func(
-                q, k, v,
-                window_size=(w // 2, w // 2),
-                causal=False,
-            )
-        elif reset_mask is not None:
-            # Full Attention + 문서 격리 → varlen
-            cu_seqlens, max_seqlen = _reset_mask_to_cu_seqlens(reset_mask)
-            # (B, T, H, d) → (total_tokens, H, d) — pad 제거
-            q_flat = q.reshape(B * T, H, d)
-            k_flat = k.reshape(B * T, self.n_kv_heads, d)
-            v_flat = v.reshape(B * T, self.n_kv_heads, d)
-            out_flat = flash_attn_varlen_func(
-                q_flat, k_flat, v_flat,
-                cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
-                max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
-                causal=False,
-            )
-            out = out_flat.reshape(B, T, H, d)
-        else:
-            # Full Attention, 패킹 없음
-            out = flash_attn_func(q, k, v, causal=False)
+        # GQA expand
+        if self.kv_repeat > 1:
+            k = k.repeat_interleave(self.kv_repeat, dim=2)  # (B, T, H, d)
+            v = v.repeat_interleave(self.kv_repeat, dim=2)
 
-        return out.reshape(B, T, H * d)
+        # Feature map
+        q = _feature_map(q)  # (B, T, H, d)
+        k = _feature_map(k)
 
-    def _sdpa_attention(
-        self, q: Tensor, k: Tensor, v: Tensor,
-        pad_mask: Tensor | None, reset_mask: Tensor | None,
-        B: int, T: int, D: int,
-    ) -> Tensor:
-        """F.scaled_dot_product_attention fallback (CPU/비CUDA 환경)"""
-        H = self.n_heads
-        d = self.headdim
+        # PAD 마스킹: PAD 위치의 K, V를 0으로
+        if pad_mask is not None:
+            mask_expand = pad_mask.unsqueeze(-1).unsqueeze(-1).to(k.dtype)  # (B, T, 1, 1)
+            k = k * mask_expand
+            v = v * mask_expand
 
         # (B, T, H, d) → (B, H, T, d)
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        # GQA expand
-        if self.kv_repeat > 1:
-            k = k.repeat_interleave(self.kv_repeat, dim=1)
-            v = v.repeat_interleave(self.kv_repeat, dim=1)
-
-        # Attention mask
-        attn_mask = self._make_mask(reset_mask, pad_mask, T, q.device)
-
-        out = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False,
-        )
-        return out.transpose(1, 2).contiguous().reshape(B, T, D)
-
-    def _make_mask(
-        self, reset_mask: Tensor | None, pad_mask: Tensor | None,
-        T: int, device: torch.device,
-    ) -> Tensor | None:
-        """Window + 문서 격리 + PAD 마스킹 → attention mask"""
-        masks = []
-
-        if self.window_size is not None:
-            pos = torch.arange(T, device=device)
-            band = (pos.unsqueeze(1) - pos.unsqueeze(0)).abs() <= (self.window_size // 2)
-            masks.append(band)
-
         if reset_mask is not None:
-            doc_id = (reset_mask.int().cumsum(dim=1) - 1)
-            doc_mask = (doc_id.unsqueeze(2) == doc_id.unsqueeze(1))
-            masks.append(doc_mask)
+            out = self._linear_attn_with_docs(q, k, v, reset_mask)
+        else:
+            # 전역 linear attention
+            kv = torch.einsum("bhsd,bhse->bhde", k, v)  # (B, H, d, d)
+            out = torch.einsum("bhsd,bhde->bhse", q, kv)  # (B, H, T, d)
+            # 정규화
+            z = torch.einsum("bhsd,bhd->bhs", q, k.sum(dim=2))  # (B, H, T)
+            out = out / (z.unsqueeze(-1).clamp(min=1e-6))
 
-        if pad_mask is not None:
-            key_mask = pad_mask.unsqueeze(1)
-            masks.append(key_mask)
+        out = out.transpose(1, 2).contiguous().reshape(B, T, H * d)
+        return out
 
-        if not masks:
-            return None
+    def _linear_attn_with_docs(
+        self, q: Tensor, k: Tensor, v: Tensor, reset_mask: Tensor,
+    ) -> Tensor:
+        """문서별 독립 linear attention
 
-        combined = masks[0]
-        for m in masks[1:]:
-            combined = combined & m
+        각 문서 segment에 대해 독립적으로 KV 집계 → 문서 간 정보 누출 없음.
+        """
+        B, H, T, d = q.shape
+        out = torch.zeros_like(q)
 
-        # (T, T) → (1, 1, T, T), (B, T, T) → (B, 1, T, T)
-        if combined.dim() == 2:
-            return combined.unsqueeze(0).unsqueeze(0)
-        return combined.unsqueeze(1)
+        for b in range(B):
+            bos_pos = reset_mask[b].nonzero(as_tuple=True)[0]
+            n_docs = bos_pos.size(0)
+
+            for i in range(n_docs):
+                start = bos_pos[i].item()
+                end = bos_pos[i + 1].item() if i + 1 < n_docs else T
+
+                q_doc = q[b, :, start:end]  # (H, doc_len, d)
+                k_doc = k[b, :, start:end]
+                v_doc = v[b, :, start:end]
+
+                # KV = K^T @ V → (H, d, d)
+                kv_doc = torch.einsum("hsd,hse->hde", k_doc, v_doc)
+                # out = Q @ KV → (H, doc_len, d)
+                out_doc = torch.einsum("hsd,hde->hse", q_doc, kv_doc)
+                # 정규화
+                z_doc = torch.einsum("hsd,hd->hs", q_doc, k_doc.sum(dim=1))
+                out[b, :, start:end] = out_doc / (z_doc.unsqueeze(-1).clamp(min=1e-6))
+
+        return out
+
 
 
 if __name__ == "__main__":
-    print("=== AttentionLayer Smoke Test ===\n")
-    print(f"flash_attn: {'사용 가능' if _FLASH_ATTN else '미설치 (SDPA fallback)'}\n")
+    print("=== AttentionLayer Smoke Test (Linear Attention) ===\n")
 
     d_model, d_ff = 256, 512
     n_heads, n_kv_heads, headdim = 4, 2, 64
 
-    # Full Attention
-    fa = AttentionLayer(d_model, d_ff, n_heads, n_kv_heads, headdim, window_size=None)
-    fa._init_weights()
-    params_fa = sum(p.numel() for p in fa.parameters())
-    print(f"Full Attention 파라미터: {params_fa:,}")
+    # ── Linear Attention 테스트 ──
+    layer = AttentionLayer(d_model, d_ff, n_heads, n_kv_heads, headdim, )
+    layer._init_weights()
+    params = sum(p.numel() for p in layer.parameters())
+    print(f"파라미터: {params:,}")
 
+    # Forward
     x = torch.randn(2, 64, d_model)
     mask = torch.ones(2, 64, dtype=torch.bool)
     reset = torch.zeros(2, 64, dtype=torch.bool)
     reset[:, 0] = True
     reset[0, 32] = True  # 문서 2개
 
-    out = fa(x, pad_mask=mask, reset_mask=reset)
-    assert out.shape == (2, 64, d_model), f"FA shape: {out.shape}"
-    print(f"  FA forward OK: {out.shape}")
+    out = layer(x, pad_mask=mask, reset_mask=reset)
+    assert out.shape == (2, 64, d_model), f"shape: {out.shape}"
+    print(f"Linear Attn forward OK: {out.shape}")
 
     out.sum().backward()
-    print("  FA backward OK")
+    print("Linear Attn backward OK")
 
-    # Window Attention (w=64)
-    wa = AttentionLayer(d_model, d_ff, n_heads, n_kv_heads, headdim, window_size=64)
-    wa._init_weights()
-    x = torch.randn(2, 256, d_model)
-    mask = torch.ones(2, 256, dtype=torch.bool)
-    reset = torch.zeros(2, 256, dtype=torch.bool)
-    reset[:, 0] = True
+    # 문서 격리 테스트 (eval 모드에서 — dropout 비활성)
+    print("\n=== 문서 격리 테스트 ===")
+    layer.eval()
+    x = torch.randn(1, 128, d_model)
+    mask = torch.ones(1, 128, dtype=torch.bool)
+    reset = torch.zeros(1, 128, dtype=torch.bool)
+    reset[0, 0] = True
+    reset[0, 64] = True
 
-    out = wa(x, pad_mask=mask, reset_mask=reset)
-    assert out.shape == (2, 256, d_model), f"WA shape: {out.shape}"
-    print(f"\n  WA(w=64) forward OK: {out.shape}")
+    x2 = x.clone()
+    x2[0, 64:] = 0.0
 
-    out.sum().backward()
-    print("  WA backward OK")
+    with torch.no_grad():
+        out1 = layer(x, mask, reset)
+        out2 = layer(x2, mask, reset)
+    diff = (out1[0, :64] - out2[0, :64]).abs().max().item()
+    print(f"  문서 2 제거 후 문서 1 차이: {diff:.6f}")
+    assert diff < 1e-4, f"문서 격리 실패: {diff}"
+    print("  ✓ 문서 격리 OK")
+    layer.train()
 
-    # Window sizes
-    for w in [32, 128, 256]:
-        wa_test = AttentionLayer(d_model, d_ff, n_heads, n_kv_heads, headdim, window_size=w)
-        out = wa_test(torch.randn(1, 128, d_model))
-        assert out.shape == (1, 128, d_model)
-        print(f"  WA(w={w}) OK")
+    # seq=4096 CPU 벤치마크
+    import time
+    print("\n=== CPU 벤치마크 (linear attention) ===")
+    layer768 = AttentionLayer(768, 2048, 12, 4, 64, ).eval()
+    x_big = torch.randn(1, 4096, 768)
+    mask_big = torch.ones(1, 4096, dtype=torch.bool)
+    reset_big = torch.zeros(1, 4096, dtype=torch.bool)
+    reset_big[0, 0] = True
 
-    # 768 차원 (128M)
-    fa768 = AttentionLayer(768, 2048, 12, 4, 64, window_size=None)
-    p768 = sum(p.numel() for p in fa768.parameters())
-    print(f"\n  d=768 FA params: {p768:,}")
-    out768 = fa768(torch.randn(1, 32, 768))
-    assert out768.shape == (1, 32, 768)
-    print("  d=768 FA forward OK")
+    # warmup
+    with torch.no_grad():
+        for _ in range(2):
+            layer768(x_big, mask_big, reset_big)
+
+    N = 5
+    t0 = time.time()
+    with torch.no_grad():
+        for _ in range(N):
+            layer768(x_big, mask_big, reset_big)
+    dt = (time.time() - t0) / N * 1000
+    print(f"  seq=4096, d=768: {dt:.0f}ms/layer (linear)")
 
     print("\n모든 테스트 통과!")

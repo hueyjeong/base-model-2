@@ -23,19 +23,6 @@ from chunk_fft import ChunkFFT
 from attention_layer import AttentionLayer
 
 
-def _parse_layer_spec(spec: str) -> tuple[str, int | None]:
-    """레이어 사양 문자열 파싱
-
-    "fa" → ("fa", None)
-    "wa:64" → ("wa", 64)
-    """
-    if spec == "fa":
-        return "fa", None
-    if spec.startswith("wa:"):
-        return "wa", int(spec.split(":")[1])
-    raise ValueError(f"알 수 없는 layer spec: {spec}")
-
-
 class DiamondEncoder(nn.Module):
     """커스텀 Diamond 인코더
 
@@ -61,21 +48,20 @@ class DiamondEncoder(nn.Module):
             cfg.d_model, chunk_size=cfg.chunk_fft_size, eps=cfg.rms_norm_eps,
         )
 
-        # 다이아몬드 레이어 스택
-        self.layers = nn.ModuleList()
-        for spec in cfg.layer_spec:
-            _, window_size = _parse_layer_spec(spec)
-            self.layers.append(AttentionLayer(
+        # Linear Attention 레이어 스택
+        n_layers = len(cfg.layer_spec)
+        self.layers = nn.ModuleList([
+            AttentionLayer(
                 d_model=cfg.d_model,
                 d_ff=cfg.d_ff,
                 n_heads=cfg.n_heads,
                 n_kv_heads=cfg.n_kv_heads,
                 headdim=cfg.headdim,
                 max_seq_len=cfg.max_seq_len,
-                window_size=window_size,
                 dropout=cfg.dropout,
                 eps=cfg.rms_norm_eps,
-            ))
+            ) for _ in range(n_layers)
+        ])
 
         # Final norm
         self.final_norm = RMSNorm(cfg.d_model, eps=cfg.rms_norm_eps)
