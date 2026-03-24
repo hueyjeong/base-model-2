@@ -7,7 +7,7 @@ struct Params {
     n: u32,          // 총 원소 수
     act_type: u32,   // 0=SiLU, 1=Softplus
 };
-@group(0) @binding(2) var<uniform> params: Params;
+var<push_constant> params: Params;
 
 fn silu(v: f32) -> f32 {
     return v / (1.0 + exp(-v));

@@ -11,7 +11,7 @@ struct Params {
     d_in_proj: u32,  // z 버퍼의 stride (d_in_proj)
     eps: f32,
 };
-@group(0) @binding(3) var<uniform> params: Params;
+var<push_constant> params: Params;
 
 fn silu(v: f32) -> f32 {
     return v / (1.0 + exp(-v));

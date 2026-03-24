@@ -19,7 +19,7 @@ struct Params {
     d_inner: u32,
     ng_ds: u32,
 };
-@group(0) @binding(6) var<uniform> params: Params;
+var<push_constant> params: Params;
 
 fn silu(v: f32) -> f32 {
     return v / (1.0 + exp(-v));

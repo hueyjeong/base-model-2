@@ -21,7 +21,7 @@ struct Params {
     chunk_size: u32,
     nchunks: u32,
 };
-@group(0) @binding(3) var<uniform> params: Params;
+var<push_constant> params: Params;
 
 const WG: u32 = 8u;
 const BM: u32 = 32u;   // tile L 크기

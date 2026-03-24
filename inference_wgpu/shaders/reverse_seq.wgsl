@@ -7,7 +7,7 @@ struct Params {
     d_model: u32,
     seq_len: u32,
 };
-@group(0) @binding(2) var<uniform> params: Params;
+var<push_constant> params: Params;
 
 @compute @workgroup_size(256, 1, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {

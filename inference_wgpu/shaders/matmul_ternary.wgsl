@@ -3,8 +3,8 @@
 // out[t, j] = gamma * Σ_k ternary(w[j,k]) * x[t, k]
 // ternary: {-1, 0, +1} → multiply 대신 add/sub/skip
 //
-// 공유 메모리에 packed u32로 가중치 저장 (f32 대비 4x 절약)
-// inner loop에서 u32 → 4개 ternary 직접 처리
+// 32×32 output tile, 8×8 workgroup, 스레드당 4×4 출력
+// 공유 메모리: x는 f32, w는 packed u32 (4 ternary per byte)
 
 @group(0) @binding(0) var<storage, read> packed_w: array<u32>;
 @group(0) @binding(1) var<storage, read> x: array<f32>;
@@ -18,9 +18,9 @@ struct Params {
     packed_stride: u32,
     mode: u32,
 };
-@group(0) @binding(3) var<uniform> params: Params;
-@group(0) @binding(4) var<storage, read> token_scales: array<f32>;
-@group(0) @binding(5) var<storage, read> row_sums: array<i32>;
+var<push_constant> params: Params;
+@group(0) @binding(3) var<storage, read> token_scales: array<f32>;
+@group(0) @binding(4) var<storage, read> row_sums: array<i32>;
 
 const WG: u32 = 8u;
 const BM: u32 = 32u;
@@ -61,15 +61,11 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
         }
 
         // ── w tile 로드 (packed bytes → u32) ──
-        // BM × BK/4 = 32 × 8 = 256 bytes → 64 u32 words
-        // 64 스레드, 스레드당 4 bytes (1 u32) → but we store as bytes in u32 array
-        // 실제로: 32 rows × 8 packed_bytes = 256 bytes
-        // u32로 저장: 256/4 = 64 words
         let packed_per_row = BK / 4u;  // 8
         for (var i = 0u; i < 4u; i++) {
             let flat = tid * 4u + i;
-            let sm = flat / packed_per_row;  // row (0..31)
-            let sb = flat % packed_per_row;  // byte index within row (0..7)
+            let sm = flat / packed_per_row;
+            let sb = flat % packed_per_row;
             let gm = m_base + sm;
             let gk_byte = (k_start / 4u) + sb;
             if (gm < params.M && gk_byte * 4u < params.K) {
@@ -77,7 +73,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
                 let word_idx = (row_base + gk_byte) / 4u;
                 let word_off = (row_base + gk_byte) % 4u;
                 let word = packed_w[word_idx];
-                // 1 byte 추출하여 u32로 저장 (smem에는 byte 값만)
                 smem_w_packed[sm * packed_per_row + sb] = (word >> (word_off * 8u)) & 0xFFu;
             } else {
                 smem_w_packed[sm * packed_per_row + sb] = 0u;
@@ -86,11 +81,9 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
 
         workgroupBarrier();
 
-        // ── 계산: packed byte에서 직접 ternary add/sub ──
-        // BK=32, 4 values per byte → 8 bytes per row per strip
+        // ── 계산: conditional add/sub (원래 방식, 분기가 GPU에서 더 빠름) ──
         for (var kb = 0u; kb < BK / 4u; kb++) {
-            // x 레지스터 로드 (4개씩)
-            var x_vals: array<array<f32, 4>, 4>;  // TN × 4
+            var x_vals: array<array<f32, 4>, 4>;
             for (var tn = 0u; tn < TN; tn++) {
                 let x_base = (tx * TN + tn) * BK + kb * 4u;
                 x_vals[tn][0] = smem_x[x_base];
@@ -99,20 +92,15 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>,
                 x_vals[tn][3] = smem_x[x_base + 3u];
             }
 
-            // w 디코드 + 조건부 add/sub (TM rows)
             for (var tm = 0u; tm < TM; tm++) {
                 let packed_byte = smem_w_packed[(ty * TM + tm) * (BK / 4u) + kb];
-                // 4개 ternary 값 추출
-                let c0 = (packed_byte >> 6u) & 3u;  // MSB pair
+                let c0 = (packed_byte >> 6u) & 3u;
                 let c1 = (packed_byte >> 4u) & 3u;
                 let c2 = (packed_byte >> 2u) & 3u;
-                let c3 = packed_byte & 3u;            // LSB pair
+                let c3 = packed_byte & 3u;
 
-                // 각 ternary 값에 대해 조건부 add/sub (곱셈 없음)
                 for (var tn = 0u; tn < TN; tn++) {
                     let idx = tm * TN + tn;
-                    // code: 00=0, 01=+1, 11=-1
-                    // bit0이 1이면 nonzero, bit1이 1이면 negative
                     if ((c0 & 1u) != 0u) {
                         if ((c0 & 2u) != 0u) { acc[idx] -= x_vals[tn][0]; }
                         else                  { acc[idx] += x_vals[tn][0]; }

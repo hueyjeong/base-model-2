@@ -27,15 +27,30 @@ from export_model import (
 
 
 def is_bitlinear_weight(key: str) -> bool:
-    """BitLinear으로 처리되는 weight 키 (RWKV proj + MoE expert FFN)"""
-    # RWKV projections
+    """BitLinear으로 처리되는 weight 키"""
+    if not key.endswith(".weight"):
+        return False
+    # RWKV projections (레거시)
     if any(p in key for p in [".r_proj.", ".k_proj.", ".v_proj.", ".o_proj."]):
-        if ".bi_rwkv." in key and key.endswith(".weight"):
+        if ".bi_rwkv." in key:
             return True
-    # MoE expert FFN
-    if ".moe_ffn.experts." in key and ".weight" in key:
+    # MoE expert FFN (레거시)
+    if ".moe_ffn.experts." in key:
         if any(p in key for p in [".gate_proj.", ".up_proj.", ".down_proj."]):
             return True
+    # DenseEditor Mamba2: in_proj_up, out_proj
+    if ".mixing." in key:
+        if any(p in key for p in [".in_proj_up.", ".out_proj.", ".in_proj."]):
+            # in_proj_down은 F32 (LoRA down), in_proj_up은 BitLinear
+            if ".in_proj_down." not in key:
+                return True
+    # DenseEditor FFN: gate_up_proj, down_proj
+    if ".ffn." in key:
+        if any(p in key for p in [".gate_up_proj.", ".down_proj."]):
+            return True
+    # tag_head
+    if key == "tag_head.weight":
+        return True
     return False
 
 
@@ -51,9 +66,9 @@ def is_linear_weight(key: str) -> bool:
     # LoRA weights
     if "lora_" in key and ".weight" in key:
         return True
-    # Tag head
-    if key == "tag_head.weight":
-        return True
+    # Tag head → bitlinear로 이동
+    # if key == "tag_head.weight":
+    #     return True
     # RWKV gate projection
     if ".g_proj." in key:
         return True

@@ -16,7 +16,7 @@ struct Params {
     d_conv_in: u32,
     nheads: u32,
 };
-@group(0) @binding(4) var<uniform> params: Params;
+var<push_constant> params: Params;
 
 fn softplus(v: f32) -> f32 {
     if (v > 20.0) { return v; }

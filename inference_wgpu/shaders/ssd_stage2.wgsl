@@ -18,7 +18,7 @@ struct Params {
     nchunks: u32,
     d_inner: u32,
 };
-@group(0) @binding(5) var<uniform> params: Params;
+var<push_constant> params: Params;
 
 @compute @workgroup_size(64, 1, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>,

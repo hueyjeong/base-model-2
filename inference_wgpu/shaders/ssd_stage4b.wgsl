@@ -24,7 +24,7 @@ struct Params {
     nchunks: u32,
     d_inner: u32,
 };
-@group(0) @binding(8) var<uniform> params: Params;
+var<push_constant> params: Params;
 
 // score 캐싱: 최대 256개 (chunk_size). 256*4 = 1KB
 var<workgroup> smem_score: array<f32, 256>;

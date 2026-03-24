@@ -34,6 +34,10 @@ struct Args {
     #[arg(long)]
     benchmark: bool,
 
+    /// 프로파일 모드 (섹션별 GPU 시간)
+    #[arg(long)]
+    profile: bool,
+
     /// 벤치마크 시퀀스 길이
     #[arg(long, default_value = "200")]
     seq_len: usize,
@@ -74,9 +78,14 @@ fn main() -> Result<()> {
     eprintln!("모델: d={}, {}L, tags={}", config.d_model, config.n_layers, config.n_tags);
 
     let mut model = DenseEditorGpu::load(&gpu, config, &args.model)?;
-    eprintln!("모델 로드 완료 (GPU 버퍼 업로드)");
+    let counters = gpu.device.get_internal_counters();
+    let vram_mb = counters.hal.buffer_memory.read() as f64 / 1024.0 / 1024.0;
+    eprintln!("모델 로드 완료 (VRAM: {:.1}MB)", vram_mb);
 
-    if args.benchmark {
+    if args.profile {
+        let input_ids: Vec<u32> = (0..args.seq_len).map(|i| (i % 303) as u32).collect();
+        model.profile(&gpu, &input_ids)?;
+    } else if args.benchmark {
         run_benchmark(&gpu, &mut model, args.seq_len, args.warmup, args.n_runs)?;
     } else if args.infer {
         run_infer(&gpu, &mut model)?;
@@ -105,7 +114,9 @@ fn run_benchmark(gpu: &GpuContext, model: &mut DenseEditorGpu, seq_len: usize,
     let elapsed = start.elapsed();
     let avg_ms = elapsed.as_secs_f64() * 1000.0 / n_runs as f64;
 
-    eprintln!("벤치마크: seq={}, {}회 평균 {:.2}ms", seq_len, n_runs, avg_ms);
+    let counters = gpu.device.get_internal_counters();
+    let vram_mb = counters.hal.buffer_memory.read() as f64 / 1024.0 / 1024.0;
+    eprintln!("벤치마크: seq={}, {}회 평균 {:.2}ms (VRAM: {:.1}MB)", seq_len, n_runs, avg_ms, vram_mb);
     Ok(())
 }
 

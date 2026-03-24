@@ -6,7 +6,7 @@ description = "DenseEditor wgpu GPU inference engine — cross-platform (Vulkan/
 
 [dependencies]
 inference-common = { path = "../inference_common" }
-wgpu = "24"
+wgpu = { version = "24", features = ["counters"] }
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
 serde = { version = "1", features = ["derive"] }

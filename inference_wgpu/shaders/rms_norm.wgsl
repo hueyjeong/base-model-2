@@ -9,7 +9,7 @@ struct Params {
     d: u32,
     eps: f32,
 };
-@group(0) @binding(3) var<uniform> params: Params;
+var<push_constant> params: Params;
 
 var<workgroup> shared_sum: array<f32, 256>;
 

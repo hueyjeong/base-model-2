@@ -13,7 +13,7 @@ struct Params {
     chunk_size: u32,
     nchunks: u32,
 };
-@group(0) @binding(3) var<uniform> params: Params;
+var<push_constant> params: Params;
 
 @compute @workgroup_size(64, 1, 1)
 fn main(@builtin(workgroup_id) wid: vec3<u32>,

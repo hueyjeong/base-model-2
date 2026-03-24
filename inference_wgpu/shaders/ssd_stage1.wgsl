@@ -1,5 +1,5 @@
-// SSD Stage 1: dA cumulative sum
-// 각 (chunk, head) 쌍에 대해 독립적으로 cumsum 수행
+// SSD Stage 1: dA cumulative sum (병렬 Hillis-Steele scan)
+// 각 (chunk, head) 쌍에 대해 inclusive prefix sum
 // dA_cumsum[c,h,l] = Σ_{i=0..l} A[h] * dt[c*chunk_size+i, h]
 
 @group(0) @binding(0) var<storage, read> dt: array<f32>;      // [seq_len, nheads]
@@ -12,24 +12,45 @@ struct Params {
     chunk_size: u32,
     nchunks: u32,
 };
-@group(0) @binding(3) var<uniform> params: Params;
+var<push_constant> params: Params;
 
-@compute @workgroup_size(1, 1, 1)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let ch = gid.x;
+var<workgroup> smem: array<f32, 256>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(workgroup_id) wid: vec3<u32>,
+        @builtin(local_invocation_index) lid: u32) {
+    let ch = wid.x;
     if (ch >= params.nchunks * params.nheads) { return; }
 
     let c = ch / params.nheads;
     let h = ch % params.nheads;
+    let l = lid;
+    let t = c * params.chunk_size + l;
 
-    var cumsum: f32 = 0.0;
-    for (var l: u32 = 0u; l < params.chunk_size; l++) {
-        let t = c * params.chunk_size + l;
-        var dt_val: f32 = 0.0;
-        if (t < params.seq_len) {
-            dt_val = dt[t * params.nheads + h];
+    // 각 스레드가 자신의 dA값 로드
+    var val: f32 = 0.0;
+    if (l < params.chunk_size && t < params.seq_len) {
+        val = a_neg[h] * dt[t * params.nheads + h];
+    }
+    smem[l] = val;
+    workgroupBarrier();
+
+    // Hillis-Steele inclusive prefix sum
+    // O(n log n) work, O(log n) steps
+    for (var stride = 1u; stride < params.chunk_size; stride *= 2u) {
+        var tmp: f32 = 0.0;
+        if (l >= stride && l < params.chunk_size) {
+            tmp = smem[l - stride];
         }
-        cumsum += a_neg[h] * dt_val;
-        dA_cumsum[(c * params.nheads + h) * params.chunk_size + l] = cumsum;
+        workgroupBarrier();
+        if (l < params.chunk_size) {
+            smem[l] += tmp;
+        }
+        workgroupBarrier();
+    }
+
+    // 결과 기록
+    if (l < params.chunk_size) {
+        dA_cumsum[ch * params.chunk_size + l] = smem[l];
     }
 }

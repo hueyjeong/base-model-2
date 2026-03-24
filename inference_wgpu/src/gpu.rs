@@ -83,8 +83,11 @@ impl GpuContext {
             .request_device(
                 &DeviceDescriptor {
                     label: Some("dense-editor"),
-                    required_features: Features::empty(),
-                    required_limits: Limits::default(),
+                    required_features: Features::PUSH_CONSTANTS,
+                    required_limits: Limits {
+                        max_push_constant_size: 128,
+                        ..Limits::default()
+                    },
                     memory_hints: MemoryHints::Performance,
                 },
                 None,
