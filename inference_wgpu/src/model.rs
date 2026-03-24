@@ -421,10 +421,16 @@ impl DenseEditorGpu {
             &self.pool.ssd_prev_states,
             nh, hd, ds, chunk_size, sl);
 
-        dispatch_ssd_stage4(gpu, encoder, &self.pipes,
-            &self.pool.x_conv, &self.pool.b_conv, &self.pool.c_conv, &self.pool.dt,
+        // Stage 4a: CB 사전 계산
+        dispatch_ssd_stage4a(gpu, encoder, &self.pipes,
+            &self.pool.b_conv, &self.pool.c_conv, &self.pool.ssd_cb,
+            sl, nh, ds, ng, chunk_size);
+
+        // Stage 4b: Score + output (CB 사용)
+        dispatch_ssd_stage4b(gpu, encoder, &self.pipes,
+            &self.pool.x_conv, &self.pool.c_conv, &self.pool.dt,
             &self.pool.ssd_da_cumsum, &self.pool.ssd_prev_states,
-            &weights.d_skip, tmp_buf,  // y → tmp_buf
+            &weights.d_skip, &self.pool.ssd_cb, tmp_buf,
             sl, nh, hd, ds, ng, chunk_size, d_inner);
 
         // 6. gate + norm: tmp_buf = RMSNorm(tmp_buf * SiLU(z from proj_buf))

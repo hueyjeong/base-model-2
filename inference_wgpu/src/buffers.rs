@@ -34,6 +34,8 @@ pub struct ActivationPool {
     pub c_conv: Buffer,
     /// Mamba2: dt [seq × nheads]
     pub dt: Buffer,
+    /// SSD: CB scores [nchunks × nheads × chunk_size × chunk_size]
+    pub ssd_cb: Buffer,
     /// SSD: dA_cumsum [nchunks × nheads × chunk_size]
     pub ssd_da_cumsum: Buffer,
     /// SSD: chunk_states [nchunks × nheads × headdim × d_state]
@@ -90,6 +92,8 @@ impl ActivationPool {
         let bc_size = (max_seq_len * ng_ds * 4) as u64;
         let dt_size = (max_seq_len * nheads * 4) as u64;
 
+        let ssd_cb_size = (nchunks * nheads * chunk_size * chunk_size * 4) as u64;
+
         Self {
             buf_a: mk("act_a", buf_a_size, rw),
             buf_b: mk("act_b", buf_b_size, rw),
@@ -97,6 +101,7 @@ impl ActivationPool {
             buf_d: mk("act_d", buf_cd_size, rw),
             buf_e: mk("act_e", buf_e_size, rw),
             buf_f: mk("act_f", buf_cd_size, rw),
+            ssd_cb: mk("ssd_cb", ssd_cb_size, rw),
             xbc: mk("xbc", xbc_size, rw),
             xbc_conv: mk("xbc_conv", xbc_size, rw),
             x_conv: mk("x_conv", buf_cd_size, rw),

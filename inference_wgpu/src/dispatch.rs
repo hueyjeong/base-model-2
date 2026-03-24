@@ -128,7 +128,8 @@ pub struct AllPipelines {
     pub ssd_stage1: ShaderPipeline,
     pub ssd_stage2: ShaderPipeline,
     pub ssd_stage3: ShaderPipeline,
-    pub ssd_stage4: ShaderPipeline,
+    pub ssd_stage4a: ShaderPipeline,
+    pub ssd_stage4b: ShaderPipeline,
     pub gate_norm: ShaderPipeline,
 }
 
@@ -206,8 +207,12 @@ impl AllPipelines {
                 include_str!("../shaders/ssd_stage3.wgsl"), "main",
                 &[storage_ro(0), storage_ro(1), storage_rw(2), uniform(3)]),
 
-            ssd_stage4: create_pipeline(gpu, "ssd_stage4",
-                include_str!("../shaders/ssd_stage4.wgsl"), "main",
+            ssd_stage4a: create_pipeline(gpu, "ssd_stage4a",
+                include_str!("../shaders/ssd_stage4a.wgsl"), "main",
+                &[storage_ro(0), storage_ro(1), storage_rw(2), uniform(3)]),
+
+            ssd_stage4b: create_pipeline(gpu, "ssd_stage4b",
+                include_str!("../shaders/ssd_stage4b.wgsl"), "main",
                 &[storage_ro(0), storage_ro(1), storage_ro(2), storage_ro(3),
                   storage_ro(4), storage_ro(5), storage_ro(6), storage_rw(7), uniform(8)]),
 
@@ -363,6 +368,18 @@ pub struct SsdStage3Params {
     pub chunk_size: u32,
     pub nchunks: u32,
     pub _pad: [u32; 3],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct SsdStage4aParams {
+    pub seq_len: u32,
+    pub nheads: u32,
+    pub d_state: u32,
+    pub ngroups: u32,
+    pub chunk_size: u32,
+    pub nchunks: u32,
+    pub _pad: [u32; 2],
 }
 
 #[repr(C)]
@@ -570,10 +587,27 @@ pub fn dispatch_ssd_stage3(
     ], (nheads, 1, 1));
 }
 
-pub fn dispatch_ssd_stage4(
+/// Stage 4a: CB 행렬 사전 계산
+pub fn dispatch_ssd_stage4a(
     gpu: &GpuContext, encoder: &mut CommandEncoder, pipes: &AllPipelines,
-    x: &Buffer, b: &Buffer, c: &Buffer, dt: &Buffer,
-    da_cumsum: &Buffer, prev_states: &Buffer, d_skip: &Buffer, y: &Buffer,
+    b: &Buffer, c: &Buffer, cb: &Buffer,
+    seq_len: u32, nheads: u32, d_state: u32, ngroups: u32, chunk_size: u32,
+) {
+    let nchunks = div_ceil(seq_len, chunk_size);
+    let params = make_uniform(gpu, &SsdStage4aParams {
+        seq_len, nheads, d_state, ngroups, chunk_size, nchunks, _pad: [0; 2],
+    });
+    dispatch(gpu, encoder, &pipes.ssd_stage4a, &[
+        buf_entry(0, b), buf_entry(1, c), buf_entry(2, cb), buf_entry(3, &params),
+    ], (nchunks * nheads, 1, 1));
+}
+
+/// Stage 4b: Score + output (CB 사전 계산 사용)
+pub fn dispatch_ssd_stage4b(
+    gpu: &GpuContext, encoder: &mut CommandEncoder, pipes: &AllPipelines,
+    x: &Buffer, c: &Buffer, dt: &Buffer,
+    da_cumsum: &Buffer, prev_states: &Buffer, d_skip: &Buffer,
+    cb: &Buffer, y: &Buffer,
     seq_len: u32, nheads: u32, headdim: u32, d_state: u32, ngroups: u32,
     chunk_size: u32, d_inner: u32,
 ) {
@@ -581,10 +615,10 @@ pub fn dispatch_ssd_stage4(
     let params = make_uniform(gpu, &SsdStage4Params {
         seq_len, nheads, headdim, d_state, ngroups, chunk_size, nchunks, d_inner,
     });
-    dispatch(gpu, encoder, &pipes.ssd_stage4, &[
-        buf_entry(0, x), buf_entry(1, b), buf_entry(2, c), buf_entry(3, dt),
-        buf_entry(4, da_cumsum), buf_entry(5, prev_states),
-        buf_entry(6, d_skip), buf_entry(7, y), buf_entry(8, &params),
+    dispatch(gpu, encoder, &pipes.ssd_stage4b, &[
+        buf_entry(0, x), buf_entry(1, c), buf_entry(2, dt),
+        buf_entry(3, da_cumsum), buf_entry(4, prev_states),
+        buf_entry(5, d_skip), buf_entry(6, cb), buf_entry(7, y), buf_entry(8, &params),
     ], (nheads * nchunks * chunk_size, 1, 1));
 }
 
