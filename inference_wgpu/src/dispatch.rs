@@ -86,39 +86,17 @@ fn uniform(binding: u32) -> BindGroupLayoutEntry {
     }
 }
 
-/// Uniform 버퍼 풀 — 256개 사전 할당, 인덱스 순환
-/// write_buffer는 submit() 시작에 일괄 실행되므로
-/// 각 dispatch가 다른 버퍼를 사용하면 데이터 충돌 없음
-static mut UNIFORM_BUFS: Vec<Buffer> = Vec::new();
-static mut UNIFORM_IDX: usize = 0;
-
-pub fn init_uniform_pool(gpu: &GpuContext) {
-    unsafe {
-        UNIFORM_BUFS = (0..512)
-            .map(|i| gpu.device.create_buffer(&BufferDescriptor {
-                label: Some(&format!("u{}", i)),
-                size: 64,
-                usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }))
-            .collect();
-        UNIFORM_IDX = 0;
-    }
+fn make_uniform<T: Pod>(gpu: &GpuContext, data: &T) -> Buffer {
+    use wgpu::util::DeviceExt;
+    gpu.device.create_buffer_init(&util::BufferInitDescriptor {
+        label: Some("params"),
+        contents: bytemuck::bytes_of(data),
+        usage: BufferUsages::UNIFORM,
+    })
 }
 
-pub fn reset_uniform_pool() {
-    unsafe { UNIFORM_IDX = 0; }
-}
-
-fn make_uniform<T: Pod>(gpu: &GpuContext, data: &T) -> &'static Buffer {
-    unsafe {
-        let idx = UNIFORM_IDX;
-        UNIFORM_IDX += 1;
-        debug_assert!(idx < UNIFORM_BUFS.len(), "uniform pool exhausted");
-        gpu.queue.write_buffer(&UNIFORM_BUFS[idx], 0, bytemuck::bytes_of(data));
-        &UNIFORM_BUFS[idx]
-    }
-}
+pub fn init_uniform_pool(_gpu: &GpuContext) {}
+pub fn reset_uniform_pool() {}
 
 /// dispatch 워크그룹 수 계산 (올림 나눗셈)
 fn div_ceil(a: u32, b: u32) -> u32 {
