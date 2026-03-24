@@ -363,6 +363,8 @@ def main():
     accum_metrics = {"gen_loss": 0.0, "disc_loss": 0.0, "rtd_acc": 0.0,
                      "gen_acc": 0.0, "replaced_ratio": 0.0}
     accum_count = 0
+    _max_line_counter = 0
+    log_tokens = 0
 
     use_prefetch = torch.cuda.is_available()
 
@@ -418,6 +420,11 @@ def main():
             for k in accum_metrics:
                 accum_metrics[k] += outputs[k].item()
             accum_count += 1
+            log_tokens += pad_mask.sum().item()
+            if "_line_counter" in batch:
+                lc = batch["_line_counter"]
+                lc_val = lc.max().item() if isinstance(lc, torch.Tensor) else max(lc) if isinstance(lc, (list, tuple)) else lc
+                _max_line_counter = max(_max_line_counter, int(lc_val))
 
         # Gradient step
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -428,6 +435,7 @@ def main():
             n = accum_count
             elapsed = time.time() - t0
             avg = {k: v / n for k, v in accum_metrics.items()}
+            tok_s = log_tokens / max(elapsed, 1e-6)
             mem_str = ""
             if step + 1 == args.log_every and torch.cuda.is_available():
                 alloc = torch.cuda.max_memory_allocated() / 1024**3
@@ -437,10 +445,12 @@ def main():
                 f"d_loss={avg['disc_loss']:.4f} g_loss={avg['gen_loss']:.4f} "
                 f"rtd={avg['rtd_acc']:.3f} g_acc={avg['gen_acc']:.3f} "
                 f"repl={avg['replaced_ratio']:.3f} "
-                f"lr={lr:.2e} ep={_current_epoch} {fmt_time(elapsed)}{mem_str}"
+                f"lr={lr:.2e} ep={_current_epoch} line={_max_line_counter} "
+                f"{tok_s:,.0f} tok/s {fmt_time(elapsed)}{mem_str}"
             )
             accum_metrics = {k: 0.0 for k in accum_metrics}
             accum_count = 0
+            log_tokens = 0
             t0 = time.time()
 
         # Validation
@@ -458,6 +468,9 @@ def main():
 
         # 체크포인트 저장
         if (step + 1) % args.save_every == 0 and is_main:
+            # worker→main _line_counter 동기화
+            train_ds._line_counter = _max_line_counter
+
             ckpt_path = os.path.join(
                 args.save_dir,
                 f"electra_{args.preset}_step_{step+1}.pt",

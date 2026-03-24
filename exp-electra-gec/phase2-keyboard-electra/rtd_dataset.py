@@ -179,6 +179,7 @@ class RTDDataset(IterableDataset):
             "pad_mask": torch.tensor(
                 [True] * seq_len + [False] * pad_len, dtype=torch.bool,
             ),
+            "_line_counter": self._line_counter,
         }
 
 
