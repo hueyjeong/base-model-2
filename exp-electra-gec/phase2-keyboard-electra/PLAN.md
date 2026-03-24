@@ -5,6 +5,7 @@
 keyboard 토크나이저(303 vocab) + 커스텀 인코더 구조로 ELECTRA RTD 사전학습 → GEC fine-tune.
 표준 Transformer 대신 Conv1d + ChunkFFT + Sliding Window/Full Attention 샌드위치 구조 사용.
 ONNX RT 배포를 전제로 설계 (GPU/CPU 모두 지원).
+전 학습 과정 INT8 QAT — 같은 모델 용량(바이트)이면 파라미터 수를 극대화.
 
 ## 배경: 왜 커스텀 구조인가?
 
@@ -20,7 +21,8 @@ ONNX RT 배포를 전제로 설계 (GPU/CPU 모두 지원).
 2. **Conv1d 전처리**: 자모 토큰은 개별로 의미 없음 → conv1d로 음절 단위 feature 합성
 3. **ChunkFFT**: conv1d 결과를 청크 단위 FFT → 슬라이스별 "분위기" 요약 → attention이 참조
 4. **ONNX 호환**: 모든 부품이 표준 연산 (conv1d, FFT, attention, linear)
-5. **FFN 축소**: BitLinear 제거로 d_ff 축소 가능 (넓게 줬던 건 BitLinear 보상 목적이었음)
+5. **INT8 QAT**: 전 학습 과정을 INT8 QAT로 진행 → 같은 모델 용량이면 파라미터 수 극대화
+6. **FFN 축소**: d_ff 축소 가능 (넓게 줬던 건 BitLinear 보상 목적이었음)
 
 ## ELECTRA RTD 개요
 
@@ -110,7 +112,8 @@ FFN이 d_ff=2048 기준. d_ff를 더 줄이면 추가 절감.
 ### Attention 설정
 - **RoPE**: 순수 sin/cos 연산, ONNX 완벽 호환, 위치 인코딩 표준
 - **GQA** (Grouped Query Attention): KV head 수 줄여 메모리 절감, ONNX 지원
-- **SwiGLU FFN**: d_ff = d_model × 2~2.67 (BitLinear 없으므로 축소)
+- **SwiGLU FFN**: d_ff = d_model × 2~2.67
+- **INT8 QAT**: pretrain부터 INT8 양자화 적용 학습, 배포 시 INT8 그대로 사용
 
 ### ChunkFFT 상세
 
@@ -131,9 +134,18 @@ mood = self.mood_attn(mood)  # [B, 16, 768]
 x = x + mood[:, chunk_indices, :]
 ```
 
+## INT8 QAT 전략
+
+- **전 과정 INT8 QAT**: pretrain(RTD) + fine-tune(GEC) 모두 INT8 양자화 적용 학습
+- **동기**: 같은 모델 파일 크기(바이트)에서 FP32 대비 4× 많은 파라미터 수용 가능
+  - 예: 128MB 용량 → FP32 32M params vs INT8 128M params
+- **INT8 matmul**: weight INT8 × activation INT8 → INT32 accumulate → 정수 경로, FP 변환 불필요
+- **ONNX RT 호환**: INT8 QDQ 노드로 export → 모든 EP(CUDA/CPU/DirectML)에서 INT8 추론
+- **Generator는 FP16/BF16**: 작은 모델(~2M)이므로 양자화 불필요, 안정적 MLM 학습 우선
+
 ## 모델 구성
 
-### Generator (~2M params, 표준 Transformer)
+### Generator (~2M params, 표준 Transformer, FP16)
 ```
 Embedding(303, d=128)
 ├── Transformer Encoder × 4 layers
@@ -142,7 +154,7 @@ Embedding(303, d=128)
 └── MLM Head: Linear(128 → 303)
 ```
 
-### Discriminator — Small (~8M params)
+### Discriminator — Small (~8M params, INT8 QAT)
 ```
 Embedding(303, d=256)
 ├── Conv1d(k=4) + ChunkFFT(chunk=256)
@@ -151,11 +163,10 @@ Embedding(303, d=256)
 │   (4 heads, GQA-2, RoPE, SwiGLU d_ff=512)
 ├── FA
 └── RTD Head: Linear(256 → 2)   [pretrain]
-    Action Head: Linear(256 → 4)  [fine-tune]
-    Content Head: Linear(256 → 303) [fine-tune]
+    Tag Head: Linear(256 → n_tags) [fine-tune]
 ```
 
-### Discriminator — 128M (BiMamba-2 직접 비교용)
+### Discriminator — 128M (INT8 QAT, BiMamba-2 직접 비교용)
 ```
 Embedding(303, d=768)
 ├── Conv1d(k=4) + ChunkFFT(chunk=256)
@@ -163,7 +174,8 @@ Embedding(303, d=768)
 │   FA → WA(64) → WA(32) → WA(64) → WA(128)
 │   → WA(256) → WA(128) → WA(64) → WA(32) → WA(64) → FA
 │   (12 heads, GQA-4, RoPE, SwiGLU d_ff=2048)
-└── RTD Head → Action Head(4) + Content Head(303)
+└── RTD Head: Linear(768 → 2)   [pretrain]
+    Tag Head: Linear(768 → n_tags) [fine-tune]
 ```
 
 ## 구현 단계
@@ -191,8 +203,8 @@ Embedding(303, d=768)
 - keyboard 토크나이저의 한계 파악 (seq 길이 ~3x 불이익)
 
 ### Step 4: GEC Fine-tune
-- RTD head → Action Head(4) + Content Head(303)으로 교체
-- Two-head 태그 체계 (Phase 1과 동일)
+- RTD head → Tag Head(n_tags)로 교체 (single-head, DenseEditor와 동일)
+- vocab 303이면 n_tags = KEEP + DELETE + INSERT_x × vocab ≈ 608, 충분히 작음
 - 확신도 threshold 튜닝, iterative refinement
 - 기존 노이즈 엔진 + 편집 태그 파이프라인 재사용
 
