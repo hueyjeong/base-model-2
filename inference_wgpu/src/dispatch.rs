@@ -597,9 +597,11 @@ pub fn dispatch_ssd_stage4a(
     let params = make_uniform(gpu, &SsdStage4aParams {
         seq_len, nheads, d_state, ngroups, chunk_size, nchunks, _pad: [0; 2],
     });
+    let tiles_per_row = div_ceil(chunk_size, 32);
+    let n_tiles = tiles_per_row * tiles_per_row;
     dispatch(gpu, encoder, &pipes.ssd_stage4a, &[
         buf_entry(0, b), buf_entry(1, c), buf_entry(2, cb), buf_entry(3, &params),
-    ], (nchunks * nheads, 1, 1));
+    ], (n_tiles, nchunks * nheads, 1));
 }
 
 /// Stage 4b: Score + output (CB 사전 계산 사용)
