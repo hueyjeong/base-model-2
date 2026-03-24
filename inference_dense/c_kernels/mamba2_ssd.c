@@ -55,15 +55,17 @@ void mamba2_ssd_fwd(
      *    Shape: [nchunks, nheads, chunk_size] */
     float* dA_cumsum = (float*)calloc(nchunks * nheads * chunk_size, sizeof(float));
 
-    for (int c = 0; c < nchunks; c++) {
-        for (int h = 0; h < nheads; h++) {
-            float cumsum = 0.0f;
-            for (int l = 0; l < chunk_size; l++) {
-                int t = c * chunk_size + l;
-                float dt_val = (t < seq_len) ? dt[t * nheads + h] : 0.0f;
-                cumsum += A[h] * dt_val;
-                dA_cumsum[(c * nheads + h) * chunk_size + l] = cumsum;
-            }
+    /* (c, h) 쌍은 완전 독립 — 각 쌍이 자체 cumsum을 0에서 시작 */
+    #pragma omp parallel for schedule(static) if(nchunks * nheads >= 4)
+    for (int ch = 0; ch < nchunks * nheads; ch++) {
+        int c = ch / nheads;
+        int h = ch % nheads;
+        float cumsum = 0.0f;
+        for (int l = 0; l < chunk_size; l++) {
+            int t = c * chunk_size + l;
+            float dt_val = (t < seq_len) ? dt[t * nheads + h] : 0.0f;
+            cumsum += A[h] * dt_val;
+            dA_cumsum[(c * nheads + h) * chunk_size + l] = cumsum;
         }
     }
 
@@ -117,7 +119,9 @@ void mamba2_ssd_fwd(
             memcpy(&prev_states[base_prev], running_state,
                    nheads * headdim * d_state * sizeof(float));
 
-            /* Update running_state: decay by chunk c's total dA, then add chunk_states[c] */
+            /* Update running_state: decay by chunk c's total dA, then add chunk_states[c]
+             * h 루프는 독립 — 각 head가 자체 state 슬라이스만 업데이트 */
+            #pragma omp parallel for schedule(static) if(nheads >= 4)
             for (int h = 0; h < nheads; h++) {
                 float dA_total = dA_cumsum[(c * nheads + h) * chunk_size + chunk_size - 1];
                 float inter_decay = expf(dA_total);

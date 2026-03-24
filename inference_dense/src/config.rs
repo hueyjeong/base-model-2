@@ -47,6 +47,12 @@ pub struct DenseEditorConfig {
     pub retnet_gamma_min: f64,
     #[serde(default = "default_gamma_max")]
     pub retnet_gamma_max: f64,
+
+    // BitLinear Mamba-2 실험
+    #[serde(default)]
+    pub bitlinear_mamba: bool,
+    #[serde(default)]
+    pub mamba2_in_proj_rank: usize,  // 0 = full rank, >0 = 저랭크
 }
 
 fn default_1() -> usize { 1 }

@@ -638,11 +638,13 @@ impl BitNetFFN {
 
 pub enum Projection {
     F32(LinearF32),
-    Ternary(TernaryLinear),       // i8 tiled 커널 (가장 빠름)
+    Ternary(TernaryLinear),       // i8 tiled 커널 (가장 빠름, LayerNorm 없음)
     TernaryBM(TernaryBitmask),    // bitmask 커널 (실험적)
+    BitLin(BitLinear),            // LayerNorm → INT8 quantize → i8_sgemm (Python BitLinear 정확 재현)
 }
 
 impl Projection {
+    /// 기존 호환: nn.Linear proj → F32, proximity-trained proj → Ternary (LayerNorm 없음)
     pub fn load_bmmq(tensors: &mut HashMap<String, TensorData>, prefix: &str) -> Result<Self> {
         let key = format!("{}.weight", prefix);
         let is_ternary = matches!(tensors.get(&key), Some(TensorData::Packed2Bit { .. }));
@@ -654,11 +656,59 @@ impl Projection {
         }
     }
 
+    /// BitLinear QAT 모델용: Packed2Bit → BitLinear (LayerNorm + INT8 quant 포함)
+    pub fn load_bmmq_bitlinear(tensors: &mut HashMap<String, TensorData>, prefix: &str) -> Result<Self> {
+        let key = format!("{}.weight", prefix);
+        let is_ternary = matches!(tensors.get(&key), Some(TensorData::Packed2Bit { .. }));
+        if is_ternary {
+            eprintln!("    {} → BitLinear(i8+LN)", prefix);
+            Ok(Projection::BitLin(BitLinear::load_bmmq(tensors, prefix)?))
+        } else {
+            Ok(Projection::F32(LinearF32::load_bmmq(tensors, prefix)?))
+        }
+    }
+
     pub fn forward_batch(&self, x: &[f32], seq_len: usize, out: &mut [f32]) {
         match self {
             Projection::F32(l) => l.forward_batch(x, seq_len, out),
             Projection::Ternary(l) => l.forward_batch(x, seq_len, out),
             Projection::TernaryBM(l) => l.forward_batch(x, seq_len, out),
+            Projection::BitLin(l) => {
+                // Python BitLinear 정확 재현: LayerNorm → float INT8 양자화 → float ternary matmul
+                // (i8_sgemm 정수 누적 대신 ternary_f32_sgemm float 누적 사용)
+                let k = l.in_dim;
+                let mut normed = vec![0.0f32; seq_len * k];
+                for t in 0..seq_len {
+                    layer_norm_no_affine(&x[t*k..(t+1)*k], &mut normed[t*k..(t+1)*k], 1e-5);
+                }
+                // per-token float quantization: round(x * 127 / eta), eta = max(|x|)
+                let mut scales = vec![0.0f32; seq_len];
+                for t in 0..seq_len {
+                    let sl = &mut normed[t*k..(t+1)*k];
+                    let mut amax = 0.0f32;
+                    for &v in sl.iter() { let a = v.abs(); if a > amax { amax = a; } }
+                    let eta = amax.max(1e-5);
+                    let inv_eta = 127.0 / eta;
+                    scales[t] = eta / 127.0;
+                    for v in sl.iter_mut() {
+                        *v = (*v * inv_eta).clamp(-128.0, 127.0).round();
+                    }
+                }
+                // ternary float matmul (Python F.linear과 동일 누적 순서)
+                unsafe {
+                    ternary_f32_sgemm_avx2(
+                        l.w_i8.as_ptr(), normed.as_ptr(), out.as_mut_ptr(),
+                        l.gamma, l.out_dim as i32, seq_len as i32, k as i32,
+                    );
+                }
+                // per-token scale 적용
+                for t in 0..seq_len {
+                    let s = scales[t];
+                    for j in 0..l.out_dim {
+                        out[t * l.out_dim + j] *= s;
+                    }
+                }
+            }
         }
     }
 
@@ -667,6 +717,7 @@ impl Projection {
             Projection::F32(l) => l.out_dim,
             Projection::Ternary(l) => l.out_dim,
             Projection::TernaryBM(l) => l.out_dim,
+            Projection::BitLin(l) => l.out_dim,
         }
     }
 
@@ -675,6 +726,7 @@ impl Projection {
             Projection::F32(l) => l.in_dim,
             Projection::Ternary(l) => l.in_dim,
             Projection::TernaryBM(l) => l.in_dim,
+            Projection::BitLin(l) => l.in_dim,
         }
     }
 }

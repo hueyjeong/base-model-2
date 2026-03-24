@@ -184,6 +184,11 @@ impl DenseEditorModel {
         let d_conv = config.mamba_d_conv;
         let n_tags = config.n_tags;
         let eps = config.rms_norm_eps;
+        let in_proj_rank = if config.bitlinear_mamba {
+            config.mamba2_in_proj_rank
+        } else {
+            0
+        };
 
         eprintln!("BMMQ 로드: {} (d={}, n_layers={})", model_path, d, nl);
         let mut tensors = bmmq::load_bmmq(model_path)?;
@@ -200,7 +205,7 @@ impl DenseEditorModel {
             let norm1 = RMSNorm::load_bmmq(&mut tensors, &format!("{}.norm1", prefix), eps as f64)?;
             let mixing = BiMamba2::load_bmmq(
                 &mut tensors, &format!("{}.mixing", prefix),
-                d, ds, d_conv, expand, hd, ng,
+                d, ds, d_conv, expand, hd, ng, in_proj_rank,
             )?;
             let norm2 = RMSNorm::load_bmmq(&mut tensors, &format!("{}.norm2", prefix), eps as f64)?;
             let ffn = FusedBitNetFFN::load_bmmq(&mut tensors, &format!("{}.ffn", prefix))?;

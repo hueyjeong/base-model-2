@@ -1,0 +1,8 @@
+{
+  "model_type": "DenseEditor",
+  "mixing_type": "mamba2",
+  "source_checkpoint": "checkpoints/mamba2_d768_6L/dense_mamba2_d768_step_1000.pt",
+  "step": 1000,
+  "format": "bmmq",
+  "param_count": 57826224
+}

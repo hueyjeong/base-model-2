@@ -34,7 +34,9 @@ from export_model import (
 # in_proj, out_proj, FFN, tag_head 모두 BitLinear → 전체 ternary
 def _is_bitlinear(key: str) -> bool:
     return any(p in key for p in [
-        "in_proj.weight", "out_proj.weight",
+        "in_proj.weight",       # 기존 모델 (nn.Linear proj)
+        "in_proj_up.weight",    # 저랭크 BitLinear 모델
+        "out_proj.weight",
         "gate_up_proj.weight", "down_proj.weight",
         "tag_head.weight",
     ])

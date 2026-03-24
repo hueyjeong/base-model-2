@@ -1,13 +1,16 @@
 """BiMamba2 Mixing Layer — 양방향 Mamba-2 SSD (Structured State Space Duality)
 
 GPU 학습: nn.Linear proj + mamba_ssm fused CUDA kernel (mamba_split_conv1d_scan_combined)
-         + proximity regularization으로 ternary 근접 가중치 학습
-CPU 추론: TernaryLinear proj + Python sequential scan fallback
+CPU 추론: C chunk-parallel SSD 커널 (ctypes) — GPU와 수치 일치
+         fallback: Python sequential scan (GPU와 ~10% 수치 차이 있음)
 
 Mamba2Block: in_proj/out_proj는 nn.Linear — fused kernel 호환 + 최대 학습 속도.
 Mamba2BitLinearBlock: in_proj 저랭크 + BitLinear, out_proj BitLinear — 전체 QAT 실험용.
 """
+import ctypes
 import math
+import os
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -28,6 +31,80 @@ try:
         _MAMBA2_CUDA_OPS = True
 except ImportError:
     pass
+
+# C chunk-parallel SSD 커널 (CPU fallback용 — GPU와 수치 일치)
+_C_SSD_LIB = None
+_c_mamba2_ssd_fwd = None
+
+def _load_c_ssd_kernel():
+    """inference_dense/c_kernels/libmamba2_ssd.so 로드. 없으면 빌드 시도."""
+    global _C_SSD_LIB, _c_mamba2_ssd_fwd
+    if _c_mamba2_ssd_fwd is not None:
+        return True
+
+    project_root = Path(__file__).resolve().parent.parent.parent
+    so_path = project_root / "inference_dense" / "c_kernels" / "libmamba2_ssd.so"
+
+    if not so_path.exists():
+        # 자동 빌드 시도
+        src = project_root / "inference_dense" / "c_kernels" / "mamba2_ssd.c"
+        if src.exists():
+            ret = os.system(
+                f"gcc -O3 -march=native -mavx2 -mfma -fopenmp -shared -fPIC "
+                f"-o {so_path} {src} -lm 2>/dev/null"
+            )
+            if ret != 0:
+                return False
+
+    if not so_path.exists():
+        return False
+
+    _C_SSD_LIB = ctypes.CDLL(str(so_path))
+    _c_mamba2_ssd_fwd = _C_SSD_LIB.mamba2_ssd_fwd
+    _c_mamba2_ssd_fwd.restype = None
+    _c_mamba2_ssd_fwd.argtypes = [
+        ctypes.c_void_p,  # x
+        ctypes.c_void_p,  # B
+        ctypes.c_void_p,  # C
+        ctypes.c_void_p,  # dt
+        ctypes.c_void_p,  # A
+        ctypes.c_void_p,  # D
+        ctypes.c_void_p,  # y (output)
+        ctypes.c_int,     # chunk_size
+        ctypes.c_int,     # seq_len
+        ctypes.c_int,     # nheads
+        ctypes.c_int,     # headdim
+        ctypes.c_int,     # d_state
+        ctypes.c_int,     # ngroups
+    ]
+    return True
+
+
+def _ssd_scan_c(x_conv, b_conv, c_conv, dt, a_neg, d_skip, nheads, headdim, d_state, ngroups):
+    """C chunk-parallel SSD forward — GPU fused kernel과 수치 일치
+
+    Args:
+        x_conv: (seq_len, d_inner) float32 contiguous — SiLU 적용됨
+        b_conv: (seq_len, ngroups*d_state) float32
+        c_conv: (seq_len, ngroups*d_state) float32
+        dt: (seq_len, nheads) float32
+        a_neg: (nheads,) float32 — -exp(A_log)
+        d_skip: (nheads,) float32
+    Returns:
+        y: (seq_len, d_inner) float32 — scan output (D*x skip 포함)
+    """
+    seq_len = x_conv.shape[0]
+    d_inner = nheads * headdim
+    y = torch.zeros(seq_len, d_inner, dtype=torch.float32)
+
+    _c_mamba2_ssd_fwd(
+        x_conv.data_ptr(), b_conv.data_ptr(), c_conv.data_ptr(),
+        dt.data_ptr(), a_neg.data_ptr(), d_skip.data_ptr(),
+        y.data_ptr(),
+        256,  # chunk_size
+        seq_len, nheads, headdim, d_state, ngroups,
+    )
+    return y
 
 
 class Mamba2Block(nn.Module):
@@ -125,7 +202,7 @@ class Mamba2Block(nn.Module):
         return y
 
     def _forward_fallback(self, x: Tensor, reset_mask: Tensor | None = None) -> Tensor:
-        """Python sequential scan fallback (CPU / non-CUDA)"""
+        """CPU fallback — C chunk-parallel SSD 커널 사용 (GPU와 수치 일치)"""
         B_batch, T, _ = x.shape
         di = self.d_inner
         ds = self.d_state
@@ -134,38 +211,45 @@ class Mamba2Block(nn.Module):
         ng = self.ngroups
         d_conv_in = di + 2 * ng * ds
 
-        # in_proj — mamba_ssm 순서: z, xBC, dt
+        # in_proj
         proj = self.in_proj(x)
 
         z = proj[:, :, :di]
         xBC_raw = proj[:, :, di:di + d_conv_in]
-        dt_raw = proj[:, :, di + d_conv_in:]  # (B, T, nh)
+        dt_raw = proj[:, :, di + d_conv_in:]
 
         # conv1d on [x, B, C]
         xBC = self.conv1d(xBC_raw.transpose(1, 2))[:, :, :T].transpose(1, 2)
 
-        # Split + SiLU on x (B, C는 raw)
+        # SiLU on ALL (GPU fused kernel activation="silu"와 동일)
         x_conv = F.silu(xBC[:, :, :di])
-        B_conv = xBC[:, :, di:di + ng * ds]
-        C_conv = xBC[:, :, di + ng * ds:]
+        B_conv = F.silu(xBC[:, :, di:di + ng * ds])
+        C_conv = F.silu(xBC[:, :, di + ng * ds:])
 
-        # dt → decay
+        # dt
         dt = F.softplus(dt_raw + self.dt_bias)  # (B, T, nh)
-        A = -torch.exp(self.A_log.float())  # (nh,) — negative
-        decay = torch.exp(A.unsqueeze(0).unsqueeze(0) * dt)  # (B, T, nh)
+        A_neg = -torch.exp(self.A_log.float())
 
-        # Sequential scan
-        x_heads = x_conv.view(B_batch, T, nh, hd)
-        B_heads = B_conv.view(B_batch, T, ng, ds)
-        C_heads = C_conv.view(B_batch, T, ng, ds)
+        # C chunk-parallel SSD (GPU와 수치 일치) — batch=1씩 처리
+        y_list = []
+        for b in range(B_batch):
+            x_b = x_conv[b].float().contiguous()       # (T, di)
+            B_b = B_conv[b].float().contiguous()        # (T, ng*ds)
+            C_b = C_conv[b].float().contiguous()        # (T, ng*ds)
+            dt_b = dt[b].float().contiguous()            # (T, nh)
+            A_b = A_neg.float().contiguous()             # (nh,)
+            D_b = self.D.float().contiguous()            # (nh,)
 
-        heads_per_group = nh // ng
-        y = self._scan_sequential(x_heads, B_heads, C_heads, decay, reset_mask,
-                                  heads_per_group)
+            if _load_c_ssd_kernel():
+                y_b = _ssd_scan_c(x_b, B_b, C_b, dt_b, A_b, D_b, nh, hd, ds, ng)
+            else:
+                # C 커널 없으면 sequential scan fallback (GPU와 수치 차이 있음)
+                y_b = self._scan_sequential_single(
+                    x_b, B_b, C_b, dt_b, A_b, D_b, nh, hd, ds, ng)
+            y_list.append(y_b)
 
-        # Skip connection: D * x
-        D_expanded = self.D.view(1, 1, nh, 1).expand_as(y)
-        y = y + D_expanded * x_heads
+        # (B, T, di) — skip connection은 C 커널 내부에서 처리됨
+        y = torch.stack(y_list, dim=0).to(x.dtype)
 
         # Reshape + gate→norm (norm_before_gate=False)
         y = y.reshape(B_batch, T, di)
@@ -174,32 +258,28 @@ class Mamba2Block(nn.Module):
 
         return self.out_proj(y)
 
-    def _scan_sequential(self, x, B, C, decay, reset_mask, heads_per_group):
-        """Mamba-2 SSD sequential scan (in-place 연산 회피 — autograd 호환)"""
-        batch, T, nh, hd = x.shape
-        ds = self.d_state
+    @staticmethod
+    def _scan_sequential_single(x, B, C, dt, A_neg, D, nh, hd, ds, ng):
+        """Sequential scan fallback (C 커널 없을 때) — 단일 시퀀스"""
+        T = x.shape[0]
+        heads_per_group = nh // ng
+        decay = torch.exp(A_neg.unsqueeze(0) * dt)  # (T, nh)
+        x_h = x.view(T, nh, hd)
+        B_h = B.view(T, ng, ds)
+        C_h = C.view(T, ng, ds)
 
-        h = x.new_zeros(batch, nh, ds, hd)
+        h = torch.zeros(nh, ds, hd, dtype=torch.float32)
         ys = []
-
         for t in range(T):
-            if reset_mask is not None:
-                rst = reset_mask[:, t].view(batch, 1, 1, 1).float()
-                h = h * (1 - rst)
-
-            a_t = decay[:, t, :].view(batch, nh, 1, 1)
-            b_t = B[:, t, :]
-            c_t = C[:, t, :]
-            x_t = x[:, t, :]
-
-            b_expanded = b_t.repeat_interleave(heads_per_group, dim=1)
-            c_expanded = c_t.repeat_interleave(heads_per_group, dim=1)
-
-            h = a_t * h + b_expanded.unsqueeze(-1) * x_t.unsqueeze(2)
-            y_t = (c_expanded.unsqueeze(-1) * h).sum(dim=2)
+            a_t = decay[t].view(nh, 1, 1)
+            b_t = B_h[t].repeat_interleave(heads_per_group, dim=0)
+            c_t = C_h[t].repeat_interleave(heads_per_group, dim=0)
+            h = a_t * h + b_t.unsqueeze(-1) * x_h[t].unsqueeze(1)
+            y_t = (c_t.unsqueeze(-1) * h).sum(dim=1)
             ys.append(y_t)
-
-        return torch.stack(ys, dim=1)
+        y = torch.stack(ys, dim=0)  # (T, nh, hd)
+        y = y + D.view(1, nh, 1) * x_h
+        return y.reshape(T, nh * hd)
 
 
 class Mamba2BitLinearBlock(nn.Module):
@@ -297,7 +377,7 @@ class Mamba2BitLinearBlock(nn.Module):
         return self.out_proj(y)
 
     def _forward_fallback(self, x: Tensor, reset_mask: Tensor | None = None) -> Tensor:
-        """Python sequential scan fallback (CPU / non-CUDA) — SSM state FP32"""
+        """CPU fallback — C chunk-parallel SSD 커널 사용 (GPU와 수치 일치)"""
         B_batch, T, _ = x.shape
         di = self.d_inner
         ds = self.d_state
@@ -316,62 +396,40 @@ class Mamba2BitLinearBlock(nn.Module):
         # conv1d on [x, B, C]
         xBC = self.conv1d(xBC_raw.transpose(1, 2))[:, :, :T].transpose(1, 2)
 
+        # SiLU on ALL (GPU fused kernel activation="silu"와 동일)
         x_conv = F.silu(xBC[:, :, :di])
-        B_conv = xBC[:, :, di:di + ng * ds]
-        C_conv = xBC[:, :, di + ng * ds:]
+        B_conv = F.silu(xBC[:, :, di:di + ng * ds])
+        C_conv = F.silu(xBC[:, :, di + ng * ds:])
 
-        # dt → decay (FP32 강제)
+        # dt (FP32 강제)
         dt = F.softplus(dt_raw.float() + self.dt_bias.float())
-        A = -torch.exp(self.A_log.float())
-        decay = torch.exp(A.unsqueeze(0).unsqueeze(0) * dt)
+        A_neg = -torch.exp(self.A_log.float())
 
-        # Sequential scan
-        x_heads = x_conv.view(B_batch, T, nh, hd)
-        B_heads = B_conv.view(B_batch, T, ng, ds)
-        C_heads = C_conv.view(B_batch, T, ng, ds)
+        # C chunk-parallel SSD — batch=1씩 처리
+        y_list = []
+        for b in range(B_batch):
+            x_b = x_conv[b].float().contiguous()
+            B_b = B_conv[b].float().contiguous()
+            C_b = C_conv[b].float().contiguous()
+            dt_b = dt[b].float().contiguous()
+            A_b = A_neg.float().contiguous()
+            D_b = self.D.float().contiguous()
 
-        heads_per_group = nh // ng
-        y = self._scan_sequential(x_heads, B_heads, C_heads, decay, reset_mask,
-                                  heads_per_group)
+            if _load_c_ssd_kernel():
+                y_b = _ssd_scan_c(x_b, B_b, C_b, dt_b, A_b, D_b, nh, hd, ds, ng)
+            else:
+                y_b = Mamba2Block._scan_sequential_single(
+                    x_b, B_b, C_b, dt_b, A_b, D_b, nh, hd, ds, ng)
+            y_list.append(y_b)
 
-        # Skip connection: D * x
-        D_expanded = self.D.float().view(1, 1, nh, 1).expand_as(y)
-        y = y + D_expanded * x_heads.float()
+        y = torch.stack(y_list, dim=0).to(x.dtype)
 
         # Reshape + gate→norm (norm_before_gate=False)
-        y = y.reshape(B_batch, T, di).to(x.dtype)
+        # y는 이미 (B, T, di), skip connection은 C 커널 내부에서 처리됨
         y = y * F.silu(z)
         y = self.norm(y)
 
         return self.out_proj(y)
-
-    def _scan_sequential(self, x, B, C, decay, reset_mask, heads_per_group):
-        """Mamba-2 SSD sequential scan — state h는 FP32"""
-        batch, T, nh, hd = x.shape
-        ds = self.d_state
-
-        # SSM state는 반드시 FP32 (BF16에서 누적 오차 방지)
-        h = torch.zeros(batch, nh, ds, hd, dtype=torch.float32, device=x.device)
-        ys = []
-
-        for t in range(T):
-            if reset_mask is not None:
-                rst = reset_mask[:, t].view(batch, 1, 1, 1).float()
-                h = h * (1 - rst)
-
-            a_t = decay[:, t, :].view(batch, nh, 1, 1)
-            b_t = B[:, t, :].float()
-            c_t = C[:, t, :].float()
-            x_t = x[:, t, :].float()
-
-            b_expanded = b_t.repeat_interleave(heads_per_group, dim=1)
-            c_expanded = c_t.repeat_interleave(heads_per_group, dim=1)
-
-            h = a_t * h + b_expanded.unsqueeze(-1) * x_t.unsqueeze(2)
-            y_t = (c_expanded.unsqueeze(-1) * h).sum(dim=2)
-            ys.append(y_t)
-
-        return torch.stack(ys, dim=1)
 
 
 class BiMamba2Mixing(MixingLayer):

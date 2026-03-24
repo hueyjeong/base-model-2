@@ -14,15 +14,21 @@ use crate::common::*;
 use super::MixingLayer;
 
 /// 단방향 Mamba-2 SSD 블록 — BitLinear projection (Ternary/F32 자동 감지)
+///
+/// 저랭크 모드 (in_proj_rank > 0):
+///   in_proj_down (d_model → rank, F32) → in_proj_up (rank → d_in_proj, Ternary)
+/// 기존 모드 (in_proj_rank = 0):
+///   in_proj_up (d_model → d_in_proj) 단일 projection
 pub struct Mamba2Block {
-    in_proj: Projection,          // d_model → d_in_proj (BitLinear → Ternary)
-    conv1d_weight: Vec<f32>,      // (d_conv_in, d_conv) — depthwise
-    conv1d_bias: Vec<f32>,        // (d_conv_in,)
-    a_log: Vec<f32>,              // (nheads,) — log-space
-    d_skip: Vec<f32>,             // (nheads,)
-    dt_bias: Vec<f32>,            // (nheads,)
-    norm_weight: Vec<f32>,        // (d_inner,) — RMSNorm
-    out_proj: Projection,         // d_inner → d_model (BitLinear → Ternary)
+    in_proj_down: Option<Projection>, // 저랭크일 때만: d_model → rank
+    in_proj_up: Projection,           // rank → d_in_proj (또는 full: d_model → d_in_proj)
+    conv1d_weight: Vec<f32>,          // (d_conv_in, d_conv) — depthwise
+    conv1d_bias: Vec<f32>,            // (d_conv_in,)
+    a_log: Vec<f32>,                  // (nheads,) — log-space
+    d_skip: Vec<f32>,                 // (nheads,)
+    dt_bias: Vec<f32>,                // (nheads,)
+    norm_weight: Vec<f32>,            // (d_inner,) — RMSNorm
+    out_proj: Projection,             // d_inner → d_model (BitLinear → Ternary)
 
     d_model: usize,
     d_inner: usize,
@@ -42,22 +48,41 @@ impl Mamba2Block {
         prefix: &str,
         d_model: usize, d_state: usize, d_conv: usize,
         expand: usize, headdim: usize, ngroups: usize,
+        in_proj_rank: usize,
     ) -> Result<Self> {
         let d_inner = d_model * expand;
         let nheads = d_inner / headdim;
+
+        // BitLinear QAT 모델: in_proj_rank > 0이면 저랭크 + BitLinear (LayerNorm 포함)
+        // 기존 모델: in_proj_rank = 0이면 단일 Ternary (LayerNorm 없음)
+        let use_bitlinear = in_proj_rank > 0;
+        let load_proj = if use_bitlinear {
+            Projection::load_bmmq_bitlinear
+        } else {
+            Projection::load_bmmq
+        };
+
+        let (in_proj_down, in_proj_up) = if in_proj_rank > 0 {
+            let down = Projection::load_bmmq(tensors, &format!("{}.in_proj_down", prefix))?;
+            let up = load_proj(tensors, &format!("{}.in_proj_up", prefix))?;
+            (Some(down), up)
+        } else {
+            (None, Projection::load_bmmq(tensors, &format!("{}.in_proj", prefix))?)
+        };
 
         let a_log = bmmq_take_f32(tensors, &format!("{}.A_log", prefix))?;
         let a_neg: Vec<f32> = a_log.iter().map(|v| -v.exp()).collect();
 
         Ok(Self {
-            in_proj: Projection::load_bmmq(tensors, &format!("{}.in_proj", prefix))?,
+            in_proj_down,
+            in_proj_up,
             conv1d_weight: bmmq_take_f32(tensors, &format!("{}.conv1d.weight", prefix))?,
             conv1d_bias: bmmq_take_f32(tensors, &format!("{}.conv1d.bias", prefix))?,
             a_log,
             d_skip: bmmq_take_f32(tensors, &format!("{}.D", prefix))?,
             dt_bias: bmmq_take_f32(tensors, &format!("{}.dt_bias", prefix))?,
             norm_weight: bmmq_take_f32(tensors, &format!("{}.norm.weight", prefix))?,
-            out_proj: Projection::load_bmmq(tensors, &format!("{}.out_proj", prefix))?,
+            out_proj: load_proj(tensors, &format!("{}.out_proj", prefix))?,
             d_model, d_inner, d_state, d_conv, nheads, headdim, ngroups,
             a_neg,
         })
@@ -75,13 +100,20 @@ impl MixingLayer for Mamba2Block {
         let hd = self.headdim;
         let ng = self.ngroups;
         let d_conv_in = di + 2 * ng * ds;
-        let d_in_proj = self.in_proj.out_dim();
+        let d_in_proj = self.in_proj_up.out_dim();
 
         let _t0 = std::time::Instant::now();
 
-        // in_proj → proj 버퍼 (재사용)
+        // in_proj → proj 버퍼 (저랭크: down→mid→up, 기존: 단일 matmul)
         let mut proj = vec![0.0f32; seq_len * d_in_proj];
-        self.in_proj.forward_batch(x, seq_len, &mut proj);
+        if let Some(ref down) = self.in_proj_down {
+            let rank = down.out_dim();
+            let mut mid = vec![0.0f32; seq_len * rank];
+            down.forward_batch(x, seq_len, &mut mid);
+            self.in_proj_up.forward_batch(&mid, seq_len, &mut proj);
+        } else {
+            self.in_proj_up.forward_batch(x, seq_len, &mut proj);
+        }
 
         let _t_proj = _t0.elapsed();
 
@@ -206,12 +238,13 @@ impl BiMamba2 {
         prefix: &str,
         d_model: usize, d_state: usize, d_conv: usize,
         expand: usize, headdim: usize, ngroups: usize,
+        in_proj_rank: usize,
     ) -> Result<Self> {
         Ok(Self {
             fwd: Mamba2Block::load_bmmq(tensors, &format!("{}.fwd", prefix),
-                d_model, d_state, d_conv, expand, headdim, ngroups)?,
+                d_model, d_state, d_conv, expand, headdim, ngroups, in_proj_rank)?,
             bwd: Mamba2Block::load_bmmq(tensors, &format!("{}.bwd", prefix),
-                d_model, d_state, d_conv, expand, headdim, ngroups)?,
+                d_model, d_state, d_conv, expand, headdim, ngroups, in_proj_rank)?,
         })
     }
 }
