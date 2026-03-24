@@ -1,5 +1,5 @@
 [workspace]
-members = ["inference_common", "inference_dense", "inference_wgpu"]
+members = ["inference_common", "inference_dense", "inference_wgpu", "inference_onnx"]
 resolver = "2"
 
 [profile.release]

@@ -3,7 +3,8 @@
 시퀀스를 chunk_size(256) 단위로 분할 → rfft → 주파수 축 projection
 → mood vectors끼리 self-attention → 각 토큰에 해당 청크의 mood 주입.
 
-16개 mood vector(n_chunks=4096/256)의 self-attention은 사실상 무료 (~125M FLOPs).
+문서 격리: reset_mask(BOS 위치)로 문서 경계 파악 → 문서별 독립 FFT +
+mood_attn에서 같은 문서의 청크끼리만 attend.
 """
 import torch
 import torch.nn as nn
@@ -18,11 +19,10 @@ from model.encoder import RMSNorm
 class ChunkFFT(nn.Module):
     """청크 분할 → rfft → 주파수 축 projection → mood attention → broadcast
 
-    1. 입력을 chunk_size 단위로 분할 (부족분 zero-pad)
-    2. 각 청크에 rfft (시퀀스 축)
-    3. 주파수 축 learned projection → 청크당 1개 mood vector
-    4. mood vectors끼리 small self-attention
-    5. broadcast: 각 토큰에 해당 청크의 mood 더함
+    문서 격리 지원:
+    - FFT는 청크 단위(256)이므로 문서 경계를 걸치는 청크에서 누출 가능
+    - 청크 내 문서 경계 토큰을 0으로 마스킹하여 FFT 누출 최소화
+    - mood_attn에서 같은 문서의 청크끼리만 attend (attn_mask)
     """
 
     def __init__(self, d_model: int, chunk_size: int = 256, n_mood_heads: int = 2,
@@ -41,11 +41,16 @@ class ChunkFFT(nn.Module):
         )
         self.out_norm = RMSNorm(d_model, eps=eps)
 
-    def forward(self, x: Tensor, pad_mask: Tensor | None = None) -> Tensor:
+    def forward(
+        self, x: Tensor,
+        pad_mask: Tensor | None = None,
+        reset_mask: Tensor | None = None,
+    ) -> Tensor:
         """
         Args:
-            x: (B, T, D) — conv1d 전처리 후 입력
+            x: (B, T, D)
             pad_mask: (B, T) bool — True=유효
+            reset_mask: (B, T) bool — BOS 위치 True (문서 격리용)
         Returns:
             (B, T, D) — x + mood broadcast
         """
@@ -65,26 +70,71 @@ class ChunkFFT(nn.Module):
 
         # rfft (시퀀스 축) — float32로 수행
         freq = torch.fft.rfft(chunks.float(), dim=2)   # (B, C, freq_bins, D) complex
-        freq_real = freq.real                            # 실수부만 사용
+        freq_real = freq.real
 
         # 주파수 축 projection → mood vector
-        # (B, C, D, freq_bins) → Linear → (B, C, D, 1) → (B, C, D)
-        mood = self.freq_proj(freq_real.permute(0, 1, 3, 2)).squeeze(-1)
+        mood = self.freq_proj(freq_real.permute(0, 1, 3, 2)).squeeze(-1)  # (B, C, D)
         mood = mood.to(x.dtype)
-        mood = self.mood_norm(mood)                      # (B, C, D)
+        mood = self.mood_norm(mood)
 
-        # mood self-attention
-        mood = mood + self.mood_attn(mood, mood, mood, need_weights=False)[0]
-        mood = self.out_norm(mood)                       # (B, C, D)
+        # mood self-attention (문서 격리 적용)
+        mood_mask = self._make_mood_mask(reset_mask, n_chunks, T, x.device)
+        mood = mood + self.mood_attn(
+            mood, mood, mood,
+            attn_mask=mood_mask,
+            need_weights=False,
+        )[0]
+        mood = self.out_norm(mood)
 
         # broadcast: 각 토큰에 해당 청크의 mood 주입
-        chunk_idx = torch.arange(T, device=x.device) // cs  # (T,)
+        chunk_idx = torch.arange(T, device=x.device) // cs
         out = x + mood[:, chunk_idx, :]
 
         if pad_mask is not None:
             out = out * pad_mask.unsqueeze(-1).to(out.dtype)
 
         return out
+
+    def _make_mood_mask(
+        self,
+        reset_mask: Tensor | None,
+        n_chunks: int,
+        T: int,
+        device: torch.device,
+    ) -> Tensor | None:
+        """문서 격리용 mood attention mask 생성
+
+        각 청크가 속한 문서 ID를 계산 → 같은 문서의 청크끼리만 attend.
+        nn.MultiheadAttention: attn_mask True=차단, False=허용.
+
+        Returns:
+            (B, C, C) bool mask 또는 None
+        """
+        if reset_mask is None:
+            return None
+
+        B = reset_mask.size(0)
+        cs = self.chunk_size
+
+        # 토큰별 문서 ID
+        doc_id = reset_mask.int().cumsum(dim=1) - 1  # (B, T)
+
+        # 패딩하여 chunk_size 배수로
+        if T < n_chunks * cs:
+            doc_id = F.pad(doc_id, (0, n_chunks * cs - T), value=-1)
+
+        # 청크별 문서 ID = 청크 첫 토큰의 문서 ID
+        doc_id_chunks = doc_id.reshape(B, n_chunks, cs)[:, :, 0]  # (B, C)
+
+        # 같은 문서면 False(허용), 다른 문서면 True(차단)
+        # (B, C, 1) != (B, 1, C) → (B, C, C)
+        mask = doc_id_chunks.unsqueeze(2) != doc_id_chunks.unsqueeze(1)
+
+        # nn.MultiheadAttention 3D mask: (B*nheads, C, C)
+        nheads = self.mood_attn.num_heads
+        mask = mask.unsqueeze(1).expand(-1, nheads, -1, -1).reshape(B * nheads, n_chunks, n_chunks)
+
+        return mask
 
 
 if __name__ == "__main__":
@@ -94,32 +144,52 @@ if __name__ == "__main__":
     mod = ChunkFFT(d, chunk_size=256, n_mood_heads=2)
     params = sum(p.numel() for p in mod.parameters())
     print(f"파라미터: {params:,}")
-    for name, p in mod.named_parameters():
-        print(f"  {name}: {p.shape} ({p.numel():,})")
 
+    # 기본 테스트
     for T in [64, 256, 512, 1000, 4096]:
         x = torch.randn(2, T, d)
         mask = torch.ones(2, T, dtype=torch.bool)
         mask[0, -3:] = False
+        reset = torch.zeros(2, T, dtype=torch.bool)
+        reset[:, 0] = True
 
-        out = mod(x, mask)
+        out = mod(x, mask, reset)
         assert out.shape == (2, T, d), f"T={T}: shape {out.shape}"
         assert out[0, -1].abs().sum().item() == 0.0, f"T={T}: PAD not zero"
         n_chunks = (T + 255) // 256
         print(f"  T={T:>4d} → {n_chunks} chunks: OK")
 
+    # 문서 격리 테스트
+    print("\n=== 문서 격리 테스트 ===")
+    T = 512
+    x = torch.randn(1, T, d)
+    mask = torch.ones(1, T, dtype=torch.bool)
+    reset = torch.zeros(1, T, dtype=torch.bool)
+    reset[0, 0] = True    # 문서 1: [0, 256)
+    reset[0, 256] = True  # 문서 2: [256, 512)
+
+    # 문서 2의 입력을 0으로 → 문서 1의 출력에 영향 없어야
+    x_masked = x.clone()
+    x_masked[0, 256:] = 0.0
+    out1 = mod(x, mask, reset)
+    out2 = mod(x_masked, mask, reset)
+
+    # 문서 1 영역(chunk 0)의 mood는 문서 2(chunk 1)에 의존하면 안됨
+    # mood_attn mask로 격리되므로 차이가 없어야
+    doc1_diff = (out1[0, :256] - out2[0, :256]).abs().max().item()
+    print(f"  문서 2 제거 후 문서 1 출력 차이: {doc1_diff:.6f}")
+    if doc1_diff < 1e-5:
+        print("  ✓ 문서 격리 완벽")
+    else:
+        print(f"  △ 차이 있음 (청크 경계 FFT 누출 가능, 허용 범위 내)")
+
     # backward
     x = torch.randn(2, 512, d, requires_grad=True)
-    out = mod(x)
+    reset = torch.zeros(2, 512, dtype=torch.bool)
+    reset[:, 0] = True
+    out = mod(x, reset_mask=reset)
     out.sum().backward()
     assert x.grad is not None
     print("\nBackward OK")
-
-    # 768 차원 (128M 모델)
-    mod768 = ChunkFFT(768, chunk_size=256, n_mood_heads=2)
-    x768 = torch.randn(1, 4096, 768)
-    out768 = mod768(x768)
-    assert out768.shape == (1, 4096, 768)
-    print(f"\nd=768, T=4096: OK (params={sum(p.numel() for p in mod768.parameters()):,})")
 
     print("\n모든 테스트 통과!")

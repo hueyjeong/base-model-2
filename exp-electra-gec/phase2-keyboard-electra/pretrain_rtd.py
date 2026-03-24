@@ -117,9 +117,12 @@ class GPUPrefetcher:
 
 @torch.no_grad()
 def validate_rtd(model, val_loader, device, n_batches=50, use_amp=False):
-    """검증: disc_loss, rtd_acc, gen_loss 측정"""
+    """검증: disc_loss, rtd_acc, gen_loss 측정
+
+    model은 raw_model(DDP unwrap 전)을 전달받아야 함.
+    """
     model.eval()
-    raw = model.module if isinstance(model, DDP) else model
+    raw = model
 
     total_disc_loss = 0.0
     total_gen_loss = 0.0
@@ -455,7 +458,7 @@ def main():
 
         # Validation
         if val_loader is not None and (step + 1) % args.val_every == 0 and is_main:
-            val_metrics = validate_rtd(model, val_loader, device, use_amp=use_amp)
+            val_metrics = validate_rtd(raw_model, val_loader, device, use_amp=use_amp)
             if val_metrics:
                 log(
                     f"  [VAL] d_loss={val_metrics['disc_loss']:.4f} "
@@ -464,7 +467,13 @@ def main():
                     f"g_acc={val_metrics['gen_acc']:.3f} "
                     f"repl={val_metrics['replaced_ratio']:.3f}"
                 )
-            model.train()
+            raw_model.train()
+            # eval→train 전환 후 Int8Linear 양자화 캐시 무효화
+            # (eval에서 .round(), train에서 _ste_round 사용 — 캐시 불일치 방지)
+            from model.bitlinear import Int8Linear as _I8L
+            for m in raw_model.modules():
+                if isinstance(m, _I8L):
+                    m._weight_version = -1
 
         # 체크포인트 저장
         if (step + 1) % args.save_every == 0 and is_main:

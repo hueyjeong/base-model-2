@@ -113,7 +113,7 @@ class DiamondEncoder(nn.Module):
 
         # Conv1d + ChunkFFT 전처리
         x = self.conv_preprocess(x, pad_mask)
-        x = self.chunk_fft(x, pad_mask)
+        x = self.chunk_fft(x, pad_mask, reset_mask)
 
         # 다이아몬드 레이어 스택
         for layer in self.layers:

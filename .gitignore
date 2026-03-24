@@ -26,6 +26,11 @@ corpus/corpus.tar.gz.enc*
 *.safetensors
 *.bin
 
+# ONNX exports (large binary)
+exports/
+*.onnx
+*.onnx.data
+
 # Logs & temp
 *.log
 _tmp_*
