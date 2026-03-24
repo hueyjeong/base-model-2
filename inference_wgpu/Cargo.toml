@@ -1,23 +1,20 @@
 [package]
-name = "dense-editor-inference"
+name = "dense-editor-wgpu"
 version = "0.1.0"
 edition = "2021"
-description = "DenseEditor CPU inference engine — 6종 mixing layer 벤치마크"
+description = "DenseEditor wgpu GPU inference engine — cross-platform (Vulkan/Metal/DX12)"
 
 [dependencies]
 inference-common = { path = "../inference_common" }
+wgpu = "24"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-rustfft = "6"
-
-[features]
-default = []
-avx2-only = []
-
-[build-dependencies]
-cc = "1"
+log = "0.4"
+env_logger = "0.11"
 
 [profile.release]
 opt-level = 3

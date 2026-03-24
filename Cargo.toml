@@ -1,0 +1,7 @@
+[workspace]
+members = ["inference_common", "inference_dense", "inference_wgpu"]
+resolver = "2"
+
+[profile.release]
+opt-level = 3
+lto = true

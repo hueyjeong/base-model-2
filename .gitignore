@@ -41,8 +41,16 @@ _tmp_*
 exported/
 
 # Rust build artifacts
+target/
 inference/target/
 inference_dense/target/
+inference_wgpu/target/
+
+# Windows distribution
+win_dist/
+
+# Exported models
+exported_768/
 
 # Zone.Identifier (WSL)
 *.Zone.Identifier
