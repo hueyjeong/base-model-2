@@ -227,6 +227,16 @@ def train(args):
     )
     if args.n_layers is not None:
         config_overrides["n_layers"] = args.n_layers
+    if args.d_ff is not None:
+        config_overrides["d_ff"] = args.d_ff
+    if args.mamba_expand is not None:
+        config_overrides["mamba_expand"] = args.mamba_expand
+    if args.mamba_d_conv is not None:
+        config_overrides["mamba_d_conv"] = args.mamba_d_conv
+    if args.bitlinear_mamba:
+        config_overrides["bitlinear_mamba"] = True
+    if args.mamba2_in_proj_rank is not None:
+        config_overrides["mamba2_in_proj_rank"] = args.mamba2_in_proj_rank
     config = make_config(
         mixing_type=args.mixing_type,
         d_model=args.d_model,
@@ -818,6 +828,16 @@ def main():
                         help="타겟 파라미터 수")
     parser.add_argument("--n_layers", type=int, default=None,
                         help="레이어 수 직접 지정 (미지정 시 target_params로 자동 계산)")
+    parser.add_argument("--d_ff", type=int, default=None,
+                        help="FFN 히든 차원 (미지정 시 d_model*8/3)")
+    parser.add_argument("--mamba_expand", type=int, default=None,
+                        help="Mamba expand factor (기본 2)")
+    parser.add_argument("--mamba_d_conv", type=int, default=None,
+                        help="Mamba conv kernel size (기본 4)")
+    parser.add_argument("--bitlinear_mamba", action="store_true",
+                        help="Mamba-2 in/out_proj를 BitLinear로 교체 (QAT)")
+    parser.add_argument("--mamba2_in_proj_rank", type=int, default=None,
+                        help="Mamba-2 in_proj 저랭크 차원 (미지정 시 full rank)")
     parser.add_argument("--tokenizer", type=str, default="keyboard",
                         choices=list(TOKENIZER_PRESETS.keys()))
     parser.add_argument("--n_iterations", type=int, default=1,

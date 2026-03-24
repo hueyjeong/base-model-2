@@ -72,6 +72,10 @@ class DenseEditorConfig:
     hybrid_conv_kernel: int = 4       # depthwise conv kernel size
     hybrid_window_size: int = 64      # window attention 크기
 
+    # BitLinear Mamba-2 실험 전용
+    bitlinear_mamba: bool = False           # Mamba-2 in/out_proj를 BitLinear로
+    mamba2_in_proj_rank: int | None = None  # in_proj 저랭크 차원 (None=full rank)
+
     def save(self, path: str) -> None:
         """설정을 JSON 파일로 저장"""
         with open(path, "w", encoding="utf-8") as f:

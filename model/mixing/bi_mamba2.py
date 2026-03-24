@@ -4,8 +4,8 @@ GPU 학습: nn.Linear proj + mamba_ssm fused CUDA kernel (mamba_split_conv1d_sca
          + proximity regularization으로 ternary 근접 가중치 학습
 CPU 추론: TernaryLinear proj + Python sequential scan fallback
 
-in_proj/out_proj는 nn.Linear로 유지 — fused kernel과 호환 + 최대 학습 속도.
-export 시 ternary quantization 적용 (proximity loss로 양자화 오차 최소화).
+Mamba2Block: in_proj/out_proj는 nn.Linear — fused kernel 호환 + 최대 학습 속도.
+Mamba2BitLinearBlock: in_proj 저랭크 + BitLinear, out_proj BitLinear — 전체 QAT 실험용.
 """
 import math
 
@@ -202,6 +202,178 @@ class Mamba2Block(nn.Module):
         return torch.stack(ys, dim=1)
 
 
+class Mamba2BitLinearBlock(nn.Module):
+    """Mamba-2 SSD 단방향 블록 — BitLinear QAT 버전
+
+    in_proj: nn.Linear(d_model, rank) → BitLinear(rank, d_in_proj)  [저랭크]
+    out_proj: BitLinear(d_inner, d_model)  [fused kernel에서 분리]
+    SSM 파라미터(A_log, dt_bias, D) + state(h)는 FP32 유지.
+    """
+
+    def __init__(self, d_model: int, d_state: int = 64, d_conv: int = 4,
+                 expand: int = 2, headdim: int = 64, ngroups: int = 1,
+                 chunk_size: int = 256, in_proj_rank: int | None = None):
+        super().__init__()
+        from model.bitlinear import BitLinear
+
+        self.d_model = d_model
+        self.d_inner = d_model * expand
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.headdim = headdim
+        self.nheads = self.d_inner // headdim
+        self.ngroups = ngroups
+        self.chunk_size = chunk_size
+
+        assert self.d_inner % headdim == 0, \
+            f"d_inner({self.d_inner})은 headdim({headdim})으로 나누어떨어져야 함"
+
+        # 프로젝션 차원 (mamba_ssm 순서: z, xBC, dt)
+        d_in_proj = 2 * self.d_inner + 2 * ngroups * d_state + self.nheads
+        d_conv_in = self.d_inner + 2 * ngroups * d_state
+
+        # in_proj: 저랭크 분해 — nn.Linear(정밀 병목) → BitLinear(ternary 확장)
+        rank = in_proj_rank or d_model
+        self.in_proj_down = nn.Linear(d_model, rank, bias=False)
+        self.in_proj_up = BitLinear(rank, d_in_proj)
+
+        self.conv1d = nn.Conv1d(
+            d_conv_in, d_conv_in,
+            kernel_size=d_conv, padding=d_conv - 1,
+            groups=d_conv_in, bias=True,
+        )
+
+        # out_proj: BitLinear — fused kernel과 분리하여 별도 적용
+        self.out_proj = BitLinear(self.d_inner, d_model)
+
+        # RMSNorm weight — GPU에서는 fused kernel 내부, CPU에서는 수동 적용
+        self.norm = nn.RMSNorm(self.d_inner)
+
+        # SSM 파라미터 (FP32 유지 — head당 스칼라)
+        self.dt_bias = nn.Parameter(torch.zeros(self.nheads))
+        A = torch.arange(1, self.nheads + 1, dtype=torch.float32)
+        self.A_log = nn.Parameter(torch.log(A))
+        self.D = nn.Parameter(torch.ones(self.nheads))
+
+    def forward(self, x: Tensor, reset_mask: Tensor | None = None) -> Tensor:
+        if _MAMBA2_CUDA_OPS and x.is_cuda:
+            return self._forward_cuda(x, reset_mask)
+        else:
+            return self._forward_fallback(x, reset_mask)
+
+    @torch.compiler.disable
+    def _forward_cuda(self, x: Tensor, reset_mask: Tensor | None = None) -> Tensor:
+        """BitLinear in_proj → fused kernel (outproj 분리) → BitLinear out_proj"""
+        seq_idx = None
+        if reset_mask is not None:
+            seq_idx = (reset_mask.int().cumsum(dim=1) - 1).to(torch.int32)
+
+        # 1) 저랭크 BitLinear in_proj
+        zxbcdt = self.in_proj_up(self.in_proj_down(x))
+
+        A = -torch.exp(self.A_log.float())
+
+        # 2) Fused: conv1d + chunk_scan + RMSNorm + gate (out_proj 제외)
+        y = _mamba_split_conv1d_scan_combined(
+            zxbcdt,
+            self.conv1d.weight.squeeze(1),
+            self.conv1d.bias,
+            self.dt_bias,
+            A,
+            self.D,
+            chunk_size=self.chunk_size,
+            seq_idx=seq_idx,
+            activation="silu",
+            rmsnorm_weight=self.norm.weight,
+            rmsnorm_eps=1e-5,
+            outproj_weight=None,  # out_proj 분리 — BitLinear 별도 적용
+            outproj_bias=None,
+            headdim=self.headdim,
+            ngroups=self.ngroups,
+            norm_before_gate=False,
+        )
+
+        # 3) BitLinear out_proj
+        return self.out_proj(y)
+
+    def _forward_fallback(self, x: Tensor, reset_mask: Tensor | None = None) -> Tensor:
+        """Python sequential scan fallback (CPU / non-CUDA) — SSM state FP32"""
+        B_batch, T, _ = x.shape
+        di = self.d_inner
+        ds = self.d_state
+        nh = self.nheads
+        hd = self.headdim
+        ng = self.ngroups
+        d_conv_in = di + 2 * ng * ds
+
+        # 저랭크 BitLinear in_proj
+        proj = self.in_proj_up(self.in_proj_down(x))
+
+        z = proj[:, :, :di]
+        xBC_raw = proj[:, :, di:di + d_conv_in]
+        dt_raw = proj[:, :, di + d_conv_in:]
+
+        # conv1d on [x, B, C]
+        xBC = self.conv1d(xBC_raw.transpose(1, 2))[:, :, :T].transpose(1, 2)
+
+        x_conv = F.silu(xBC[:, :, :di])
+        B_conv = xBC[:, :, di:di + ng * ds]
+        C_conv = xBC[:, :, di + ng * ds:]
+
+        # dt → decay (FP32 강제)
+        dt = F.softplus(dt_raw.float() + self.dt_bias.float())
+        A = -torch.exp(self.A_log.float())
+        decay = torch.exp(A.unsqueeze(0).unsqueeze(0) * dt)
+
+        # Sequential scan
+        x_heads = x_conv.view(B_batch, T, nh, hd)
+        B_heads = B_conv.view(B_batch, T, ng, ds)
+        C_heads = C_conv.view(B_batch, T, ng, ds)
+
+        heads_per_group = nh // ng
+        y = self._scan_sequential(x_heads, B_heads, C_heads, decay, reset_mask,
+                                  heads_per_group)
+
+        # Skip connection: D * x
+        D_expanded = self.D.float().view(1, 1, nh, 1).expand_as(y)
+        y = y + D_expanded * x_heads.float()
+
+        # Reshape + gate→norm (norm_before_gate=False)
+        y = y.reshape(B_batch, T, di).to(x.dtype)
+        y = y * F.silu(z)
+        y = self.norm(y)
+
+        return self.out_proj(y)
+
+    def _scan_sequential(self, x, B, C, decay, reset_mask, heads_per_group):
+        """Mamba-2 SSD sequential scan — state h는 FP32"""
+        batch, T, nh, hd = x.shape
+        ds = self.d_state
+
+        # SSM state는 반드시 FP32 (BF16에서 누적 오차 방지)
+        h = torch.zeros(batch, nh, ds, hd, dtype=torch.float32, device=x.device)
+        ys = []
+
+        for t in range(T):
+            if reset_mask is not None:
+                rst = reset_mask[:, t].view(batch, 1, 1, 1).float()
+                h = h * (1 - rst)
+
+            a_t = decay[:, t, :].view(batch, nh, 1, 1)
+            b_t = B[:, t, :].float()
+            c_t = C[:, t, :].float()
+            x_t = x[:, t, :].float()
+
+            b_expanded = b_t.repeat_interleave(heads_per_group, dim=1)
+            c_expanded = c_t.repeat_interleave(heads_per_group, dim=1)
+
+            h = a_t * h + b_expanded.unsqueeze(-1) * x_t.unsqueeze(2)
+            y_t = (c_expanded.unsqueeze(-1) * h).sum(dim=2)
+            ys.append(y_t)
+
+        return torch.stack(ys, dim=1)
+
+
 class BiMamba2Mixing(MixingLayer):
     """양방향 Mamba-2 — forward + backward addition"""
 
@@ -214,12 +386,18 @@ class BiMamba2Mixing(MixingLayer):
         expand = getattr(cfg, 'mamba_expand', 2)
         d_conv = getattr(cfg, 'mamba_d_conv', 4)
 
-        self.fwd = Mamba2Block(cfg.d_model, d_state=ds, d_conv=d_conv,
-                               expand=expand, headdim=hd, ngroups=ng,
-                               chunk_size=cs)
-        self.bwd = Mamba2Block(cfg.d_model, d_state=ds, d_conv=d_conv,
-                               expand=expand, headdim=hd, ngroups=ng,
-                               chunk_size=cs)
+        common_kwargs = dict(d_state=ds, d_conv=d_conv, expand=expand,
+                             headdim=hd, ngroups=ng, chunk_size=cs)
+
+        if getattr(cfg, 'bitlinear_mamba', False):
+            rank = getattr(cfg, 'mamba2_in_proj_rank', None)
+            self.fwd = Mamba2BitLinearBlock(cfg.d_model, **common_kwargs,
+                                           in_proj_rank=rank)
+            self.bwd = Mamba2BitLinearBlock(cfg.d_model, **common_kwargs,
+                                           in_proj_rank=rank)
+        else:
+            self.fwd = Mamba2Block(cfg.d_model, **common_kwargs)
+            self.bwd = Mamba2Block(cfg.d_model, **common_kwargs)
 
     def forward(self, x: Tensor, pad_mask: Tensor | None = None,
                 reset_mask: Tensor | None = None) -> Tensor:
