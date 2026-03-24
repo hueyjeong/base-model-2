@@ -180,13 +180,16 @@ def validate_editor(model, val_loader, criterion, config, device, use_amp, n_ste
 
     model.train()
     if total_tokens == 0:
-        return float("nan"), float("nan"), float("nan"), float("nan")
+        return float("nan"), float("nan"), float("nan"), float("nan"), float("nan")
 
     val_loss = total_loss / total_tokens
     tag_acc = total_correct / total_tokens
     edit_precision = edit_tp / max(edit_tp + edit_fp, 1)
     edit_recall = edit_tp / max(edit_tp + edit_fn, 1)
-    return val_loss, tag_acc, edit_precision, edit_recall
+    beta_sq = 0.5 ** 2  # F0.5: precision 가중
+    edit_f05 = ((1 + beta_sq) * edit_precision * edit_recall
+                / max(beta_sq * edit_precision + edit_recall, 1e-8))
+    return val_loss, tag_acc, edit_precision, edit_recall, edit_f05
 
 
 def train(args):
@@ -687,7 +690,7 @@ def train(args):
         if (val_loader is not None and args.val_every
                 and (step + 1) >= args.warmup_steps
                 and (step + 1 - args.warmup_steps) % args.val_every == 0):
-            val_loss, tag_acc, edit_p, edit_r = validate_editor(
+            val_loss, tag_acc, edit_p, edit_r, edit_f05 = validate_editor(
                 raw_model, val_loader, criterion, config, device,
                 use_amp, args.val_steps, amp_dtype=amp_dtype,
             )
@@ -696,9 +699,14 @@ def train(args):
                 dist.all_reduce(val_stats)
                 val_stats /= world_size
                 val_loss, tag_acc, edit_p, edit_r = val_stats.tolist()
+                # F0.5는 평균 P,R로 재계산 (harmonic mean은 평균 불가)
+                beta_sq = 0.5 ** 2
+                edit_f05 = ((1 + beta_sq) * edit_p * edit_r
+                            / max(beta_sq * edit_p + edit_r, 1e-8))
             if global_rank == 0:
                 print(f"  val step {step + 1:>6d} | val_loss {val_loss:.4f} | "
-                      f"tag_acc {tag_acc:.2%} | edit_P {edit_p:.2%} | edit_R {edit_r:.2%}", flush=True)
+                      f"tag_acc {tag_acc:.2%} | P {edit_p:.2%} R {edit_r:.2%} F0.5 {edit_f05:.2%}",
+                      flush=True)
 
         # 체크포인트 (DDP: all_reduce는 모든 rank 참여 필요)
         if (step + 1) % save_interval == 0:
