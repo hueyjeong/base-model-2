@@ -1,0 +1,7 @@
+{
+  "model_type": "BitEditor",
+  "source_checkpoint": "checkpoints/mamba2_d768_12L/dense_mamba2_d768_step_10000.pt",
+  "step": 10000,
+  "format": "bmmq",
+  "param_count": 114952032
+}

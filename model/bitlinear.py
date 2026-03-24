@@ -44,7 +44,6 @@ def quantize_weights_158(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return w_quant, gamma
 
 
-@torch.compiler.disable
 def quantize_activations_8bit(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """활성화를 8-bit per-token absmax 양자화
 
@@ -53,7 +52,7 @@ def quantize_activations_8bit(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
     x_q = clip(round(x × Q_b / η), -128, 127)
 
     CUDA 커널 사용 가능 시 fused 단일 커널로 실행 (5+ ops → 1).
-    torch.compiler.disable: amax backward가 inductor에서 NaN 생성하는 버그 회피.
+    PyTorch 2.10+: amax backward inductor NaN 버그 수정됨 → compiler.disable 불필요.
 
     Returns:
         (quantized_activations, scale_factor)
@@ -330,7 +329,6 @@ class Int8Linear(nn.Linear):
         self._w_quant_cache: torch.Tensor | None = None
         self._w_scale_cache: torch.Tensor | None = None
 
-    @torch.compiler.disable
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # LayerNorm (BitLinear과 동일한 sub-layer norm)
         x = self.norm(x)
@@ -354,6 +352,14 @@ class Int8Linear(nn.Linear):
 
         # STE 재연결
         w_quant = self.weight + (self._w_quant_cache * self._w_scale_cache - self.weight).detach()
+
+        # AMP autocast 존중: 양자화 값은 {-128~127} 정수 → bf16 정확 표현 가능
+        # bf16 matmul = Tensor Core 활용, fp32 대비 ~2x throughput
+        if torch.is_autocast_enabled():
+            compute_dtype = torch.get_autocast_gpu_dtype()
+            x_quant = x_quant.to(compute_dtype)
+            w_quant = w_quant.to(compute_dtype)
+            x_scale = x_scale.to(compute_dtype)
 
         out = F.linear(x_quant, w_quant, self.bias)
         return out * x_scale
