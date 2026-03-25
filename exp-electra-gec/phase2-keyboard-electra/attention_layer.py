@@ -162,30 +162,41 @@ class AttentionLayer(nn.Module):
     ) -> Tensor:
         """문서별 독립 linear attention
 
-        각 문서 segment에 대해 독립적으로 KV 집계 → 문서 간 정보 누출 없음.
+        배치는 벡터화, 문서는 n_docs loop (n_docs ~5-20, 작음).
+        각 iteration에서 mask select → einsum → mask scatter.
+        B loop 제거, 문서 loop만 유지.
         """
         B, H, T, d = q.shape
+
+        # 문서 ID: (B, T)
+        doc_id = reset_mask.int().cumsum(dim=1) - 1
+
         out = torch.zeros_like(q)
+        n_docs = doc_id.max().item() + 1
 
-        for b in range(B):
-            bos_pos = reset_mask[b].nonzero(as_tuple=True)[0]
-            n_docs = bos_pos.size(0)
+        for doc in range(n_docs):
+            # 이 문서에 속하는 토큰 마스크: (B, T)
+            mask = (doc_id == doc)  # (B, T)
+            if not mask.any():
+                continue
 
-            for i in range(n_docs):
-                start = bos_pos[i].item()
-                end = bos_pos[i + 1].item() if i + 1 < n_docs else T
+            # 마스크 확장: (B, 1, T, 1)
+            m = mask.unsqueeze(1).unsqueeze(-1).to(q.dtype)  # (B, 1, T, 1)
 
-                q_doc = q[b, :, start:end]  # (H, doc_len, d)
-                k_doc = k[b, :, start:end]
-                v_doc = v[b, :, start:end]
+            # 이 문서의 K, V만 추출 (마스크 외 위치 0)
+            k_doc = k * m  # (B, H, T, d)
+            v_doc = v * m
 
-                # KV = K^T @ V → (H, d, d)
-                kv_doc = torch.einsum("hsd,hse->hde", k_doc, v_doc)
-                # out = Q @ KV → (H, doc_len, d)
-                out_doc = torch.einsum("hsd,hde->hse", q_doc, kv_doc)
-                # 정규화
-                z_doc = torch.einsum("hsd,hd->hs", q_doc, k_doc.sum(dim=1))
-                out[b, :, start:end] = out_doc / (z_doc.unsqueeze(-1).clamp(min=1e-6))
+            # KV 집계: (B, H, d, d)
+            kv = torch.einsum("bhsd,bhse->bhde", k_doc, v_doc)
+            # Q @ KV: (B, H, T, d)
+            out_doc = torch.einsum("bhsd,bhde->bhse", q, kv)
+            # 정규화
+            k_sum = k_doc.sum(dim=2)  # (B, H, d)
+            z = torch.einsum("bhsd,bhd->bhs", q, k_sum).clamp(min=1e-6)
+
+            # 이 문서 위치에만 기록
+            out += (out_doc / z.unsqueeze(-1)) * m
 
         return out
 
