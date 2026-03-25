@@ -131,18 +131,31 @@ def validate_rtd(model, val_loader, device, n_batches=50, use_amp=False):
     total_replaced = 0.0
     count = 0
 
-    val_iter = iter(val_loader)
+    try:
+        val_iter = iter(val_loader)
+    except Exception as e:
+        print(f"  [VAL] val_loader iter 실패: {e}", flush=True)
+        model.train()
+        return {}
+
     for _ in range(n_batches):
         try:
             batch = next(val_iter)
         except StopIteration:
             break
+        except Exception as e:
+            print(f"  [VAL] batch 로드 실패: {e}", flush=True)
+            break
 
         input_ids = batch["input_ids"].to(device)
         pad_mask = batch["pad_mask"].to(device)
 
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
-            outputs = raw(input_ids, pad_mask)
+        try:
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
+                outputs = raw(input_ids, pad_mask)
+        except Exception as e:
+            print(f"  [VAL] forward 실패: {e}", flush=True)
+            break
 
         total_disc_loss += outputs["disc_loss"].item()
         total_gen_loss += outputs["gen_loss"].item()
@@ -303,8 +316,7 @@ def main():
             text_key=args.text_key,
         )
         val_loader = DataLoader(
-            val_ds, batch_size=args.batch_size, num_workers=2,
-            drop_last=True, prefetch_factor=4, persistent_workers=True,
+            val_ds, batch_size=args.batch_size, num_workers=0,
         )
 
     # ── Resume ──
@@ -502,6 +514,8 @@ def main():
                     f"g_acc={val_metrics['gen_acc']:.3f} "
                     f"repl={val_metrics['replaced_ratio']:.3f}"
                 )
+            else:
+                log("  [VAL] 검증 배치 0개 — val_corpus 파일/경로 확인 필요")
             raw_model.train()
             # eval→train 전환 후 Int8Linear 양자화 캐시 무효화
             # (eval에서 .round(), train에서 _ste_round 사용 — 캐시 불일치 방지)
