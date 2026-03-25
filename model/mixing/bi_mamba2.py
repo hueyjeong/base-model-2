@@ -168,8 +168,7 @@ class Mamba2Block(nn.Module):
         self.D = nn.Parameter(torch.ones(self.nheads))
 
     def forward(self, x: Tensor, reset_mask: Tensor | None = None) -> Tensor:
-        # int8_qat: fused kernel이 out_proj QAT를 우회하므로 fallback 강제
-        if _MAMBA2_CUDA_OPS and x.is_cuda and not self.int8_qat:
+        if _MAMBA2_CUDA_OPS and x.is_cuda:
             return self._forward_cuda(x, reset_mask)
         else:
             return self._forward_fallback(x, reset_mask)
@@ -188,6 +187,21 @@ class Mamba2Block(nn.Module):
         A = -torch.exp(self.A_log.float())
 
         # 2) Fused: conv1d + chunk_scan + RMSNorm + gate + out_proj
+        # int8_qat: out_proj가 Int8Linear이면 fused kernel에 QAT weight 전달
+        if self.int8_qat:
+            # Int8Linear의 QAT 시뮬레이션: weight → INT8 round-trip (STE)
+            out_w = self.out_proj.weight
+            Qb = 127.0
+            with torch.no_grad():
+                w_eta = out_w.abs().max().clamp(min=1e-5)
+                w_q = (out_w * Qb / w_eta).clamp(-128, 127).round()
+            # STE: forward는 양자화값, backward는 원본으로 전파
+            outproj_weight = out_w + (w_q * w_eta / Qb - out_w).detach()
+            outproj_bias = self.out_proj.bias
+        else:
+            outproj_weight = self.out_proj.weight
+            outproj_bias = self.out_proj.bias
+
         y = _mamba_split_conv1d_scan_combined(
             zxbcdt,
             self.conv1d.weight.squeeze(1),  # (d_conv_in, d_conv)
@@ -200,8 +214,8 @@ class Mamba2Block(nn.Module):
             activation="silu",
             rmsnorm_weight=self.norm.weight,
             rmsnorm_eps=1e-5,
-            outproj_weight=self.out_proj.weight,
-            outproj_bias=self.out_proj.bias,
+            outproj_weight=outproj_weight,
+            outproj_bias=outproj_bias,
             headdim=self.headdim,
             ngroups=self.ngroups,
             norm_before_gate=False,
