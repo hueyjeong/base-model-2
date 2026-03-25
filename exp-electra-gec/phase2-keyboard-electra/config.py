@@ -91,13 +91,24 @@ class ElectraConfig:
 
 
 # ── 프리셋 ──
+#
+# 전체 Linear Attention (양방향, O(Td²)).
+# ONNX RT CPU INT8 벤치마크 (seq=4096, 32T 서버):
+#
+# | 프리셋   | disc params | ONNX INT8 | 크기  |
+# |----------|-------------|-----------|-------|
+# | small    |    3.3M     |    ~30ms  |  4MB  |
+# | base     |   19.6M     |   254ms   | 20MB  |
+# | large    |   70.5M     |   622ms   | 66MB  |
 
 def make_small_config(**overrides) -> ElectraConfig:
-    """Small Discriminator (~8M) + Generator (~2M)"""
+    """Small — 3.3M disc, 1.4M gen. 빠른 실험용.
+    ONNX CPU INT8 seq=4096: ~30ms
+    """
     disc = DiscriminatorConfig(
         d_model=256, d_ff=512,
         n_heads=4, n_kv_heads=2, headdim=64,
-        layer_spec=["fa", "wa:64", "wa:32", "wa:64", "fa"],
+        layer_spec=["la"] * 5,
     )
     gen = GeneratorConfig(d_model=128, n_layers=4, d_ff=512, n_heads=2)
     cfg = ElectraConfig(disc=disc, gen=gen)
@@ -106,24 +117,41 @@ def make_small_config(**overrides) -> ElectraConfig:
     return cfg
 
 
-def make_128m_config(**overrides) -> ElectraConfig:
-    """128M Discriminator + Generator (~2M)"""
+def make_base_config(**overrides) -> ElectraConfig:
+    """Base — 19.6M disc, 1.4M gen. CPU 배포 타겟.
+    ONNX CPU INT8 seq=4096: 254ms / 20MB
+    """
+    disc = DiscriminatorConfig(
+        d_model=512, d_ff=1024,
+        n_heads=8, n_kv_heads=4, headdim=64,
+        layer_spec=["la"] * 8,
+    )
+    gen = GeneratorConfig(d_model=128, n_layers=4, d_ff=512, n_heads=2)
+    cfg = ElectraConfig(disc=disc, gen=gen)
+    for k, v in overrides.items():
+        setattr(cfg, k, v)
+    return cfg
+
+
+def make_large_config(**overrides) -> ElectraConfig:
+    """Large — 70.5M disc, 1.4M gen. GPU 배포 / 최고 품질.
+    ONNX CPU INT8 seq=4096: 622ms / 66MB
+    PyTorch GPU seq=4096: 45ms
+    """
     disc = DiscriminatorConfig(
         d_model=768, d_ff=2048,
         n_heads=12, n_kv_heads=4, headdim=64,
-        layer_spec=[
-            "fa",
-            "wa:64", "wa:32", "wa:64", "wa:128",
-            "wa:256",
-            "wa:128", "wa:64", "wa:32", "wa:64",
-            "fa",
-        ],
+        layer_spec=["la"] * 11,
     )
     gen = GeneratorConfig(d_model=128, n_layers=4, d_ff=512, n_heads=2)
     cfg = ElectraConfig(disc=disc, gen=gen)
     for k, v in overrides.items():
         setattr(cfg, k, v)
     return cfg
+
+
+# 하위 호환
+make_128m_config = make_large_config
 
 
 if __name__ == "__main__":

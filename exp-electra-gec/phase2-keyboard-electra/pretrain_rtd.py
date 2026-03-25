@@ -36,7 +36,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 
-from config import ElectraConfig, make_small_config, make_128m_config
+from config import ElectraConfig, make_small_config, make_base_config, make_large_config
 from electra_rtd import ElectraRTD
 from rtd_dataset import RTDDataset
 from keyboard_tokenizer.keyboard_wrapper import KeyboardTokenizer
@@ -167,7 +167,7 @@ def validate_rtd(model, val_loader, device, n_batches=50, use_amp=False):
 def main():
     parser = argparse.ArgumentParser(description="ELECTRA RTD Pretrain")
     # 모델
-    parser.add_argument("--preset", choices=["small", "128m"], default="small")
+    parser.add_argument("--preset", choices=["small", "base", "large"], default="base")
     # 데이터
     parser.add_argument("--corpus", required=True, nargs="+")
     parser.add_argument("--text_key", default=None)
@@ -220,18 +220,16 @@ def main():
     is_main = (rank == 0)
 
     # ── Config ──
-    if args.preset == "small":
-        cfg = make_small_config(
-            mask_prob=args.mask_prob,
-            disc_loss_weight=args.disc_loss_weight,
-            temperature=args.temperature,
-        )
-    else:
-        cfg = make_128m_config(
-            mask_prob=args.mask_prob,
-            disc_loss_weight=args.disc_loss_weight,
-            temperature=args.temperature,
-        )
+    preset_map = {
+        "small": make_small_config,
+        "base": make_base_config,
+        "large": make_large_config,
+    }
+    cfg = preset_map[args.preset](
+        mask_prob=args.mask_prob,
+        disc_loss_weight=args.disc_loss_weight,
+        temperature=args.temperature,
+    )
     cfg.disc.max_seq_len = args.max_seq_len
     cfg.gen.max_seq_len = args.max_seq_len
 
