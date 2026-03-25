@@ -238,6 +238,8 @@ def train(args):
         config_overrides["mamba_d_conv"] = args.mamba_d_conv
     if args.bitlinear_mamba:
         config_overrides["bitlinear_mamba"] = True
+    if args.int8_qat:
+        config_overrides["int8_qat"] = True
     if args.mamba2_in_proj_rank is not None:
         config_overrides["mamba2_in_proj_rank"] = args.mamba2_in_proj_rank
     config = make_config(
@@ -844,6 +846,8 @@ def main():
                         help="Mamba conv kernel size (기본 4)")
     parser.add_argument("--bitlinear_mamba", action="store_true",
                         help="Mamba-2 in/out_proj를 BitLinear로 교체 (QAT)")
+    parser.add_argument("--int8_qat", action="store_true",
+                        help="전체 INT8 QAT (BitLinear→Int8Linear, Mamba proj 포함)")
     parser.add_argument("--mamba2_in_proj_rank", type=int, default=None,
                         help="Mamba-2 in_proj 저랭크 차원 (미지정 시 full rank)")
     parser.add_argument("--tokenizer", type=str, default="keyboard",
