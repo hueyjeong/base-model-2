@@ -18,6 +18,16 @@ import io
 import json
 import math
 import os
+
+# ── 기본 환경 변수 (DDP/메모리 최적화) ──
+_DEFAULT_ENV = {
+    "NCCL_P2P_DISABLE": "1",
+    "NCCL_IB_DISABLE": "1",
+    "OMP_NUM_THREADS": "16",
+    "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+}
+for _k, _v in _DEFAULT_ENV.items():
+    os.environ.setdefault(_k, _v)
 import sys
 import threading
 import time
