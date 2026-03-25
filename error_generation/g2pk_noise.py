@@ -53,7 +53,11 @@ def _pronounce_word(word: str) -> str:
     """
     g2p = _get_g2p()
     # G2PK는 descriptive=False (표준 발음)
-    pronounced = g2p(word)
+    # g2pk numerals.py 버그: 특정 숫자에서 UnboundLocalError 발생
+    try:
+        pronounced = g2p(word)
+    except (UnboundLocalError, Exception):
+        return word
     return pronounced
 
 
