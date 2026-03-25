@@ -48,9 +48,10 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(d_model))
         self.eps = eps
+        self.use_triton = True  # torch.compile 시 False로 설정 → graph break 방지
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if _TRITON_KERNELS and x.is_cuda:
+        if self.use_triton and _TRITON_KERNELS and x.is_cuda:
             return _triton_rms_norm_wrapper(x, self.weight, self.eps)
         rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
         return (x * rms) * self.weight.to(x.dtype)

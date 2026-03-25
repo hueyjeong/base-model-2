@@ -387,6 +387,7 @@ def _quantize_weights_int8(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]
     return w_q, scale
 
 
+@torch.compiler.allow_in_graph
 class _Int8LinearCudaFn(torch.autograd.Function):
     """Int8Linear CUDA — weight도 INT8 양자화 (ternary 대신)"""
     @staticmethod
@@ -508,7 +509,6 @@ class Int8LinearCuda(nn.Module):
         self.norm = nn.LayerNorm(in_features, elementwise_affine=False)
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
-    @torch.compiler.disable
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_norm = self.norm(x)
 
@@ -563,4 +563,37 @@ def replace_bitlinear_with_cuda(model: nn.Module) -> nn.Module:
         setattr(parent, parts[-1], new)
 
     print(f"[BitLinearCuda] Replaced {len(replacements)} BitLinear layers")
+    return model
+
+
+def replace_int8linear_with_cuda(model: nn.Module) -> nn.Module:
+    """Int8Linear → Int8LinearCuda 교체 (INT8 matmul + torch.compile 호환)
+
+    Int8Linear의 @torch.compiler.disable graph break를 제거하고
+    _Int8LinearCudaFn(@allow_in_graph)으로 교체하여 torch.compile fusion 활성화.
+    """
+    from model.bitlinear import Int8Linear
+
+    replacements = []
+    for name, module in model.named_modules():
+        if isinstance(module, Int8Linear):
+            replacements.append(name)
+
+    for name in replacements:
+        parts = name.split(".")
+        parent = model
+        for part in parts[:-1]:
+            parent = getattr(parent, part)
+
+        old = getattr(parent, parts[-1])
+        old_device = old.weight.device
+        new = Int8LinearCuda(old.in_features, old.out_features, bias=old.bias is not None)
+        new.weight.data.copy_(old.weight.data)
+        if old.bias is not None:
+            new.bias.data.copy_(old.bias.data)
+        new.norm.load_state_dict(old.norm.state_dict())
+        new = new.to(old_device)
+        setattr(parent, parts[-1], new)
+
+    print(f"[Int8LinearCuda] Replaced {len(replacements)} Int8Linear layers")
     return model

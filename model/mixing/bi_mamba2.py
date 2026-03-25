@@ -173,21 +173,17 @@ class Mamba2Block(nn.Module):
         else:
             return self._forward_fallback(x, reset_mask)
 
-    @torch.compiler.disable
     def _forward_cuda(self, x: Tensor, reset_mask: Tensor | None = None) -> Tensor:
-        """nn.Linear in_proj → mamba_split_conv1d_scan_combined fused kernel"""
-        # seq_idx for document isolation
+        """in_proj (compiled graph) → fused kernel (@disable) 분리"""
+        # seq_idx for document isolation — compiled graph 안
         seq_idx = None
         if reset_mask is not None:
             seq_idx = (reset_mask.int().cumsum(dim=1) - 1).to(torch.int32)
 
-        # 1) nn.Linear in_proj
+        # 1) in_proj — compiled graph 안 (Int8LinearCuda @allow_in_graph)
         zxbcdt = self.in_proj(x)  # (B, T, d_in_proj)
 
-        A = -torch.exp(self.A_log.float())
-
-        # 2) Fused: conv1d + chunk_scan + RMSNorm + gate + out_proj
-        # int8_qat: out_proj가 Int8Linear이면 fused kernel에 QAT weight 전달
+        # 2) out_proj weight 준비 — compiled graph 안
         if self.int8_qat:
             # Int8Linear의 QAT 시뮬레이션: weight → INT8 round-trip (STE)
             out_w = self.out_proj.weight
@@ -195,14 +191,21 @@ class Mamba2Block(nn.Module):
             with torch.no_grad():
                 w_eta = out_w.abs().max().clamp(min=1e-5)
                 w_q = (out_w * Qb / w_eta).clamp(-128, 127).round()
-            # STE: forward는 양자화값, backward는 원본으로 전파
             outproj_weight = out_w + (w_q * w_eta / Qb - out_w).detach()
             outproj_bias = self.out_proj.bias
         else:
             outproj_weight = self.out_proj.weight
             outproj_bias = self.out_proj.bias
 
-        y = _mamba_split_conv1d_scan_combined(
+        # 3) fused kernel만 @disable (C++/CUDA 확장 — torch.compile trace 불가)
+        return self._fused_scan(zxbcdt, seq_idx, outproj_weight, outproj_bias)
+
+    @torch.compiler.disable
+    def _fused_scan(self, zxbcdt: Tensor, seq_idx: Tensor | None,
+                    outproj_weight: Tensor, outproj_bias: Tensor | None) -> Tensor:
+        """mamba_split_conv1d_scan_combined fused CUDA kernel"""
+        A = -torch.exp(self.A_log.float())
+        return _mamba_split_conv1d_scan_combined(
             zxbcdt,
             self.conv1d.weight.squeeze(1),  # (d_conv_in, d_conv)
             self.conv1d.bias,
@@ -220,8 +223,6 @@ class Mamba2Block(nn.Module):
             ngroups=self.ngroups,
             norm_before_gate=False,
         )
-
-        return y
 
     def _forward_fallback(self, x: Tensor, reset_mask: Tensor | None = None) -> Tensor:
         """CPU fallback — C chunk-parallel SSD 커널 사용 (GPU와 수치 일치)"""

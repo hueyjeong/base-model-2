@@ -126,7 +126,8 @@ class DenseEditor(nn.Module):
                 x = layer(x, pad_mask=pad_mask, reset_mask=reset_mask)
 
         x = self.final_norm(x)
-        tag_logits = self.tag_head(x.float())
+        # tag_head 내부에서 LayerNorm + quantization 수행 → float 캐스팅은 CE loss 직전으로 이동
+        tag_logits = self.tag_head(x)
 
         return tag_logits
 

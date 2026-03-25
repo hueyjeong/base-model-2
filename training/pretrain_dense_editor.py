@@ -288,6 +288,15 @@ def train(args):
         if global_rank == 0:
             print(f"  INT8 backend: {args.int8_backend}")
 
+    # INT8 QAT 모드: Int8Linear → Int8LinearCuda 교체 (torch.compile graph break 제거)
+    if args.int8_qat:
+        try:
+            from model.cuda_bitlinear import replace_int8linear_with_cuda
+            model = replace_int8linear_with_cuda(model)
+        except Exception as e:
+            if global_rank == 0:
+                print(f"Int8LinearCuda 교체 실패: {e}, 기존 Int8Linear 유지")
+
     # raw_model 참조 저장 (wrapping 전 — state_dict, grad_ckpt, validate에서 사용)
     raw_model = model
 
@@ -297,19 +306,25 @@ def train(args):
 
     # DDP
     if is_distributed:
+        # compile + allow_in_graph 사용 시 autograd graph이 정상 추적되므로
+        # find_unused_parameters=False 가능 → DDP 오버헤드 감소
+        _find_unused = not args.compile
         model = DDP(
             model,
             device_ids=[local_rank],
             gradient_as_bucket_view=True,
-            # Triton/CUDA custom kernel (@torch.compiler.disable)이 autograd graph를
-            # 변형하므로 static_graph=False + find_unused_parameters=True 필요.
-            # static_graph=True는 PyTorch 2.10에서 custom autograd와 충돌 가능.
             static_graph=False,
-            find_unused_parameters=True,
+            find_unused_parameters=_find_unused,
         )
 
     # torch.compile (DDP 후에 — DDP 래핑 후 compile해야 reducer hook 충돌 방지)
     if args.compile:
+        # RMSNorm: Triton @disable → PyTorch ops (torch.compile이 자체 fusion)
+        from model.encoder import RMSNorm as _RMSNorm
+        for m in raw_model.modules():
+            if isinstance(m, _RMSNorm):
+                m.use_triton = False
+
         torch._dynamo.config.capture_scalar_outputs = True
         torch._dynamo.config.recompile_limit = 64
         torch._dynamo.config.cache_size_limit = 256
