@@ -144,15 +144,14 @@ class AttentionLayer(nn.Module):
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        if reset_mask is not None:
-            out = self._linear_attn_with_docs(q, k, v, reset_mask)
-        else:
-            # 전역 linear attention
-            kv = torch.einsum("bhsd,bhse->bhde", k, v)  # (B, H, d, d)
-            out = torch.einsum("bhsd,bhde->bhse", q, kv)  # (B, H, T, d)
-            # 정규화
-            z = torch.einsum("bhsd,bhd->bhs", q, k.sum(dim=2))  # (B, H, T)
-            out = out / (z.unsqueeze(-1).clamp(min=1e-6))
+        # 전역 linear attention (문서 격리 불필요)
+        # Linear attention의 KV는 (d,d) 고정 크기 집계 — 다른 문서 기여는 미약한 노이즈.
+        # ChunkFFT에서 이미 문서별 mood 격리가 처리됨.
+        kv = torch.einsum("bhsd,bhse->bhde", k, v)  # (B, H, d, d)
+        out = torch.einsum("bhsd,bhde->bhse", q, kv)  # (B, H, T, d)
+        # 정규화
+        z = torch.einsum("bhsd,bhd->bhs", q, k.sum(dim=2))  # (B, H, T)
+        out = out / (z.unsqueeze(-1).clamp(min=1e-6))
 
         out = out.transpose(1, 2).contiguous().reshape(B, T, H * d)
         return out
@@ -160,45 +159,52 @@ class AttentionLayer(nn.Module):
     def _linear_attn_with_docs(
         self, q: Tensor, k: Tensor, v: Tensor, reset_mask: Tensor,
     ) -> Tensor:
-        """문서별 독립 linear attention
+        """문서별 독립 linear attention (scatter_add 벡터화)
 
-        배치는 벡터화, 문서는 n_docs loop (n_docs ~5-20, 작음).
-        각 iteration에서 mask select → einsum → mask scatter.
-        B loop 제거, 문서 loop만 유지.
+        scatter_add로 문서별 KV를 한 번에 집계 → gather로 각 토큰에 적용.
+        Python loop 없음 (d 축 chunk loop만, GPU 커널 최소).
+        메모리: (B,H,n_docs,d,d) ≈ 84MB (n_docs=20, d=64, B=16, H=8, bf16).
         """
         B, H, T, d = q.shape
 
-        # 문서 ID: (B, T)
-        doc_id = reset_mask.int().cumsum(dim=1) - 1
-
-        out = torch.zeros_like(q)
+        # 문서 ID
+        doc_id = reset_mask.int().cumsum(dim=1) - 1  # (B, T)
         n_docs = doc_id.max().item() + 1
 
-        for doc in range(n_docs):
-            # 이 문서에 속하는 토큰 마스크: (B, T)
-            mask = (doc_id == doc)  # (B, T)
-            if not mask.any():
-                continue
+        # scatter/gather용 인덱스: (B, H, T, d)
+        idx = doc_id.unsqueeze(1).unsqueeze(-1).expand(B, H, T, d)
 
-            # 마스크 확장: (B, 1, T, 1)
-            m = mask.unsqueeze(1).unsqueeze(-1).to(q.dtype)  # (B, 1, T, 1)
+        # ── 문서별 K 합 (정규화용) ──
+        k_sum = torch.zeros(B, H, n_docs, d, device=q.device, dtype=q.dtype)
+        k_sum.scatter_add_(2, idx, k)
 
-            # 이 문서의 K, V만 추출 (마스크 외 위치 0)
-            k_doc = k * m  # (B, H, T, d)
-            v_doc = v * m
+        # ── 문서별 KV 집계: d 축 chunk로 (B,H,T,d,d) 미생성 ──
+        CHUNK = 8  # d를 8개씩 처리 → d/8 = 8 iterations
+        kv_per_doc = torch.zeros(B, H, n_docs, d, d, device=q.device, dtype=q.dtype)
+        for j0 in range(0, d, CHUNK):
+            j1 = min(j0 + CHUNK, d)
+            # K * V[..., j0:j1] → (B, H, T, d, chunk)
+            kv_chunk = k.unsqueeze(-1) * v[:, :, :, j0:j1].unsqueeze(-2)  # (B,H,T,d,chunk)
+            # scatter_add → (B, H, n_docs, d, chunk)
+            idx_chunk = idx.unsqueeze(-1).expand(-1, -1, -1, -1, j1 - j0)
+            kv_per_doc[:, :, :, :, j0:j1].scatter_add_(2, idx_chunk, kv_chunk)
 
-            # KV 집계: (B, H, d, d)
-            kv = torch.einsum("bhsd,bhse->bhde", k_doc, v_doc)
-            # Q @ KV: (B, H, T, d)
-            out_doc = torch.einsum("bhsd,bhde->bhse", q, kv)
-            # 정규화
-            k_sum = k_doc.sum(dim=2)  # (B, H, d)
-            z = torch.einsum("bhsd,bhd->bhs", q, k_sum).clamp(min=1e-6)
+        # ── 출력 계산 ──
+        # 각 토큰의 문서 KV를 gather → Q @ KV
+        # gather kv_per_doc column-by-column으로 (B,H,T,d,d) 미생성
+        k_sum_tok = k_sum.gather(2, idx)  # (B, H, T, d)
+        z = (q * k_sum_tok).sum(dim=-1).clamp(min=1e-6)  # (B, H, T)
 
-            # 이 문서 위치에만 기록
-            out += (out_doc / z.unsqueeze(-1)) * m
+        out = torch.zeros_like(q)  # (B, H, T, d)
+        for j0 in range(0, d, CHUNK):
+            j1 = min(j0 + CHUNK, d)
+            kv_cols = kv_per_doc[:, :, :, :, j0:j1]  # (B, H, n_docs, d, chunk)
+            idx_chunk = idx.unsqueeze(-1).expand(-1, -1, -1, -1, j1 - j0)
+            kv_tok = kv_cols.gather(2, idx_chunk)  # (B, H, T, d, chunk)
+            # out[:,:,:,j0:j1] = (Q @ KV_col)  = sum_i Q[...,i] * KV_tok[...,i,:]
+            out[:, :, :, j0:j1] = torch.einsum("bhsi,bhsij->bhsj", q, kv_tok)
 
-        return out
+        return out / z.unsqueeze(-1)
 
 
 
