@@ -94,6 +94,42 @@ class BitNetFFN(nn.Module):
         return x
 
 
+class Int8FFN(nn.Module):
+    """INT8 QAT FFN (ReLU gating) — BitNetFFN의 Int8Linear 버전
+
+    BitNetFFN과 동일한 구조, BitLinear → Int8Linear 교체.
+    x → Int8Linear(gate_up) → relu(gate)*up → Int8Linear(down)
+    """
+
+    def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1,
+                 fused_gate_up: bool = False):
+        super().__init__()
+        self.d_ff = d_ff
+        self.fused = fused_gate_up
+
+        if fused_gate_up:
+            self.gate_up_proj = Int8Linear(d_model, 2 * d_ff)
+        else:
+            self.gate_proj = Int8Linear(d_model, d_ff)
+            self.up_proj = Int8Linear(d_model, d_ff)
+
+        self.down_proj = Int8Linear(d_ff, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.fused:
+            gu = self.gate_up_proj(x)
+            gate_out, up = gu.split(self.d_ff, dim=-1)
+        else:
+            gate_out = self.gate_proj(x)
+            up = self.up_proj(x)
+
+        x = F.relu(gate_out) * up
+        x = self.dropout(x)
+        x = self.down_proj(x)
+        return x
+
+
 class SwiGLUFFN(nn.Module):
     """SwiGLU FFN (Int8Linear QAT, SiLU activation)
 

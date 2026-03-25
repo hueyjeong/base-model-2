@@ -18,7 +18,7 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
 from model.dense_editor_config import DenseEditorConfig
-from model.encoder import RMSNorm, BitNetFFN, SwiGLUFFN
+from model.encoder import RMSNorm, BitNetFFN, Int8FFN, SwiGLUFFN
 from model.bitlinear import BitLinear, Int8Linear
 from model.mixing import create_mixing_layer
 
@@ -38,6 +38,8 @@ class DenseEditorLayer(nn.Module):
         self.norm2 = RMSNorm(cfg.d_model, eps=cfg.rms_norm_eps)
         if cfg.mixing_type in ("attention", "hybrid"):
             self.ffn = SwiGLUFFN(cfg.d_model, cfg.d_ff, dropout=cfg.dropout)
+        elif getattr(cfg, 'int8_qat', False):
+            self.ffn = Int8FFN(cfg.d_model, cfg.d_ff, dropout=cfg.dropout, fused_gate_up=True)
         else:
             self.ffn = BitNetFFN(cfg.d_model, cfg.d_ff, dropout=cfg.dropout, fused_gate_up=True)
         self.dropout = nn.Dropout(cfg.dropout)
@@ -77,7 +79,7 @@ class DenseEditor(nn.Module):
 
         # Final norm + tag head
         self.final_norm = RMSNorm(cfg.d_model, eps=cfg.rms_norm_eps)
-        if cfg.mixing_type in ("attention", "hybrid"):
+        if cfg.mixing_type in ("attention", "hybrid") or getattr(cfg, 'int8_qat', False):
             self.tag_head = Int8Linear(cfg.d_model, cfg.n_tags, bias=False)
         else:
             self.tag_head = BitLinear(cfg.d_model, cfg.n_tags)

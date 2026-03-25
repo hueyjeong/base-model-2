@@ -76,6 +76,9 @@ class DenseEditorConfig:
     bitlinear_mamba: bool = False           # Mamba-2 in/out_proj를 BitLinear로
     mamba2_in_proj_rank: int | None = None  # in_proj 저랭크 차원 (None=full rank)
 
+    # 양자화 모드
+    int8_qat: bool = False            # True: BitLinear(ternary) → Int8Linear(INT8 QAT)
+
     def save(self, path: str) -> None:
         """설정을 JSON 파일로 저장"""
         with open(path, "w", encoding="utf-8") as f:
