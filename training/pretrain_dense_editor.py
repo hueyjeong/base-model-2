@@ -313,9 +313,14 @@ def train(args):
         torch._dynamo.config.capture_scalar_outputs = True
         torch._dynamo.config.recompile_limit = 64
         torch._dynamo.config.cache_size_limit = 256
+        # max-autotune-no-cudagraphs: CUDA graph 없이 matmul autotune만 적용
+        # 양자화 캐시(BitLinear/Int8Linear)가 CUDA graph와 호환 불가
+        compile_mode = args.compile_mode
+        if compile_mode == "max-autotune":
+            compile_mode = "max-autotune-no-cudagraphs"
         if global_rank == 0:
-            print(f"torch.compile 적용 중 (mode={args.compile_mode})... (첫 step 느림, 이후 빠름)")
-        model = torch.compile(model, mode=args.compile_mode)
+            print(f"torch.compile 적용 중 (mode={compile_mode})... (첫 step 느림, 이후 빠름)")
+        model = torch.compile(model, mode=compile_mode)
 
     # 노이즈 설정 (토큰 레벨 비활성화, 한국어 오류 증강 CLI 제어)
     noise_cfg = NoiseConfig(
