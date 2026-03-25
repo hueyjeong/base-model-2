@@ -75,24 +75,22 @@ class ElectraRTD(nn.Module):
         gen_input = input_ids.clone()
         gen_input[mask_positions] = disc_cfg.mask_id
 
-        # ── 3. Generator forward → MLM loss ──
-        gen_logits = self.generator(gen_input, pad_mask)  # (B, T, V)
+        # ── 3. Generator forward → 마스크 위치에서만 MLM head 실행 ──
+        gen_hidden = self.generator(gen_input, pad_mask, return_hidden=True)  # (B, T, d_gen)
+        gen_logits_masked = self.generator.mlm_head(gen_hidden[mask_positions])  # (N_mask, V)
 
-        # 마스크 위치의 MLM loss (mask_prob > 0이므로 항상 마스크 존재)
         gen_loss = F.cross_entropy(
-            gen_logits[mask_positions],     # (N_mask, V)
+            gen_logits_masked,               # (N_mask, V)
             input_ids[mask_positions],       # (N_mask,) 원본이 정답
         )
 
-        # ── 4. 샘플링으로 대체 토큰 생성 ──
+        # ── 4. 마스크 위치에서만 샘플링 ──
         with torch.no_grad():
-            gen_probs = F.softmax(gen_logits / self.cfg.temperature, dim=-1)
-            sampled_flat = torch.multinomial(
-                gen_probs.view(-1, gen_probs.size(-1)), 1,
-            ).view(B, T)
+            gen_probs_masked = F.softmax(gen_logits_masked / self.cfg.temperature, dim=-1)
+            sampled_tokens = torch.multinomial(gen_probs_masked, 1).squeeze(-1)  # (N_mask,)
 
         disc_input = input_ids.clone()
-        disc_input[mask_positions] = sampled_flat[mask_positions]
+        disc_input[mask_positions] = sampled_tokens
 
         # ── 5. RTD 라벨 ──
         # Generator가 정답을 맞히면 real(0), 틀리면 replaced(1)
@@ -112,7 +110,7 @@ class ElectraRTD(nn.Module):
 
         # ── 모니터링 (no_grad, graph 밖) ──
         with torch.no_grad():
-            gen_preds = gen_logits[mask_positions].argmax(dim=-1)
+            gen_preds = gen_logits_masked.argmax(dim=-1)
             gen_acc = (gen_preds == input_ids[mask_positions]).float().mean()
             rtd_preds = rtd_logits.argmax(dim=-1)
             rtd_acc = (rtd_preds[valid_mask] == rtd_labels[valid_mask]).float().mean()
@@ -132,6 +130,85 @@ class ElectraRTD(nn.Module):
             self.cfg.gen_loss_weight * outputs["gen_loss"] +
             self.cfg.disc_loss_weight * outputs["disc_loss"]
         )
+
+    # ── Split backward 지원: Gen forward→backward → Disc forward→backward ──
+    # Gen activation을 Disc forward 전에 해제하여 메모리 확보
+
+    def forward_gen(
+        self,
+        input_ids: Tensor,
+        pad_mask: Tensor | None = None,
+    ) -> dict[str, Tensor]:
+        """Phase 1: Generator forward + MLM loss + 샘플링"""
+        B, T = input_ids.shape
+        device = input_ids.device
+        disc_cfg = self.cfg.disc
+
+        is_special = (
+            (input_ids == disc_cfg.pad_id) |
+            (input_ids == disc_cfg.bos_id) |
+            (input_ids == disc_cfg.eos_id) |
+            (input_ids == disc_cfg.mask_id)
+        )
+        can_mask = ~is_special
+        if pad_mask is not None:
+            can_mask = can_mask & pad_mask
+
+        mask_probs = torch.rand(B, T, device=device)
+        mask_positions = can_mask & (mask_probs < self.cfg.mask_prob)
+
+        gen_input = input_ids.clone()
+        gen_input[mask_positions] = disc_cfg.mask_id
+
+        gen_hidden = self.generator(gen_input, pad_mask, return_hidden=True)
+        gen_logits_masked = self.generator.mlm_head(gen_hidden[mask_positions])
+
+        gen_loss = F.cross_entropy(gen_logits_masked, input_ids[mask_positions])
+
+        with torch.no_grad():
+            gen_probs_masked = F.softmax(gen_logits_masked / self.cfg.temperature, dim=-1)
+            sampled_tokens = torch.multinomial(gen_probs_masked, 1).squeeze(-1)
+            gen_preds = gen_logits_masked.argmax(dim=-1)
+            gen_acc = (gen_preds == input_ids[mask_positions]).float().mean()
+
+        disc_input = input_ids.clone()
+        disc_input[mask_positions] = sampled_tokens
+        rtd_labels = (disc_input != input_ids).long()
+
+        valid_mask = pad_mask if pad_mask is not None else \
+            torch.ones(B, T, dtype=torch.bool, device=device)
+
+        return {
+            "gen_loss": gen_loss,
+            "gen_acc": gen_acc,
+            # detach: disc phase에서 사용, gen graph 의존성 없음
+            "disc_input": disc_input.detach(),
+            "rtd_labels": rtd_labels.detach(),
+            "valid_mask": valid_mask.detach(),
+            "replaced_ratio": rtd_labels[valid_mask].float().mean(),
+        }
+
+    def forward_disc(
+        self,
+        disc_input: Tensor,
+        pad_mask: Tensor | None,
+        rtd_labels: Tensor,
+        valid_mask: Tensor,
+    ) -> dict[str, Tensor]:
+        """Phase 2: Discriminator forward + RTD loss"""
+        disc_hidden = self.discriminator(disc_input, pad_mask)
+        rtd_logits = self.rtd_head(disc_hidden)
+
+        disc_loss = F.cross_entropy(
+            rtd_logits[valid_mask],
+            rtd_labels[valid_mask],
+        )
+
+        with torch.no_grad():
+            rtd_preds = rtd_logits.argmax(dim=-1)
+            rtd_acc = (rtd_preds[valid_mask] == rtd_labels[valid_mask]).float().mean()
+
+        return {"disc_loss": disc_loss, "rtd_acc": rtd_acc}
 
 
 if __name__ == "__main__":

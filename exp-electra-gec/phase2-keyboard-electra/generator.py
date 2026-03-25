@@ -46,14 +46,19 @@ class TransformerGenerator(nn.Module):
         nn.init.xavier_uniform_(self.mlm_head.weight)
         nn.init.zeros_(self.mlm_head.bias)
 
-    def forward(self, input_ids: Tensor, pad_mask: Tensor | None = None) -> Tensor:
+    def forward(
+        self, input_ids: Tensor, pad_mask: Tensor | None = None,
+        return_hidden: bool = False,
+    ) -> Tensor:
         """
         Args:
             input_ids: (B, T)
             pad_mask: (B, T) bool — True=유효
+            return_hidden: True면 hidden states 반환 (MLM head 미적용)
 
         Returns:
-            mlm_logits: (B, T, vocab_size)
+            return_hidden=False: mlm_logits (B, T, vocab_size)
+            return_hidden=True: hidden (B, T, d_model)
         """
         B, T = input_ids.shape
         pos = torch.arange(T, device=input_ids.device)
@@ -63,6 +68,8 @@ class TransformerGenerator(nn.Module):
         src_key_pad = ~pad_mask if pad_mask is not None else None
         x = self.encoder(x, src_key_padding_mask=src_key_pad)
 
+        if return_hidden:
+            return x
         return self.mlm_head(x)
 
     def count_parameters(self) -> int:

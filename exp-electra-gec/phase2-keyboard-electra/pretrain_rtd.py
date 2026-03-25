@@ -186,6 +186,8 @@ def main():
     parser.add_argument("--gradient_checkpointing", action="store_true")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--compile_mode", default="reduce-overhead")
+    parser.add_argument("--split_backward", action="store_true",
+                        help="Gen/Disc backward 분리 — Gen activation을 Disc 전에 해제하여 메모리 절약")
     # ELECTRA
     parser.add_argument("--mask_prob", type=float, default=0.15)
     parser.add_argument("--disc_loss_weight", type=float, default=50.0)
@@ -235,7 +237,7 @@ def main():
 
     # ── 모델 ──
     model = ElectraRTD(cfg).to(device)
-    raw_model = model
+    raw_model = model  # 항상 원본 ElectraRTD 참조 (config/메서드 접근용)
 
     if args.gradient_checkpointing:
         raw_model.discriminator.gradient_checkpointing = True
@@ -257,15 +259,15 @@ def main():
               f"max_steps={args.max_steps}")
         print()
 
-    # DDP
-    if ddp:
-        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
-
-    # torch.compile
+    # torch.compile — DDP 전에 적용 (PyTorch 2.x 권장)
     if args.compile:
         if is_main:
             print(f"torch.compile 적용 (mode={args.compile_mode})...")
         model = torch.compile(model, mode=args.compile_mode)
+
+    # DDP — compiled 모델을 감싸기
+    if ddp:
+        model = DDP(model, device_ids=[rank], find_unused_parameters=False)
 
     # ── Optimizer ──
     use_fused = torch.cuda.is_available()
@@ -361,11 +363,12 @@ def main():
     step = start_step
     optimizer.zero_grad(set_to_none=True)
     t0 = time.time()
-    accum_metrics = {"gen_loss": 0.0, "disc_loss": 0.0, "rtd_acc": 0.0,
-                     "gen_acc": 0.0, "replaced_ratio": 0.0}
+    # GPU 텐서에 메트릭 축적 — .item() GPU→CPU sync 제거 (로깅 시점에서만 1회)
+    _metric_keys = ["gen_loss", "disc_loss", "rtd_acc", "gen_acc", "replaced_ratio"]
+    accum_tensors = {k: torch.zeros(1, device=device) for k in _metric_keys}
     accum_count = 0
     _max_line_counter = 0
-    log_tokens = 0
+    accum_tokens = torch.zeros(1, device=device, dtype=torch.long)
 
     use_prefetch = torch.cuda.is_available()
 
@@ -411,32 +414,65 @@ def main():
             ctx = model.no_sync() if (ddp and not is_last_accum) else nullcontext()
 
             with ctx:
-                with amp_ctx:
-                    outputs = raw_model(input_ids, pad_mask)
-                    total_loss = raw_model.get_total_loss(outputs)
-                    loss_scaled = total_loss / args.grad_accum_steps
+                if args.split_backward:
+                    # ── Split backward: Gen→backward→Disc→backward ──
+                    # Gen activation을 Disc forward 전에 해제하여 메모리 절약
+                    with amp_ctx:
+                        gen_out = raw_model.forward_gen(input_ids, pad_mask)
+                        gen_loss_scaled = (
+                            gen_out["gen_loss"] * raw_model.cfg.gen_loss_weight
+                            / args.grad_accum_steps
+                        )
+                    gen_loss_scaled.backward()  # Gen activation 해제!
 
-                loss_scaled.backward()
+                    with amp_ctx:
+                        disc_out = raw_model.forward_disc(
+                            gen_out["disc_input"], pad_mask,
+                            gen_out["rtd_labels"], gen_out["valid_mask"],
+                        )
+                        disc_loss_scaled = (
+                            disc_out["disc_loss"] * raw_model.cfg.disc_loss_weight
+                            / args.grad_accum_steps
+                        )
+                    disc_loss_scaled.backward()
 
-            for k in accum_metrics:
-                accum_metrics[k] += outputs[k].item()
+                    outputs = {**gen_out, **disc_out}
+                else:
+                    # ── 기존 경로: joint forward + single backward ──
+                    # model = compiled(DDP(raw_model)) 또는 compiled(raw_model) 사용
+                    with amp_ctx:
+                        outputs = model(input_ids, pad_mask)
+                        total_loss = raw_model.get_total_loss(outputs)
+                        loss_scaled = total_loss / args.grad_accum_steps
+
+                    loss_scaled.backward()
+
+            # GPU 텐서에 축적 — GPU→CPU sync 없음
+            with torch.no_grad():
+                for k in accum_tensors:
+                    accum_tensors[k] += outputs[k].detach()
+                accum_tokens += pad_mask.sum()
             accum_count += 1
-            log_tokens += pad_mask.sum().item()
             if "_line_counter" in batch:
                 lc = batch["_line_counter"]
-                lc_val = lc.max().item() if isinstance(lc, torch.Tensor) else max(lc) if isinstance(lc, (list, tuple)) else lc
-                _max_line_counter = max(_max_line_counter, int(lc_val))
+                if isinstance(lc, torch.Tensor):
+                    _max_line_counter = max(_max_line_counter, int(lc.max().item()))
+                elif isinstance(lc, (list, tuple)):
+                    _max_line_counter = max(_max_line_counter, int(max(lc)))
+                else:
+                    _max_line_counter = max(_max_line_counter, int(lc))
 
         # Gradient step
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
-        # Logging
+        # Logging — 여기서만 GPU→CPU sync 발생 (log_every 간격)
         if is_main and (step + 1) % args.log_every == 0:
             n = accum_count
             elapsed = time.time() - t0
-            avg = {k: v / n for k, v in accum_metrics.items()}
-            tok_s = log_tokens / max(elapsed, 1e-6)
+            avg = {k: (accum_tensors[k] / n).item() for k in accum_tensors}
+            log_tokens_val = accum_tokens.item()
+            tok_s = log_tokens_val / max(elapsed, 1e-6)
             mem_str = ""
             if step + 1 == args.log_every and torch.cuda.is_available():
                 alloc = torch.cuda.max_memory_allocated() / 1024**3
@@ -449,9 +485,10 @@ def main():
                 f"lr={lr:.2e} ep={_current_epoch} line={_max_line_counter} "
                 f"{tok_s:,.0f} tok/s {fmt_time(elapsed)}{mem_str}"
             )
-            accum_metrics = {k: 0.0 for k in accum_metrics}
+            for t in accum_tensors.values():
+                t.zero_()
             accum_count = 0
-            log_tokens = 0
+            accum_tokens.zero_()
             t0 = time.time()
 
         # Validation

@@ -82,9 +82,11 @@ class ChunkFFT(nn.Module):
         # 청크 분할
         chunks = x_padded.reshape(B, n_chunks, cs, D)  # (B, C, cs, D)
 
-        # DFT matmul (rfft 실수부 대체, ONNX 호환)
-        # dft_matrix: (freq_bins, cs) @ chunks: (B, C, cs, D) → (B, C, freq_bins, D)
-        freq_real = torch.einsum("fn,bcnd->bcfd", self.dft_matrix, chunks.float())
+        # 학습: cuFFT (빠름), 추론: DFT matmul (ONNX 호환)
+        if self.training:
+            freq_real = torch.fft.rfft(chunks.float(), dim=2).real  # (B, C, freq_bins, D)
+        else:
+            freq_real = torch.einsum("fn,bcnd->bcfd", self.dft_matrix, chunks.float())
 
         # 주파수 축 projection → mood vector
         mood = self.freq_proj(freq_real.permute(0, 1, 3, 2)).squeeze(-1)  # (B, C, D)
