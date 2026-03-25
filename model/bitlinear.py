@@ -339,6 +339,9 @@ class Int8Linear(nn.Linear):
         # Weight: per-tensor absmax → INT8 + STE (캐시)
         Qb = 127.0
         v = self.weight._version
+        # device 이동 감지 — .cuda()/.cpu() 후 캐시 무효화
+        if self._w_quant_cache is not None and self._w_quant_cache.device != self.weight.device:
+            self._weight_version = -1
         if v != self._weight_version:
             with torch.no_grad():
                 w_eta = self.weight.abs().max().clamp(min=1e-5)

@@ -123,7 +123,7 @@ class Mamba2Block(nn.Module):
 
     def __init__(self, d_model: int, d_state: int = 64, d_conv: int = 4,
                  expand: int = 2, headdim: int = 64, ngroups: int = 1,
-                 chunk_size: int = 256):
+                 chunk_size: int = 256, int8_qat: bool = False):
         super().__init__()
         self.d_model = d_model
         self.d_inner = d_model * expand
@@ -133,6 +133,7 @@ class Mamba2Block(nn.Module):
         self.nheads = self.d_inner // headdim
         self.ngroups = ngroups
         self.chunk_size = chunk_size
+        self.int8_qat = int8_qat
 
         assert self.d_inner % headdim == 0, \
             f"d_inner({self.d_inner})은 headdim({headdim})으로 나누어떨어져야 함"
@@ -141,15 +142,21 @@ class Mamba2Block(nn.Module):
         d_in_proj = 2 * self.d_inner + 2 * ngroups * d_state + self.nheads
         d_conv_in = self.d_inner + 2 * ngroups * d_state
 
-        # nn.Linear projection — fused kernel 호환, 최대 학습 속도
-        # export 시 ternary quantization 적용 (proximity loss로 양자화 오차 최소화)
-        self.in_proj = nn.Linear(d_model, d_in_proj, bias=False)
+        if int8_qat:
+            # INT8 QAT: 가중치+활성화 모두 INT8 양자화 (fused kernel 비호환 → fallback 사용)
+            from model.bitlinear import Int8Linear
+            self.in_proj = Int8Linear(d_model, d_in_proj, bias=False)
+            self.out_proj = Int8Linear(self.d_inner, d_model, bias=False)
+        else:
+            # nn.Linear projection — fused kernel 호환, 최대 학습 속도
+            self.in_proj = nn.Linear(d_model, d_in_proj, bias=False)
+            self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
+
         self.conv1d = nn.Conv1d(
             d_conv_in, d_conv_in,
             kernel_size=d_conv, padding=d_conv - 1,
             groups=d_conv_in, bias=True,
         )
-        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
 
         # RMSNorm weight — GPU에서는 fused kernel 내부에서 사용, CPU에서는 수동 적용
         self.norm = nn.RMSNorm(self.d_inner)
@@ -161,7 +168,8 @@ class Mamba2Block(nn.Module):
         self.D = nn.Parameter(torch.ones(self.nheads))
 
     def forward(self, x: Tensor, reset_mask: Tensor | None = None) -> Tensor:
-        if _MAMBA2_CUDA_OPS and x.is_cuda:
+        # int8_qat: fused kernel이 out_proj QAT를 우회하므로 fallback 강제
+        if _MAMBA2_CUDA_OPS and x.is_cuda and not self.int8_qat:
             return self._forward_cuda(x, reset_mask)
         else:
             return self._forward_fallback(x, reset_mask)
@@ -230,8 +238,9 @@ class Mamba2Block(nn.Module):
         dt = F.softplus(dt_raw + self.dt_bias)  # (B, T, nh)
         A_neg = -torch.exp(self.A_log.float())
 
-        # C chunk-parallel SSD (GPU와 수치 일치) — batch=1씩 처리
+        # SSD scan — C chunk-parallel 커널 (CPU) 또는 Python sequential (GPU/fallback)
         y_list = []
+        use_c_kernel = not x.is_cuda and _load_c_ssd_kernel()
         for b in range(B_batch):
             x_b = x_conv[b].float().contiguous()       # (T, di)
             B_b = B_conv[b].float().contiguous()        # (T, ng*ds)
@@ -240,10 +249,9 @@ class Mamba2Block(nn.Module):
             A_b = A_neg.float().contiguous()             # (nh,)
             D_b = self.D.float().contiguous()            # (nh,)
 
-            if _load_c_ssd_kernel():
+            if use_c_kernel:
                 y_b = _ssd_scan_c(x_b, B_b, C_b, dt_b, A_b, D_b, nh, hd, ds, ng)
             else:
-                # C 커널 없으면 sequential scan fallback (GPU와 수치 차이 있음)
                 y_b = self._scan_sequential_single(
                     x_b, B_b, C_b, dt_b, A_b, D_b, nh, hd, ds, ng)
             y_list.append(y_b)
@@ -268,7 +276,7 @@ class Mamba2Block(nn.Module):
         B_h = B.view(T, ng, ds)
         C_h = C.view(T, ng, ds)
 
-        h = torch.zeros(nh, ds, hd, dtype=torch.float32)
+        h = torch.zeros(nh, ds, hd, dtype=torch.float32, device=x.device)
         ys = []
         for t in range(T):
             a_t = decay[t].view(nh, 1, 1)
@@ -447,6 +455,8 @@ class BiMamba2Mixing(MixingLayer):
         common_kwargs = dict(d_state=ds, d_conv=d_conv, expand=expand,
                              headdim=hd, ngroups=ng, chunk_size=cs)
 
+        int8_qat = getattr(cfg, 'int8_qat', False)
+
         if getattr(cfg, 'bitlinear_mamba', False):
             rank = getattr(cfg, 'mamba2_in_proj_rank', None)
             self.fwd = Mamba2BitLinearBlock(cfg.d_model, **common_kwargs,
@@ -454,8 +464,8 @@ class BiMamba2Mixing(MixingLayer):
             self.bwd = Mamba2BitLinearBlock(cfg.d_model, **common_kwargs,
                                            in_proj_rank=rank)
         else:
-            self.fwd = Mamba2Block(cfg.d_model, **common_kwargs)
-            self.bwd = Mamba2Block(cfg.d_model, **common_kwargs)
+            self.fwd = Mamba2Block(cfg.d_model, **common_kwargs, int8_qat=int8_qat)
+            self.bwd = Mamba2Block(cfg.d_model, **common_kwargs, int8_qat=int8_qat)
 
     def forward(self, x: Tensor, pad_mask: Tensor | None = None,
                 reset_mask: Tensor | None = None) -> Tensor:
