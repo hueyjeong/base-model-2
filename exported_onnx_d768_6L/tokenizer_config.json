@@ -1,0 +1,6 @@
+{
+  "type": "keyboard",
+  "vocab_size": 303,
+  "pad_id": 0,
+  "bos_id": 2
+}
