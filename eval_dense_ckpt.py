@@ -26,10 +26,55 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from model.dense_editor_config import make_config
 from model.dense_editor import DenseEditor
-from model.edit_tags import TAG_KEEP
+from model.edit_tags import TAG_KEEP, apply_edit_tags
 from training.noising import DenoisingNoiser, NoiseConfig
 from training.editor_dataset import EditorDataset
 from torch.utils.data import DataLoader
+
+
+def edit_distance(a, b):
+    """Levenshtein 편집 거리 (문자/어절 리스트 범용, 1행 DP)"""
+    n, m = len(a), len(b)
+    if n < m:
+        a, b = b, a
+        n, m = m, n
+    prev = list(range(m + 1))
+    for i in range(1, n + 1):
+        curr = [i] + [0] * m
+        for j in range(1, m + 1):
+            if a[i - 1] == b[j - 1]:
+                curr[j] = prev[j - 1]
+            else:
+                curr[j] = 1 + min(prev[j], curr[j - 1], prev[j - 1])
+        prev = curr
+    return prev[m]
+
+
+def unpack_sentences(input_ids, edit_tags, preds, valid_len, bos_id, eos_id):
+    """패킹된 배치 행에서 [BOS]...[EOS] 단위로 개별 문장 추출
+
+    Returns:
+        list of (src_ids, pred_tags, gold_tags) — BOS/EOS 포함
+    """
+    sentences = []
+    i = 0
+    while i < valid_len:
+        if input_ids[i] == bos_id:
+            j = i + 1
+            while j < valid_len and input_ids[j] != eos_id:
+                j += 1
+            if j < valid_len:  # EOS 발견
+                sentences.append((
+                    input_ids[i:j + 1],
+                    preds[i:j + 1],
+                    edit_tags[i:j + 1],
+                ))
+                i = j + 1
+            else:
+                break  # 불완전 문장 — 스킵
+        else:
+            i += 1
+    return sentences
 
 
 def forward_with_gumbel(model, input_ids, pad_mask, use_amp, temperature):
@@ -194,6 +239,10 @@ def main():
     edit_fp = 0
     edit_fn = 0
     n_batches = 0
+    all_sentences = []  # 글자/어절 평가용 (src_ids, pred_tags, gold_tags) 누적
+    bos_id = tokenizer.bos_id
+    eos_id = tokenizer.eos_id
+    vocab_size = config.vocab_size
 
     use_amp = device.type == "cuda"
     t0 = time.time()
@@ -231,6 +280,17 @@ def main():
             edit_tp += (pred_edit & true_edit).sum().item()
             edit_fp += (pred_edit & ~true_edit).sum().item()
             edit_fn += (~pred_edit & true_edit).sum().item()
+
+            # 글자/어절 평가용 문장 추출
+            input_cpu = input_ids.cpu().tolist()
+            preds_cpu = preds.cpu().tolist()
+            tags_cpu = edit_tags.cpu().tolist()
+            mask_lens = pad_mask.sum(dim=1).tolist()
+            for b in range(input_ids.size(0)):
+                sents = unpack_sentences(
+                    input_cpu[b], tags_cpu[b], preds_cpu[b],
+                    int(mask_lens[b]), bos_id, eos_id)
+                all_sentences.extend(sents)
 
             # threshold 스윕
             if thresholds:
@@ -281,6 +341,38 @@ def main():
     print(f"  Recall     = {edit_recall:.2%}")
     print(f"  F0.5       = {edit_f05:.2%}")
     print(f"  TP={edit_tp:,}  FP={edit_fp:,}  FN={edit_fn:,}")
+
+    # ── 글자/어절 단위 평가 ──
+    if all_sentences:
+        t_span = time.time()
+        print(f"\n  --- Text-level Metrics ({len(all_sentences):,} sentences) ---")
+        for granularity, label in [("char", "Char"), ("word", "Word")]:
+            tp, fp, fn = 0.0, 0.0, 0.0
+            for src_ids, pred_tags, gold_tags in all_sentences:
+                hyp_ids = apply_edit_tags(src_ids, pred_tags, vocab_size)
+                gold_ids = apply_edit_tags(src_ids, gold_tags, vocab_size)
+                src_text = tokenizer.decode(src_ids, skip_special=True)
+                hyp_text = tokenizer.decode(hyp_ids, skip_special=True)
+                gold_text = tokenizer.decode(gold_ids, skip_special=True)
+
+                if granularity == "char":
+                    s, h, g = list(src_text), list(hyp_text), list(gold_text)
+                else:
+                    s, h, g = src_text.split(), hyp_text.split(), gold_text.split()
+
+                d_sg = edit_distance(s, g)
+                d_sh = edit_distance(s, h)
+                d_hg = edit_distance(h, g)
+                tp += (d_sg + d_sh - d_hg) / 2
+                fp += (d_sh + d_hg - d_sg) / 2
+                fn += (d_sg + d_hg - d_sh) / 2
+
+            p = tp / max(tp + fp, 1e-8)
+            r = tp / max(tp + fn, 1e-8)
+            f05 = ((1 + beta_sq) * p * r / max(beta_sq * p + r, 1e-8))
+            print(f"  [{label}] P={p:.2%}  R={r:.2%}  F0.5={f05:.2%}  "
+                  f"TP={tp:.0f}  FP={fp:.0f}  FN={fn:.0f}")
+        print(f"  (span eval: {time.time() - t_span:.1f}s)")
 
     # threshold 스윕 결과
     if thresholds:
