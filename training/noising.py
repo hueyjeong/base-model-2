@@ -203,7 +203,7 @@ WEIGHT_PRESETS: dict[str, dict[str, float]] = {
         # KoGEC 2025 + NIKL PARA 실제 오류 분포 반영
         # 가중치 = 목표 비율 / hit rate 로 보정 (hit rate 높은 모듈은 가중치를 낮춤)
         "spacing_errors": 6.5,              # WS 25% 목표
-        "punctuation_errors": 10.0,         # PUNCT 58% — NIKL PARA 최다 오류 (마침표/물음표 누락)
+        "punctuation_errors": 6.0,          # PUNCT — error_count=5에서 ~1개/문장 수준 유지
         "emoticon_spacing": 3.0,            # 이모티콘 앞뒤 공백/마침표 (NIKL PARA ~6%)
         "char_repeat": 2.0,                 # 연속 문자 변형 (말줄임표/이모티콘 반복)
         "conjugation_errors": 2.0,          # VERB_ADJ 10.6% 목표 (hit rate 82%)
