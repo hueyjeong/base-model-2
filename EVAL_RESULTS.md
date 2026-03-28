@@ -136,6 +136,35 @@ edit_distance 기반 TP/FP/FN 산출 (48,099 문장).
 - **형태소 단위가 가장 엄격** (F0.5=89.45%): 교정 전후 형태소 경계 변동 영향
 - 외부 벤치마크(ERRANT 등)가 형태소 수준이라면 이 수치가 현실적 참고점
 
+## M2 Scorer 외부 평가 (step 100,000)
+
+NIKL PARA 원본 데이터(original_form → corrected_form)에서 10k 샘플 추출,
+KAGAS M2 scorer로 평가. 오염 가능성 있으므로 참고 수준.
+
+| 모델 | M2 Precision | M2 Recall | M2 F0.5 | 데이터 |
+|------|-------------|-----------|---------|--------|
+| Hanspell (KAGAS 논문) | 37.34% | 11.58% | 25.85% | Kor-Union test |
+| KoBART (KAGAS 논문) | 44.75% | 14.64% | 31.70% | Kor-Union test |
+| **DenseEditor 100k** | **49.17%** | **14.64%** | **33.41%** | NIKL PARA 10k 샘플 |
+
+- 데이터/테스트셋이 다르므로 직접 비교 부적절 (참고용)
+- NIKL PARA는 Kor-Native에 가까움 (Hanspell 71.50, KoBART 70.45)
+- 완벽 교정: 42/9,709건 (0.4%) — 대부분 단순 띄어쓰기+마침표 교정
+- M2 편집 타입 분포: INSERTION 40%, UNCLASSIFIED 22%, DELETION 21%
+
+### 모델이 못 하는 영역 (노이즈 엔진 미커버)
+- 문장부호 누락/오용 (마침표, 쉼표, 물음표 선택)
+- 이모티콘 앞뒤 띄어쓰기 ("네네^^" → "네네. ^^")
+- 구어 축약 복원 ("시러→싫어", "머→뭐")
+- 연속 문자 정규화 ("..→...", "??→?")
+- 초성어 복원 ("ㄹㅇ→레알")
+
+### 평가 파이프라인
+- KAGAS: `/workspace/Standard_Korean_GEC/`
+- M2 생성: `KAGAS/parallel_to_m2_korean.py`
+- M2 scorer: `metric/m2scorer/scripts/m2scorer.py`
+- 교정 스크립트: `eval_kagas.py`
+
 ## 학습 계획
 
 ### LR Decay 스케줄
