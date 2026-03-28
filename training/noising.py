@@ -187,6 +187,8 @@ WEIGHT_PRESETS: dict[str, dict[str, float]] = {
         "word_order_errors": 1.0,
         "tense_errors": 1.0,
         "semantic_errors": 2.0,
+        "emoticon_spacing": 1.0,
+        "char_repeat": 1.0,
         "conjugation_errors": 0.5,
         "suffix_errors": 0.5,
         "particle_errors": 0.5,
@@ -198,11 +200,13 @@ WEIGHT_PRESETS: dict[str, dict[str, float]] = {
         "honorific_errors": 0.5,
     },
     "realistic": {
-        # KoGEC 2025 + 이경미 2018 실제 오류 분포 반영
+        # KoGEC 2025 + NIKL PARA 실제 오류 분포 반영
         # 가중치 = 목표 비율 / hit rate 로 보정 (hit rate 높은 모듈은 가중치를 낮춤)
         "spacing_errors": 6.5,              # WS 25% 목표
-        "punctuation_errors": 6.0,          # PUNCT 30% 목표
-        "conjugation_errors": 2.0,          # VERB_ADJ 10.6% 목표 (hit rate 82% → 가중치 낮춤)
+        "punctuation_errors": 10.0,         # PUNCT 58% — NIKL PARA 최다 오류 (마침표/물음표 누락)
+        "emoticon_spacing": 3.0,            # 이모티콘 앞뒤 공백/마침표 (NIKL PARA ~6%)
+        "char_repeat": 2.0,                 # 연속 문자 변형 (말줄임표/이모티콘 반복)
+        "conjugation_errors": 2.0,          # VERB_ADJ 10.6% 목표 (hit rate 82%)
         "tense_errors": 1.5,               # VERB_ADJ 보조
         "common_misspellings": 0.5,         # SPELL 과다 방지 (hit rate 5%)
         "vowel_confusion": 0.3,             # SPELL 과다 방지 (hit rate 91%)
@@ -213,8 +217,8 @@ WEIGHT_PRESETS: dict[str, dict[str, float]] = {
         "semantic_errors": 2.5,             # PRO_NOUN 주력 (hit rate 91%)
         "grammar_remove": 2.5,              # DEL 10.6% 목표
         "grammar_addition": 1.0,            # INS 6.4% 목표
-        "suffix_errors": 4.0,              # END 4.3% 목표 (hit rate 19% → 높은 가중치 필요)
-        "particle_errors": 0.5,             # PART 2.1% 목표 (초과 방지)
+        "suffix_errors": 4.0,              # END 4.3% 목표 (hit rate 19%)
+        "particle_errors": 0.5,             # PART 2.1% 목표
         "number_errors": 0.5,
         "jamo_separation": 0.1,             # SPELL 과다 방지
         "phoneme_errors": 0.1,              # SPELL 과다 방지 (hit rate 98%)
@@ -225,7 +229,7 @@ WEIGHT_PRESETS: dict[str, dict[str, float]] = {
         "double_expression": 0.2,
         "foreign_style": 0.4,              # MODIFIER 1.1% 목표
         "misc_errors": 0.2,
-        "chat_style_errors": 0.2,
+        "chat_style_errors": 1.0,           # 구어 축약/초성어 (NIKL PARA ~1%)
         "honorific_errors": 0.2,
     },
 }

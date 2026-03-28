@@ -14,7 +14,7 @@ Phase 1/2 평가 시 오류 유형별 P/R/F0.5 분석에 사용.
 # KAGAS 유형 → 우리 오류 모듈 이름 매핑
 KAGAS_MAP: dict[str, list[str]] = {
     "WS":          ["spacing_errors"],
-    "PUNCT":       ["punctuation_errors"],
+    "PUNCT":       ["punctuation_errors", "emoticon_spacing", "char_repeat"],
     "SPELL":       ["common_misspellings", "vowel_confusion", "consonant_errors",
                     "g2pk_pronunciation", "heterograph_errors", "jamo_separation",
                     "phoneme_errors", "typing_language_errors"],

@@ -43,6 +43,8 @@ from error_generation.word_order_errors import apply_word_order_error
 from error_generation.tense_errors import apply_tense_error
 from error_generation.semantic_errors import apply_semantic_error
 from error_generation.heterograph import apply_heterograph_error
+from error_generation.emoticon_spacing import apply_emoticon_spacing
+from error_generation.char_repeat import apply_char_repeat
 
 # g2pk 기반 발음→철자 노이즈 (g2pk 미설치 시 비활성)
 try:
@@ -76,6 +78,8 @@ from error_generation import word_order_errors
 from error_generation import tense_errors
 from error_generation import semantic_errors
 from error_generation import heterograph
+from error_generation import emoticon_spacing
+from error_generation import char_repeat
 if _HAS_G2PK:
     from error_generation import g2pk_noise
 
@@ -120,6 +124,10 @@ ERROR_GENERATORS: list[tuple[str, ErrorFn, float]] = [
     # D-6. 의미론적 오류 (10%)
     ("semantic_errors",      apply_semantic_error,     2.0),
     
+    # E. 이모티콘/연속문자 오류
+    ("emoticon_spacing",     apply_emoticon_spacing,   1.0),
+    ("char_repeat",          apply_char_repeat,        1.0),
+
     # 그 외 보조 오류 (나머지 비중 분산)
     ("conjugation_errors",   apply_conjugation_error,  0.5),
     ("suffix_errors",        apply_suffix_error,       0.5),
@@ -148,6 +156,8 @@ ALL_MODULES = [
     typing_language_errors, foreign_word_errors, phoneme_errors,
     word_order_errors, tense_errors, semantic_errors,
     heterograph,
+    emoticon_spacing,
+    char_repeat,
 ]
 if _HAS_G2PK:
     ALL_MODULES.append(g2pk_noise)

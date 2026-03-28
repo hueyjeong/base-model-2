@@ -342,11 +342,13 @@ def main():
     print(f"  F0.5       = {edit_f05:.2%}")
     print(f"  TP={edit_tp:,}  FP={edit_fp:,}  FN={edit_fn:,}")
 
-    # ── 글자/어절 단위 평가 ──
+    # ── 글자/어절/형태소 단위 평가 ──
     if all_sentences:
         t_span = time.time()
+        import mecab
+        _mecab = mecab.MeCab()
         print(f"\n  --- Text-level Metrics ({len(all_sentences):,} sentences) ---")
-        for granularity, label in [("char", "Char"), ("word", "Word")]:
+        for granularity, label in [("char", "Char"), ("word", "Word"), ("morph", "Morph")]:
             tp, fp, fn = 0.0, 0.0, 0.0
             for src_ids, pred_tags, gold_tags in all_sentences:
                 hyp_ids = apply_edit_tags(src_ids, pred_tags, vocab_size)
@@ -357,8 +359,12 @@ def main():
 
                 if granularity == "char":
                     s, h, g = list(src_text), list(hyp_text), list(gold_text)
-                else:
+                elif granularity == "word":
                     s, h, g = src_text.split(), hyp_text.split(), gold_text.split()
+                else:  # morph
+                    s = _mecab.morphs(src_text)
+                    h = _mecab.morphs(hyp_text)
+                    g = _mecab.morphs(gold_text)
 
                 d_sg = edit_distance(s, g)
                 d_sh = edit_distance(s, h)
