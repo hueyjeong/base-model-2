@@ -143,12 +143,12 @@ KAGAS M2 scorer로 평가. 오염 가능성 있으므로 참고 수준.
 
 | 모델 | M2 Precision | M2 Recall | M2 F0.5 | 데이터 |
 |------|-------------|-----------|---------|--------|
-| Hanspell (KAGAS 논문) | 37.34% | 11.58% | 25.85% | Kor-Union test |
-| KoBART (KAGAS 논문) | 44.75% | 14.64% | 31.70% | Kor-Union test |
+| Hanspell (KAGAS 논문) | 81.93% | 47.36% | 71.50% | Kor-Native test |
+| KoBART (KAGAS 논문) | 75.34% | 55.95% | 70.45% | Kor-Native test |
 | **DenseEditor 100k** | **49.17%** | **14.64%** | **33.41%** | NIKL PARA 10k 샘플 |
 
 - 데이터/테스트셋이 다르므로 직접 비교 부적절 (참고용)
-- NIKL PARA는 Kor-Native에 가까움 (Hanspell 71.50, KoBART 70.45)
+- NIKL PARA는 Kor-Native(국립국어원 원어민 데이터)에 가까운 출처
 - 완벽 교정: 42/9,709건 (0.4%) — 대부분 단순 띄어쓰기+마침표 교정
 - M2 편집 타입 분포: INSERTION 40%, UNCLASSIFIED 22%, DELETION 21%
 
