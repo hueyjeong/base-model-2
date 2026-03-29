@@ -162,21 +162,19 @@ def validate_editor(model, val_loader, criterion, config, device, use_amp, n_ste
             edit_tags = batch["edit_tags"].to(device)
             pad_mask = batch["pad_mask"].to(device)
 
-            # 하이브리드: INSERT 정보
-            insert_pos = batch.get("insert_positions")
+            # 하이브리드: INSERT 시퀀스 정답
             insert_tgt = batch.get("insert_targets")
             insert_msk = batch.get("insert_mask")
-            if insert_pos is not None:
-                insert_pos = insert_pos.to(device)
+            if insert_tgt is not None:
                 insert_tgt = insert_tgt.to(device)
                 insert_msk = insert_msk.to(device)
 
             torch.compiler.cudagraph_mark_step_begin()
             if use_amp:
                 with torch.amp.autocast("cuda", dtype=amp_dtype):
-                    result = model(input_ids, pad_mask, insert_pos, insert_tgt, insert_msk)
+                    result = model(input_ids, pad_mask, edit_tags, insert_tgt, insert_msk)
             else:
-                result = model(input_ids, pad_mask, insert_pos, insert_tgt, insert_msk)
+                result = model(input_ids, pad_mask, edit_tags, insert_tgt, insert_msk)
 
             if isinstance(result, tuple):
                 tag_logits, decoder_logits = result
@@ -407,31 +405,24 @@ def train(args):
         max_insert_len=getattr(config, 'max_insert_len', 16),
     )
 
-    # 하이브리드 모드: insert 텐서 크기가 샘플마다 다르므로 커스텀 collate
+    # 하이브리드 모드: insert targets 크기가 샘플마다 다르므로 커스텀 collate
     def _collate_hybrid(batch):
-        """패킹 배치 collate — insert_positions/targets/mask를 배치로 합침"""
+        """패킹 배치 collate — insert_targets/mask를 합침 (positions는 GPU에서 계산)"""
         keys = ["input_ids", "edit_tags", "pad_mask", "original_ids"]
         result = {k: torch.stack([b[k] for b in batch]) for k in keys}
         result["n_chars"] = torch.tensor([b["n_chars"] for b in batch])
         result["_line_counter"] = torch.tensor([b.get("_line_counter", 0) for b in batch])
 
-        # INSERT 정보 합치기: (N_total_inserts, 2), (N_total_inserts, max_len)
-        if any("insert_positions" in b for b in batch):
-            all_pos = []     # (batch_idx, seq_pos)
+        # INSERT targets 합치기: (N_total_inserts, max_len)
+        if any("insert_targets" in b for b in batch):
             all_targets = []
             all_masks = []
             max_ins_len = max(
                 (b["insert_targets"].shape[1] for b in batch if "insert_targets" in b),
                 default=1)
 
-            for bi, b in enumerate(batch):
-                if "insert_positions" in b:
-                    n_ins = b["insert_positions"].shape[0]
-                    # (batch_idx, seq_pos) 쌍
-                    batch_col = torch.full((n_ins,), bi, dtype=torch.long)
-                    pos_2d = torch.stack([batch_col, b["insert_positions"]], dim=1)
-                    all_pos.append(pos_2d)
-                    # targets 패딩 맞춤
+            for b in batch:
+                if "insert_targets" in b:
                     tgt = b["insert_targets"]
                     msk = b["insert_mask"]
                     if tgt.shape[1] < max_ins_len:
@@ -441,8 +432,7 @@ def train(args):
                     all_targets.append(tgt)
                     all_masks.append(msk)
 
-            if all_pos:
-                result["insert_positions"] = torch.cat(all_pos, dim=0)
+            if all_targets:
                 result["insert_targets"] = torch.cat(all_targets, dim=0)
                 result["insert_mask"] = torch.cat(all_masks, dim=0)
 
@@ -684,12 +674,10 @@ def train(args):
 
             if hybrid_mode:
                 # ── 하이브리드: 단일 forward (인코더 + 디코더) ──
-                insert_pos = batch.get("insert_positions")
                 insert_tgt = batch.get("insert_targets")
                 insert_msk = batch.get("insert_mask")
 
-                if insert_pos is not None:
-                    insert_pos = insert_pos.to(device, non_blocking=True)
+                if insert_tgt is not None:
                     insert_tgt = insert_tgt.to(device, non_blocking=True)
                     insert_msk = insert_msk.to(device, non_blocking=True)
 
@@ -698,9 +686,9 @@ def train(args):
                         torch.compiler.cudagraph_mark_step_begin()
                     if use_amp:
                         with torch.amp.autocast("cuda", dtype=amp_dtype):
-                            result = model(input_ids, pad_mask, insert_pos, insert_tgt, insert_msk)
+                            result = model(input_ids, pad_mask, edit_tags, insert_tgt, insert_msk)
                     else:
-                        result = model(input_ids, pad_mask, insert_pos, insert_tgt, insert_msk)
+                        result = model(input_ids, pad_mask, edit_tags, insert_tgt, insert_msk)
 
                     if isinstance(result, tuple):
                         tag_logits, decoder_logits = result

@@ -234,7 +234,7 @@ class DenseEditor(nn.Module):
         self,
         input_ids: torch.Tensor,
         pad_mask: torch.Tensor | None = None,
-        insert_positions: torch.Tensor | None = None,
+        edit_tags: torch.Tensor | None = None,
         insert_targets: torch.Tensor | None = None,
         insert_target_mask: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -242,8 +242,8 @@ class DenseEditor(nn.Module):
         Args:
             input_ids: (B, T) — 입력 토큰 ID
             pad_mask: (B, T) bool — True가 유효 데이터
-            insert_positions: (N_ins, 2) — [batch_idx, seq_pos] INSERT 위치 (하이브리드)
-            insert_targets: (N_ins, max_insert_len) — 삽입 시퀀스 정답 (하이브리드)
+            edit_tags: (B, T) — 정답 태그 (하이브리드: INSERT_START 위치 탐지용)
+            insert_targets: (N_ins, max_insert_len) — 삽입 시퀀스 정답
             insert_target_mask: (N_ins, max_insert_len) bool — 유효 위치
 
         Returns:
@@ -265,13 +265,15 @@ class DenseEditor(nn.Module):
         x = self.final_norm(x)
         tag_logits = self.tag_head(x)
 
-        # 하이브리드 모드: INSERT 위치에서 디코더 실행
-        if self.hybrid_mode and insert_positions is not None:
-            # INSERT 위치의 encoder hidden state 추출
-            enc_hidden = x[insert_positions[:, 0], insert_positions[:, 1]]  # (N_ins, d)
-            decoder_logits = self.insert_decoder(
-                enc_hidden, insert_targets, insert_target_mask)
-            return tag_logits, decoder_logits
+        # 하이브리드: edit_tags에서 INSERT_START 위치를 GPU에서 직접 추출
+        if self.hybrid_mode and edit_tags is not None and insert_targets is not None:
+            INSERT_START = 2 + self.cfg.vocab_size
+            insert_mask = (edit_tags == INSERT_START)  # (B, T) bool
+            if insert_mask.any():
+                enc_hidden = x[insert_mask]  # (N_ins, d) — GPU에서 직접
+                decoder_logits = self.insert_decoder(
+                    enc_hidden, insert_targets, insert_target_mask)
+                return tag_logits, decoder_logits
 
         return tag_logits
 
