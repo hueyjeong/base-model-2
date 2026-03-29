@@ -271,6 +271,15 @@ class DenseEditor(nn.Module):
             insert_mask = (edit_tags == INSERT_START)  # (B, T) bool
             if insert_mask.any():
                 enc_hidden = x[insert_mask]  # (N_ins, d) — GPU에서 직접
+                # 안전 가드: edit_tags와 insert_targets 개수 불일치 시 맞춤
+                n_ins = enc_hidden.shape[0]
+                n_tgt = insert_targets.shape[0]
+                if n_ins != n_tgt:
+                    n_min = min(n_ins, n_tgt)
+                    enc_hidden = enc_hidden[:n_min]
+                    insert_targets = insert_targets[:n_min]
+                    if insert_target_mask is not None:
+                        insert_target_mask = insert_target_mask[:n_min]
                 decoder_logits = self.insert_decoder(
                     enc_hidden, insert_targets, insert_target_mask)
                 return tag_logits, decoder_logits
