@@ -135,6 +135,53 @@ def _apply_go_to_gu(text: str, rng: random.Random) -> Optional[str]:
     return ' '.join(words)
 
 
+def _apply_suffix_swap(text: str, rng: random.Random) -> Optional[str]:
+    """빈출 접미사 변환 — NIKL PARA 전수 분석에서 발견된 어미 변형 규칙.
+
+    각 규칙은 어절 끝(구두점 제외)에서 매칭:
+    - 잖아→자나 (89회), 데→디 (68회), 지→징 (48회)
+    - 더라→드라 (46회), 어→엉 (43회), 데→뎅 (58회)
+    - 게→께 (31회), 죠→져 (31회)
+    """
+    # (정답 접미사, 오류 접미사, 가중치)
+    _SUFFIX_RULES = [
+        ("잖아", "자나", 3),
+        ("잖아요", "자나요", 3),
+        ("는데", "는디", 2),
+        ("은데", "은디", 2),
+        ("인데", "인디", 2),
+        ("는데", "는뎅", 2),
+        ("은데", "은뎅", 2),
+        ("인데", "인뎅", 2),
+        ("지", "징", 2),
+        ("더라", "드라", 2),
+        ("죠", "져", 2),
+        ("게", "께", 1),
+        ("게요", "께요", 1),
+    ]
+
+    words = text.split()
+    candidates = []
+    for i, w in enumerate(words):
+        m = re.match(r'^(.+?)(([.,!?~…;:])+)?$', w)
+        body = m.group(1)
+        for correct_suf, wrong_suf, weight in _SUFFIX_RULES:
+            if body.endswith(correct_suf) and len(body) > len(correct_suf):
+                candidates.append((i, body, correct_suf, wrong_suf, m.group(2) or '', weight))
+
+    if not candidates:
+        return None
+
+    indices = list(range(len(candidates)))
+    weights = [c[5] for c in candidates]
+    [chosen_idx] = rng.choices(indices, weights=weights, k=1)
+    i, body, correct_suf, wrong_suf, punct, _ = candidates[chosen_idx]
+
+    new_body = body[:-len(correct_suf)] + wrong_suf
+    words[i] = new_body + punct
+    return ' '.join(words)
+
+
 # ── 통합 인터페이스 ──
 
 _RULES = [
@@ -142,6 +189,7 @@ _RULES = [
     (_apply_yo_to_yong,      3),  # -요→-용/-여
     (_apply_da_to_dang,      1),  # -다→-당
     (_apply_go_to_gu,        2),  # -고→-구
+    (_apply_suffix_swap,     3),  # 접미사 변환 (잖아→자나, 데→디 등)
 ]
 
 
