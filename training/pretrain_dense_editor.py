@@ -527,14 +527,18 @@ def train(args):
     elif args.init_weights:
         ckpt = torch.load(args.init_weights, map_location=device, weights_only=False)
         state_dict = ckpt.get("model", ckpt)
-        missing, unexpected = raw_model.load_state_dict(state_dict, strict=False)
+        # shape 불일치 키 제거 (tag_head 등 아키텍처 변경 시)
+        model_state = raw_model.state_dict()
+        filtered = {k: v for k, v in state_dict.items()
+                    if k in model_state and v.shape == model_state[k].shape}
+        skipped = [k for k in state_dict if k not in filtered and k in model_state]
+        missing, unexpected = raw_model.load_state_dict(filtered, strict=False)
         if global_rank == 0:
             print(f"\n사전학습 가중치 로드: {args.init_weights}")
+            print(f"  로드: {len(filtered)}개, 건너뜀 (shape 불일치): {skipped}")
             if missing:
-                print(f"  missing keys ({len(missing)}): {missing[:3]}...")
-            if unexpected:
-                print(f"  unexpected keys ({len(unexpected)}): {unexpected[:3]}...")
-        del ckpt, state_dict
+                print(f"  missing keys ({len(missing)}): {missing[:5]}")
+        del ckpt, state_dict, filtered
         gc.collect()
 
     # 학습 루프
