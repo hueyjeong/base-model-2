@@ -162,9 +162,12 @@ def validate_editor(model, val_loader, criterion, config, device, use_amp, n_ste
             edit_tags = batch["edit_tags"].to(device)
             pad_mask = batch["pad_mask"].to(device)
 
-            # 하이브리드: INSERT 시퀀스 정답
+            # 하이브리드: INSERT positions + targets
+            insert_pos = batch.get("insert_positions")
             insert_tgt = batch.get("insert_targets")
             insert_msk = batch.get("insert_mask")
+            if insert_pos is not None:
+                insert_pos = insert_pos.to(device)
             if insert_tgt is not None:
                 insert_tgt = insert_tgt.to(device)
                 insert_msk = insert_msk.to(device)
@@ -172,9 +175,9 @@ def validate_editor(model, val_loader, criterion, config, device, use_amp, n_ste
             torch.compiler.cudagraph_mark_step_begin()
             if use_amp:
                 with torch.amp.autocast("cuda", dtype=amp_dtype):
-                    result = model(input_ids, pad_mask, edit_tags, insert_tgt, insert_msk)
+                    result = model(input_ids, pad_mask, insert_pos, insert_tgt, insert_msk)
             else:
-                result = model(input_ids, pad_mask, edit_tags, insert_tgt, insert_msk)
+                result = model(input_ids, pad_mask, insert_pos, insert_tgt, insert_msk)
 
             if isinstance(result, tuple):
                 tag_logits, decoder_logits = result
@@ -412,6 +415,12 @@ def train(args):
         result = {k: torch.stack([b[k] for b in batch]) for k in keys}
         result["n_chars"] = torch.tensor([b["n_chars"] for b in batch])
         result["_line_counter"] = torch.tensor([b.get("_line_counter", 0) for b in batch])
+
+        # INSERT positions: edit_tags에서 vectorized 추출 (CPU, GPU sync 없음)
+        INSERT_START = 2 + tokenizer.vocab_size  # tag_insert_start(vocab_size)
+        insert_positions = (result["edit_tags"] == INSERT_START).nonzero(as_tuple=False)
+        if insert_positions.shape[0] > 0:
+            result["insert_positions"] = insert_positions  # (N_ins, 2) — [batch, pos]
 
         # INSERT targets 합치기: (N_total_inserts, max_len)
         if any("insert_targets" in b for b in batch):
@@ -674,9 +683,12 @@ def train(args):
 
             if hybrid_mode:
                 # ── 하이브리드: 단일 forward (인코더 + 디코더) ──
+                insert_pos = batch.get("insert_positions")
                 insert_tgt = batch.get("insert_targets")
                 insert_msk = batch.get("insert_mask")
 
+                if insert_pos is not None:
+                    insert_pos = insert_pos.to(device, non_blocking=True)
                 if insert_tgt is not None:
                     insert_tgt = insert_tgt.to(device, non_blocking=True)
                     insert_msk = insert_msk.to(device, non_blocking=True)
@@ -686,9 +698,9 @@ def train(args):
                         torch.compiler.cudagraph_mark_step_begin()
                     if use_amp:
                         with torch.amp.autocast("cuda", dtype=amp_dtype):
-                            result = model(input_ids, pad_mask, edit_tags, insert_tgt, insert_msk)
+                            result = model(input_ids, pad_mask, insert_pos, insert_tgt, insert_msk)
                     else:
-                        result = model(input_ids, pad_mask, edit_tags, insert_tgt, insert_msk)
+                        result = model(input_ids, pad_mask, insert_pos, insert_tgt, insert_msk)
 
                     if isinstance(result, tuple):
                         tag_logits, decoder_logits = result

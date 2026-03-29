@@ -234,7 +234,7 @@ class DenseEditor(nn.Module):
         self,
         input_ids: torch.Tensor,
         pad_mask: torch.Tensor | None = None,
-        edit_tags: torch.Tensor | None = None,
+        insert_positions: torch.Tensor | None = None,
         insert_targets: torch.Tensor | None = None,
         insert_target_mask: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
@@ -242,7 +242,7 @@ class DenseEditor(nn.Module):
         Args:
             input_ids: (B, T) — 입력 토큰 ID
             pad_mask: (B, T) bool — True가 유효 데이터
-            edit_tags: (B, T) — 정답 태그 (하이브리드: INSERT_START 위치 탐지용)
+            insert_positions: (N_ins, 2) — [batch_idx, seq_pos] (collate에서 사전 계산)
             insert_targets: (N_ins, max_insert_len) — 삽입 시퀀스 정답
             insert_target_mask: (N_ins, max_insert_len) bool — 유효 위치
 
@@ -265,25 +265,18 @@ class DenseEditor(nn.Module):
         x = self.final_norm(x)
         tag_logits = self.tag_head(x)
 
-        # 하이브리드: edit_tags에서 INSERT_START 위치를 GPU에서 직접 추출
-        if self.hybrid_mode and edit_tags is not None and insert_targets is not None:
-            INSERT_START = 2 + self.cfg.vocab_size
-            insert_mask = (edit_tags == INSERT_START)  # (B, T) bool
-            if insert_mask.any():
-                enc_hidden = x[insert_mask]  # (N_ins, d) — GPU에서 직접
-                # 안전 가드: edit_tags와 insert_targets 개수 불일치 시 맞춤
-                n_ins = enc_hidden.shape[0]
-                n_tgt = insert_targets.shape[0]
-                if n_ins != n_tgt:
-                    import sys
-                    print(f"[WARN] forward INSERT 불일치: enc={n_ins}, tgt={n_tgt}", file=sys.stderr)
-                    n_min = min(n_ins, n_tgt)
-                    enc_hidden = enc_hidden[:n_min]
-                    insert_targets = insert_targets[:n_min]
-                    if insert_target_mask is not None:
-                        insert_target_mask = insert_target_mask[:n_min]
+        # 하이브리드: 사전 계산된 INSERT positions로 encoder hidden 추출 (GPU sync 없음)
+        if self.hybrid_mode and insert_positions is not None and insert_targets is not None:
+            n_pos = insert_positions.shape[0]
+            n_tgt = insert_targets.shape[0]
+            n_min = min(n_pos, n_tgt)
+            if n_min > 0:
+                enc_hidden = x[insert_positions[:n_min, 0],
+                               insert_positions[:n_min, 1]]  # (N_ins, d)
                 decoder_logits = self.insert_decoder(
-                    enc_hidden, insert_targets, insert_target_mask)
+                    enc_hidden,
+                    insert_targets[:n_min],
+                    insert_target_mask[:n_min] if insert_target_mask is not None else None)
                 return tag_logits, decoder_logits
 
         return tag_logits
