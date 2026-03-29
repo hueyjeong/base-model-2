@@ -17,7 +17,7 @@ KAGAS_MAP: dict[str, list[str]] = {
     "PUNCT":       ["punctuation_errors", "emoticon_spacing", "char_repeat"],
     "SPELL":       ["common_misspellings", "vowel_confusion", "consonant_errors",
                     "g2pk_pronunciation", "heterograph_errors", "jamo_separation",
-                    "phoneme_errors", "typing_language_errors"],
+                    "phoneme_errors", "typing_language_errors", "jamo_rules"],
     "PART":        ["particle_errors"],
     "VERB_ADJ":    ["conjugation_errors", "tense_errors"],
     "PRO_NOUN":    ["word_substitution", "semantic_errors", "number_errors"],

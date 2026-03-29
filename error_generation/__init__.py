@@ -45,6 +45,7 @@ from error_generation.semantic_errors import apply_semantic_error
 from error_generation.heterograph import apply_heterograph_error
 from error_generation.emoticon_spacing import apply_emoticon_spacing
 from error_generation.char_repeat import apply_char_repeat
+from error_generation.jamo_rules import apply_jamo_rule
 
 # g2pk 기반 발음→철자 노이즈 (g2pk 미설치 시 비활성)
 try:
@@ -80,6 +81,7 @@ from error_generation import semantic_errors
 from error_generation import heterograph
 from error_generation import emoticon_spacing
 from error_generation import char_repeat
+from error_generation import jamo_rules
 if _HAS_G2PK:
     from error_generation import g2pk_noise
 
@@ -128,6 +130,9 @@ ERROR_GENERATORS: list[tuple[str, ErrorFn, float]] = [
     ("emoticon_spacing",     apply_emoticon_spacing,   1.0),
     ("char_repeat",          apply_char_repeat,        1.0),
 
+    # F. 자모 규칙 구어체 오류 (ㅆ→ㅅ, -요→-용, -다→-당, -고→-구)
+    ("jamo_rules",           apply_jamo_rule,          2.0),
+
     # 그 외 보조 오류 (나머지 비중 분산)
     ("conjugation_errors",   apply_conjugation_error,  0.5),
     ("suffix_errors",        apply_suffix_error,       0.5),
@@ -158,6 +163,7 @@ ALL_MODULES = [
     heterograph,
     emoticon_spacing,
     char_repeat,
+    jamo_rules,
 ]
 if _HAS_G2PK:
     ALL_MODULES.append(g2pk_noise)

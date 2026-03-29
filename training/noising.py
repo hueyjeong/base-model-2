@@ -189,6 +189,7 @@ WEIGHT_PRESETS: dict[str, dict[str, float]] = {
         "semantic_errors": 2.0,
         "emoticon_spacing": 1.0,
         "char_repeat": 1.0,
+        "jamo_rules": 1.0,
         "conjugation_errors": 0.5,
         "suffix_errors": 0.5,
         "particle_errors": 0.5,
@@ -206,6 +207,7 @@ WEIGHT_PRESETS: dict[str, dict[str, float]] = {
         "punctuation_errors": 6.0,          # PUNCT — error_count=5에서 ~1개/문장 수준 유지
         "emoticon_spacing": 3.0,            # 이모티콘 앞뒤 공백/마침표 (NIKL PARA ~6%)
         "char_repeat": 2.0,                 # 연속 문자 변형 (말줄임표/이모티콘 반복)
+        "jamo_rules": 4.0,                  # 자모 규칙 구어체 (ㅆ→ㅅ, -요→-용, -고→-구, 2000+ 변형)
         "conjugation_errors": 2.0,          # VERB_ADJ 10.6% 목표 (hit rate 82%)
         "tense_errors": 1.5,               # VERB_ADJ 보조
         "common_misspellings": 0.5,         # SPELL 과다 방지 (hit rate 5%)
