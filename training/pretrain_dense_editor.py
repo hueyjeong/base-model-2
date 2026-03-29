@@ -138,14 +138,17 @@ def format_chars(n: int) -> str:
 
 def validate_editor(model, val_loader, criterion, config, device, use_amp, n_steps,
                      amp_dtype=torch.bfloat16):
-    """검증 루프: n_steps 배치에 대해 loss, 태그 정확도, 편집 precision/recall 계산"""
+    """검증 루프: tag loss/accuracy + decoder loss (하이브리드) + precision/recall"""
     model.eval()
+    hybrid_mode = getattr(config, 'hybrid_decoder', False)
     total_loss = 0.0
+    total_dec_loss = 0.0
     total_tokens = 0
+    total_dec_tokens = 0
     total_correct = 0
-    edit_tp = 0  # non-KEEP 정답
-    edit_fp = 0  # KEEP인데 non-KEEP으로 예측
-    edit_fn = 0  # non-KEEP인데 KEEP으로 예측
+    edit_tp = 0
+    edit_fp = 0
+    edit_fn = 0
     val_iter = iter(val_loader)
 
     with torch.no_grad():
@@ -159,13 +162,29 @@ def validate_editor(model, val_loader, criterion, config, device, use_amp, n_ste
             edit_tags = batch["edit_tags"].to(device)
             pad_mask = batch["pad_mask"].to(device)
 
+            # 하이브리드: INSERT 정보
+            insert_pos = batch.get("insert_positions")
+            insert_tgt = batch.get("insert_targets")
+            insert_msk = batch.get("insert_mask")
+            if insert_pos is not None:
+                insert_pos = insert_pos.to(device)
+                insert_tgt = insert_tgt.to(device)
+                insert_msk = insert_msk.to(device)
+
             torch.compiler.cudagraph_mark_step_begin()
             if use_amp:
                 with torch.amp.autocast("cuda", dtype=amp_dtype):
-                    tag_logits = model(input_ids, pad_mask)
+                    result = model(input_ids, pad_mask, insert_pos, insert_tgt, insert_msk)
             else:
-                tag_logits = model(input_ids, pad_mask)
+                result = model(input_ids, pad_mask, insert_pos, insert_tgt, insert_msk)
 
+            if isinstance(result, tuple):
+                tag_logits, decoder_logits = result
+            else:
+                tag_logits = result
+                decoder_logits = None
+
+            # 태그 loss
             targets = edit_tags.clone()
             targets[~pad_mask] = -100
             loss = criterion(
@@ -178,10 +197,22 @@ def validate_editor(model, val_loader, criterion, config, device, use_amp, n_ste
             total_loss += loss.item() * n_tok
             total_tokens += n_tok
 
+            # 디코더 loss
+            if decoder_logits is not None and insert_tgt is not None:
+                dec_targets = insert_tgt.clone()
+                dec_targets[~insert_msk] = -100
+                dec_criterion = nn.CrossEntropyLoss(ignore_index=-100)
+                dec_loss = dec_criterion(
+                    decoder_logits.float().view(-1, config.vocab_size),
+                    dec_targets.view(-1),
+                )
+                n_dec = insert_msk.sum().item()
+                total_dec_loss += dec_loss.item() * n_dec
+                total_dec_tokens += n_dec
+
             preds = tag_logits.argmax(dim=-1)
             total_correct += (preds[valid] == edit_tags[valid]).sum().item()
 
-            # Precision/Recall: non-KEEP 태그 (TAG_KEEP=0)
             pred_edit = preds[valid] != TAG_KEEP
             true_edit = edit_tags[valid] != TAG_KEEP
             edit_tp += (pred_edit & true_edit).sum().item()
@@ -193,10 +224,12 @@ def validate_editor(model, val_loader, criterion, config, device, use_amp, n_ste
         return float("nan"), float("nan"), float("nan"), float("nan"), float("nan")
 
     val_loss = total_loss / total_tokens
+    if total_dec_tokens > 0:
+        val_loss += total_dec_loss / total_dec_tokens  # tag + decoder 합산
     tag_acc = total_correct / total_tokens
     edit_precision = edit_tp / max(edit_tp + edit_fp, 1)
     edit_recall = edit_tp / max(edit_tp + edit_fn, 1)
-    beta_sq = 0.5 ** 2  # F0.5: precision 가중
+    beta_sq = 0.5 ** 2
     edit_f05 = ((1 + beta_sq) * edit_precision * edit_recall
                 / max(beta_sq * edit_precision + edit_recall, 1e-8))
     return val_loss, tag_acc, edit_precision, edit_recall, edit_f05
@@ -444,7 +477,7 @@ def train(args):
             seed=args.seed + 1,
             rank=global_rank,
             world_size=world_size,
-            pack=False,
+            pack=True,
             hybrid_decoder=hybrid_mode,
             max_insert_len=getattr(config, 'max_insert_len', 16),
         )
