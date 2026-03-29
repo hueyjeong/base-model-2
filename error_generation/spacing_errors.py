@@ -6,6 +6,8 @@
 2. 동적 생성: MeCab 형태소 분석 기반 어절 합치기/쪼개기/의존명사 결합
 """
 
+import json
+import os
 import random
 import re
 from typing import Optional
@@ -363,6 +365,22 @@ DATE_SPACING: list[tuple[str, str]] = [
     ("12. 10.", "12.10"),
 ]
 
+# NIKL PARA 전수 분석 자동 추출 사전
+_NIKL_SPACING_PATH = os.path.join(os.path.dirname(__file__), "nikl_para_spacing.json")
+_NIKL_SPLIT_TO_JOIN: list[tuple[str, str]] = []  # (올바른 띄어쓰기, 붙여쓴 오류)
+_NIKL_JOIN_TO_SPLIT: list[tuple[str, str]] = []  # (올바른 붙여쓰기, 띄어쓴 오류)
+
+if os.path.exists(_NIKL_SPACING_PATH):
+    with open(_NIKL_SPACING_PATH, encoding="utf-8") as _f:
+        _nikl_spacing = json.load(_f)
+    for _correct, _wrongs in _nikl_spacing.get("split_to_join", {}).items():
+        for _w in _wrongs:
+            _NIKL_SPLIT_TO_JOIN.append((_correct, _w))
+    for _correct, _wrongs in _nikl_spacing.get("join_to_split", {}).items():
+        for _w in _wrongs:
+            _NIKL_JOIN_TO_SPLIT.append((_correct, _w))
+    del _nikl_spacing
+
 
 def _dynamic_spacing_error(text: str, rng: random.Random) -> Optional[str]:
     """동적 띄어쓰기 오류 생성 — 패턴 매칭 실패 시 fallback.
@@ -507,7 +525,7 @@ def apply_spacing_error(text: str, rng: random.Random) -> Optional[str]:
     Returns:
         오류가 적용된 문장. 적용 가능한 패턴이 없으면 None.
     """
-    # 1. 패턴 기반 (30% 확률로 우선 시도)
+    # 1. 하드코딩 패턴 (30% 확률로 우선 시도)
     all_patterns = JOIN_TO_SPLIT + SPLIT_TO_JOIN + DEPENDENT_NOUN_SPACING + DATE_SPACING
     candidates = [(correct, wrong) for correct, wrong in all_patterns if correct in text]
 
@@ -515,14 +533,24 @@ def apply_spacing_error(text: str, rng: random.Random) -> Optional[str]:
         correct, wrong = rng.choice(candidates)
         return text.replace(correct, wrong, 1)
 
-    # 2. 동적 생성
+    # 2. NIKL PARA 사전 패턴 (20% 확률)
+    nikl_candidates = [(c, w) for c, w in _NIKL_SPLIT_TO_JOIN if c in text]
+    nikl_candidates += [(c, w) for c, w in _NIKL_JOIN_TO_SPLIT if c in text]
+    if nikl_candidates and rng.random() < 0.2:
+        correct, wrong = rng.choice(nikl_candidates)
+        return text.replace(correct, wrong, 1)
+
+    # 3. 동적 생성 (MeCab POS 기반)
     result = _dynamic_spacing_error(text, rng)
     if result is not None:
         return result
 
-    # 3. 패턴 기반 fallback
+    # 4. fallback: 하드코딩 → NIKL 사전
     if candidates:
         correct, wrong = rng.choice(candidates)
+        return text.replace(correct, wrong, 1)
+    if nikl_candidates:
+        correct, wrong = rng.choice(nikl_candidates)
         return text.replace(correct, wrong, 1)
 
     return None
