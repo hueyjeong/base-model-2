@@ -205,10 +205,12 @@ def compute_edit_tags_hybrid(
             break
     ops.reverse()
 
-    # 연산 → 태그 + 삽입 시퀀스
+    # 연산 → 태그 + 삽입 시퀀스 (two-pass: SUB/DEL 먼저, INSERT 나중에)
     tags = [TAG_KEEP] * n
     insert_seqs: dict[int, list[int]] = {}
 
+    # 1차: match/sub/del — 태그 확정
+    insert_ops: list[tuple[int, int]] = []
     for op, src_idx, tgt_token in ops:
         if op == "match":
             pass
@@ -217,15 +219,17 @@ def compute_edit_tags_hybrid(
         elif op == "del":
             tags[src_idx] = TAG_DELETE
         elif op == "ins":
-            # 삽입 위치: src_idx 직전 (src_idx-1)
-            ins_at = max(0, src_idx - 1)
-            if ins_at not in insert_seqs:
-                # INSERT_START 태그 설정 (KEEP 위치만 — REPLACE 등이면 삽입 불가)
-                if tags[ins_at] != TAG_KEEP:
-                    continue  # 이 위치에 INSERT 불가 → 건너뜀
-                tags[ins_at] = INSERT_START
-                insert_seqs[ins_at] = []
-            insert_seqs[ins_at].append(tgt_token)
+            insert_ops.append((src_idx, tgt_token))
+
+    # 2차: insert — 태그가 확정된 후 KEEP 위치에만 INSERT_START 설정
+    for src_idx, tgt_token in insert_ops:
+        ins_at = max(0, src_idx - 1)
+        if ins_at not in insert_seqs:
+            if tags[ins_at] != TAG_KEEP:
+                continue
+            tags[ins_at] = INSERT_START
+            insert_seqs[ins_at] = []
+        insert_seqs[ins_at].append(tgt_token)
 
     # 삽입 시퀀스에 EOS 추가
     for pos in insert_seqs:
