@@ -74,3 +74,5 @@ exp-2-pass-consensus/exported_step2000_f32/
 # ONNX 모델 파일 (대용량)
 *.onnx
 *.onnx.data
+error_generation/nikl_para_misspellings.json
+error_generation/nikl_para_spacing.json
