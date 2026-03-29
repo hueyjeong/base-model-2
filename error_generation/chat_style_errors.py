@@ -27,10 +27,33 @@ _CHAT_STYLE_PATTERNS = [
     (re.compile(r"그렇(지|죠)"), ["그치", "글치"]),
     (re.compile(r"어떡해"), ["어뜨케", "어떻해", "어케"]),
 
-    # ── 초성어 ──
+    # ── 초성어 (NIKL PARA 빈출) ──
     (re.compile(r"레알"), ["ㄹㅇ"]),
-    (re.compile(r"인정"), ["ㅇㅈ"]),
+    (re.compile(r"인정"), ["ㅇㅈ", "ㅇㅈㅇㅈ"]),
     (re.compile(r"감사"), ["ㄱㅅ"]),
+    (re.compile(r"응응"), ["ㅇㅇ"]),
+    (re.compile(r"오키"), ["ㅇㅋ", "ㅇㅋㅇㅋ"]),
+    (re.compile(r"맞아"), ["ㅁㅈ"]),
+
+    # ── 구어 축약 (NIKL PARA 전수 분석 — 빈출순) ──
+    (re.compile(r"나도"), ["나두"]),
+    (re.compile(r"저도"), ["저두"]),
+    (re.compile(r"그래도"), ["그래두"]),
+    (re.compile(r"좀"), ["쫌"]),
+    (re.compile(r"그냥"), ["걍"]),
+    (re.compile(r"그리고"), ["글고", "글구", "그리구"]),
+    (re.compile(r"많이"), ["마니"]),
+    (re.compile(r"네가"), ["너가", "니가", "니"]),
+    (re.compile(r"여하튼"), ["여튼"]),
+    (re.compile(r"왜냐하면"), ["왜냐면"]),
+    (re.compile(r"오래간만에"), ["간만에"]),
+    (re.compile(r"먹고"), ["먹구"]),
+    (re.compile(r"하고"), ["하구"]),
+
+    # ── -라고요 → -라구요 (빈출 맞춤법) ──
+    (re.compile(r"더라고요"), ["더라구요"]),
+    (re.compile(r"으려고요"), ["으려구요"]),
+    (re.compile(r"그렇죠"), ["그쵸", "그치"]),
 
     # ── 부사/감탄 ──
     (re.compile(r"너무"), ["넘", "넘무", "개", "존나"]),
