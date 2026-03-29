@@ -11,25 +11,34 @@ from typing import Optional
 
 _PUNCTS = [".", ",", "!", "?", "~"]
 
+# NIKL PARA 빈출: 감탄사/응답어 뒤 쉼표가 빠지는 패턴
+_INTERJECTIONS = [
+    "아", "오", "와", "헐", "헉", "음", "응", "앗", "아하", "우와",
+    "네", "네네", "웅", "웅웅", "아아", "오오", "오호", "하", "어",
+    "야", "엉", "아뇨", "흠", "언니", "엥", "아니",
+]
+
 
 def get_error_count() -> int:
     """오류 패턴의 총 개수를 반환."""
-    return 9  # 기존 3 + 신규 6
+    return 11  # 기존 3 + 신규 8
 
 
 def apply_punctuation_error(text: str, rng: random.Random) -> Optional[str]:
     """구두점 오류 주입. 누락/반복/교체/정규화 역방향 등."""
     # 액션 가중치 (NIKL PARA 분포 반영: 누락 > 변형 > 삽입)
     actions = [
-        ("remove_final",   30),  # 문장 끝 구두점 삭제 (가장 빈번)
-        ("remove_comma",   15),  # 쉼표 삭제
-        ("ellipsis_vary",  15),  # 말줄임표 변형
-        ("duplicate",      10),  # 구두점 중복 (?→??, !→!!)
-        ("swap_final",      8),  # 마침표↔물음표 교체
-        ("delete_inner",    8),  # 기존: 내부 구두점 삭제
-        ("repeat_inner",    7),  # 기존: 반복
-        ("swap_inner",      4),  # 기존: 교체
-        ("insert_random",   3),  # 기존: 무작위 삽입
+        ("remove_final",        25),  # 문장 끝 구두점 삭제
+        ("remove_interjection", 20),  # 감탄사 뒤 쉼표 삭제 (NIKL PARA 1위 패턴)
+        ("remove_comma",        12),  # 일반 쉼표 삭제
+        ("ellipsis_vary",       12),  # 말줄임표 변형
+        ("duplicate",            8),  # 구두점 중복 (?→??, !→!!)
+        ("swap_final",           7),  # 마침표↔물음표 교체
+        ("merge_repeat_word",    5),  # 반복어 쉼표 제거: "맞아, 맞아"→"맞아맞아"
+        ("delete_inner",         5),  # 기존: 내부 구두점 삭제
+        ("repeat_inner",         3),  # 기존: 반복
+        ("swap_inner",           2),  # 기존: 교체
+        ("insert_random",        1),  # 기존: 무작위 삽입
     ]
     action_names = [a[0] for a in actions]
     action_weights = [a[1] for a in actions]
@@ -48,7 +57,26 @@ def apply_punctuation_error(text: str, rng: random.Random) -> Optional[str]:
 def _apply_action(text: str, action: str, rng: random.Random) -> Optional[str]:
     """개별 구두점 액션 적용."""
 
-    if action == "remove_final":
+    if action == "remove_interjection":
+        # 감탄사 뒤 쉼표 삭제: "아, 맞아요" → "아 맞아요"
+        for intj in _INTERJECTIONS:
+            pattern = intj + ","
+            idx = text.find(pattern)
+            if idx >= 0 and (idx == 0 or text[idx - 1] == ' '):
+                # 쉼표 제거, 공백은 유지
+                after = text[idx + len(pattern):]
+                return text[:idx] + intj + (" " if after and after[0] != " " else "") + after
+        return None
+
+    elif action == "merge_repeat_word":
+        # 반복어 쉼표 제거: "맞아, 맞아." → "맞아맞아"
+        m = re.search(r'(\S+),\s+\1', text)
+        if m:
+            word = m.group(1)
+            return text[:m.start()] + word + word + text[m.end():]
+        return None
+
+    elif action == "remove_final":
         # 문장 끝 구두점 삭제: "안녕하세요." → "안녕하세요"
         m = re.search(r'[.!?~…]+\s*$', text)
         if m:
