@@ -239,12 +239,27 @@ def _dynamic_spacing_error(text: str, rng: random.Random) -> Optional[str]:
                 # 접미사 앞: 붙여야 함
                 elif pos_tag in ('XSN', 'XSV', 'XSA'):
                     join_candidates.append((t.start - 1, 3))
-                # 부사 + 동사/형용사: "빨리 해" → "빨리해"
+                # 명사+명사 복합어: "외부 액정" → "외부액정" (1위 빈출)
+                elif prev_pos.startswith('N') and pos_tag in ('NNG', 'NNP'):
+                    join_candidates.append((t.start - 1, 4))
+                # 관형어+명사: "예쁜 집" → "예쁜집"
+                elif prev_pos == 'ETM' and pos_tag.startswith('N'):
+                    join_candidates.append((t.start - 1, 3))
+                # 부사+동사/형용사: "빨리 해" → "빨리해"
                 elif prev_pos == 'MAG' and pos_tag in ('VV', 'VA'):
+                    join_candidates.append((t.start - 1, 3))
+                # 명사+동사: "추천 해" → "추천해"
+                elif prev_pos.startswith('N') and pos_tag in ('VV', 'VA', 'XSV'):
+                    join_candidates.append((t.start - 1, 3))
+                # 어미+동사: "먹고 싶다" → "먹고싶다"
+                elif prev_pos.startswith('E') and pos_tag in ('VV', 'VA', 'VX'):
                     join_candidates.append((t.start - 1, 2))
-                # 명사 + 동사화접미사(이미 어절): "공부 하다" → "공부하다"
-                elif prev_pos.startswith('N') and pos_tag == 'XSV':
+                # 조사+명사/부사/동사: 일반적인 어절 경계
+                elif prev_pos.startswith('J') and pos_tag in ('NNG', 'NNP', 'MAG', 'VV', 'VA'):
                     join_candidates.append((t.start - 1, 2))
+                # 부사+부사: "너무 많이" → "너무많이"
+                elif prev_pos == 'MAG' and pos_tag == 'MAG':
+                    join_candidates.append((t.start - 1, 1))
                 # 일반 어절 합치기 (낮은 가중치)
                 else:
                     join_candidates.append((t.start - 1, 1))
