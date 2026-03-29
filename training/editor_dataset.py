@@ -250,6 +250,24 @@ class EditorDataset(IterableDataset):
 
         # 하이브리드: INSERT 위치 + 삽입 시퀀스
         if insert_seqs:
+            # 검증: edit_tags의 INSERT_START 수 == insert_seqs 수
+            from model.edit_tags import tag_insert_start
+            INSERT_START = tag_insert_start(self.vocab_size)
+            n_tags_ins = sum(1 for t in buf_tags if t == INSERT_START)
+            n_seqs = len(insert_seqs)
+            if n_tags_ins != n_seqs:
+                import sys
+                # 디버그: 불일치 원인 출력
+                tag_positions = [i for i, t in enumerate(buf_tags) if t == INSERT_START]
+                seq_positions = sorted(insert_seqs.keys())
+                extra_seqs = [p for p in seq_positions if p >= len(buf_tags) or buf_tags[p] != INSERT_START]
+                print(f"[WARN] INSERT 불일치: tags={n_tags_ins}, seqs={n_seqs}, "
+                      f"extra_seq_positions={extra_seqs[:5]}, "
+                      f"tags_at_extra={[buf_tags[p] if p < len(buf_tags) else 'OOB' for p in extra_seqs[:5]]}",
+                      file=sys.stderr)
+                # insert_seqs에서 INSERT_START 없는 위치 제거
+                insert_seqs = {k: v for k, v in insert_seqs.items()
+                               if k < len(buf_tags) and buf_tags[k] == INSERT_START}
             positions = sorted(insert_seqs.keys())
             max_ins_len = max(len(insert_seqs[p]) for p in positions)
             max_ins_len = min(max_ins_len, self.max_insert_len)

@@ -275,6 +275,8 @@ class DenseEditor(nn.Module):
                 n_ins = enc_hidden.shape[0]
                 n_tgt = insert_targets.shape[0]
                 if n_ins != n_tgt:
+                    import sys
+                    print(f"[WARN] forward INSERT 불일치: enc={n_ins}, tgt={n_tgt}", file=sys.stderr)
                     n_min = min(n_ins, n_tgt)
                     enc_hidden = enc_hidden[:n_min]
                     insert_targets = insert_targets[:n_min]
