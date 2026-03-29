@@ -252,6 +252,10 @@ def train(args):
         config_overrides["int8_qat"] = True
     if args.mamba2_in_proj_rank is not None:
         config_overrides["mamba2_in_proj_rank"] = args.mamba2_in_proj_rank
+    if args.hybrid_decoder:
+        config_overrides["hybrid_decoder"] = True
+        config_overrides["decoder_n_layers"] = args.decoder_n_layers
+        config_overrides["max_insert_len"] = args.max_insert_len
     config = make_config(
         mixing_type=args.mixing_type,
         d_model=args.d_model,
@@ -354,7 +358,8 @@ def train(args):
         use_korean_errors=True,
     )
 
-    # 데이터셋 — 패킹 항상 활성 (GPU refinement로 original_ids 불필요)
+    # 데이터셋 — 패킹 항상 활성
+    hybrid_mode = getattr(config, 'hybrid_decoder', False)
     dataset = EditorDataset(
         args.corpus, tokenizer, noiser,
         vocab_size=tokenizer.vocab_size,
@@ -365,7 +370,52 @@ def train(args):
         rank=global_rank,
         world_size=world_size,
         pack=True,
+        hybrid_decoder=hybrid_mode,
+        max_insert_len=getattr(config, 'max_insert_len', 16),
     )
+
+    # 하이브리드 모드: insert 텐서 크기가 샘플마다 다르므로 커스텀 collate
+    def _collate_hybrid(batch):
+        """패킹 배치 collate — insert_positions/targets/mask를 배치로 합침"""
+        keys = ["input_ids", "edit_tags", "pad_mask", "original_ids"]
+        result = {k: torch.stack([b[k] for b in batch]) for k in keys}
+        result["n_chars"] = torch.tensor([b["n_chars"] for b in batch])
+        result["_line_counter"] = torch.tensor([b.get("_line_counter", 0) for b in batch])
+
+        # INSERT 정보 합치기: (N_total_inserts, 2), (N_total_inserts, max_len)
+        if any("insert_positions" in b for b in batch):
+            all_pos = []     # (batch_idx, seq_pos)
+            all_targets = []
+            all_masks = []
+            max_ins_len = max(
+                (b["insert_targets"].shape[1] for b in batch if "insert_targets" in b),
+                default=1)
+
+            for bi, b in enumerate(batch):
+                if "insert_positions" in b:
+                    n_ins = b["insert_positions"].shape[0]
+                    # (batch_idx, seq_pos) 쌍
+                    batch_col = torch.full((n_ins,), bi, dtype=torch.long)
+                    pos_2d = torch.stack([batch_col, b["insert_positions"]], dim=1)
+                    all_pos.append(pos_2d)
+                    # targets 패딩 맞춤
+                    tgt = b["insert_targets"]
+                    msk = b["insert_mask"]
+                    if tgt.shape[1] < max_ins_len:
+                        pad_len = max_ins_len - tgt.shape[1]
+                        tgt = torch.nn.functional.pad(tgt, (0, pad_len), value=0)
+                        msk = torch.nn.functional.pad(msk, (0, pad_len), value=False)
+                    all_targets.append(tgt)
+                    all_masks.append(msk)
+
+            if all_pos:
+                result["insert_positions"] = torch.cat(all_pos, dim=0)
+                result["insert_targets"] = torch.cat(all_targets, dim=0)
+                result["insert_mask"] = torch.cat(all_masks, dim=0)
+
+        return result
+
+    collate_fn = _collate_hybrid if hybrid_mode else None
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -374,6 +424,7 @@ def train(args):
         drop_last=True,
         prefetch_factor=4 if args.num_workers > 0 else None,
         persistent_workers=args.num_workers > 0,
+        collate_fn=collate_fn,
     )
 
     # 검증 데이터셋
@@ -587,84 +638,123 @@ def train(args):
             edit_tags = batch["edit_tags"].to(device, non_blocking=True)
             pad_mask = batch["pad_mask"].to(device, non_blocking=True)
 
-            # 동적 max_iterations 계산
-            if args.n_iterations == 0:
-                max_iter = int(pad_mask.sum(dim=1).max().item()) // 2
-                max_iter = max(max_iter, 1)
-            else:
-                max_iter = args.n_iterations
-
-            # Iterative refinement 학습 + 샘플별 active 마스킹
-            current_ids = input_ids
-            actual_iters = 0
-            _iter_loss.zero_()
-            B_cur = current_ids.shape[0]
-
             # DDP: 마지막 accum step에서만 gradient sync (중간 step은 no_sync)
             is_last_accum = (accum_step == args.grad_accum_steps - 1)
             ctx = model.no_sync() if (is_distributed and not is_last_accum) else nullcontext()
 
-            with ctx:
-              for it in range(max_iter):
-                if args.compile:
-                    torch.compiler.cudagraph_mark_step_begin()
-                if use_amp:
-                    with torch.amp.autocast("cuda", dtype=amp_dtype):
-                        tag_logits = model(current_ids, pad_mask)
+            if hybrid_mode:
+                # ── 하이브리드: 단일 forward (인코더 + 디코더) ──
+                insert_pos = batch.get("insert_positions")
+                insert_tgt = batch.get("insert_targets")
+                insert_msk = batch.get("insert_mask")
+
+                if insert_pos is not None:
+                    insert_pos = insert_pos.to(device, non_blocking=True)
+                    insert_tgt = insert_tgt.to(device, non_blocking=True)
+                    insert_msk = insert_msk.to(device, non_blocking=True)
+
+                with ctx:
+                    if args.compile:
+                        torch.compiler.cudagraph_mark_step_begin()
+                    if use_amp:
+                        with torch.amp.autocast("cuda", dtype=amp_dtype):
+                            result = model(input_ids, pad_mask, insert_pos, insert_tgt, insert_msk)
+                    else:
+                        result = model(input_ids, pad_mask, insert_pos, insert_tgt, insert_msk)
+
+                    if isinstance(result, tuple):
+                        tag_logits, decoder_logits = result
+                    else:
+                        tag_logits = result
+                        decoder_logits = None
+
+                    # 태그 CE loss
+                    targets = torch.where(pad_mask, edit_tags, _ignore_idx)
+                    tag_loss = criterion(
+                        tag_logits.float().view(-1, config.n_tags),
+                        targets.view(-1),
+                    )
+
+                    # 디코더 CE loss (INSERT 위치만)
+                    dec_loss = torch.zeros(1, device=device)
+                    if decoder_logits is not None and insert_tgt is not None:
+                        dec_targets = insert_tgt.clone()
+                        dec_targets[~insert_msk] = -100
+                        dec_criterion = nn.CrossEntropyLoss(ignore_index=-100)
+                        dec_loss = dec_criterion(
+                            decoder_logits.float().view(-1, config.vocab_size),
+                            dec_targets.view(-1),
+                        )
+
+                    loss = (tag_loss + dec_loss) / args.grad_accum_steps
+                    loss.backward()
+
+                _total_loss += (tag_loss.detach() + dec_loss.detach())
+
+            else:
+                # ── 레거시: iterative refinement ──
+                # 동적 max_iterations 계산
+                if args.n_iterations == 0:
+                    max_iter = int(pad_mask.sum(dim=1).max().item()) // 2
+                    max_iter = max(max_iter, 1)
                 else:
-                    tag_logits = model(current_ids, pad_mask)
+                    max_iter = args.n_iterations
 
-                # 현재 iteration의 태그에 대한 CE loss (PAD → -100)
-                targets = torch.where(pad_mask, edit_tags, _ignore_idx)
+                current_ids = input_ids
+                actual_iters = 0
+                _iter_loss.zero_()
 
-                ce_loss = criterion(
-                    tag_logits.float().view(-1, config.n_tags),
-                    targets.view(-1),
-                )
+                with ctx:
+                  for it in range(max_iter):
+                    if args.compile:
+                        torch.compiler.cudagraph_mark_step_begin()
+                    if use_amp:
+                        with torch.amp.autocast("cuda", dtype=amp_dtype):
+                            tag_logits = model(current_ids, pad_mask)
+                    else:
+                        tag_logits = model(current_ids, pad_mask)
 
-                # 첫 iteration NaN = 모델 손상, 이후 NaN = refinement 문제
-                if it > 0 and ce_loss.isnan():
-                    break
+                    targets = torch.where(pad_mask, edit_tags, _ignore_idx)
+                    ce_loss = criterion(
+                        tag_logits.float().view(-1, config.n_tags),
+                        targets.view(-1),
+                    )
 
-                # grad_accum만 나눔 — iteration 나누기는 후에 gradient 보정
-                loss = ce_loss / args.grad_accum_steps
+                    if it > 0 and ce_loss.isnan():
+                        break
 
-                # Ternary proximity regularization
-                if args.quant_reg_weight > 0:
-                    from model.bitlinear import BitLinear as _BL, quantize_weights_158 as _qw
-                    quant_loss = torch.tensor(0.0, device=device)
-                    for m in raw_model.modules():
-                        if isinstance(m, _BL):
-                            quant_loss = quant_loss + m.quantization_loss()
-                        elif isinstance(m, nn.Linear) and m.weight.requires_grad:
-                            with torch.no_grad():
-                                gamma = m.weight.abs().mean().clamp(min=1e-5)
-                                target = gamma * (m.weight / gamma).clamp(-1.0, 1.0).round()
-                            quant_loss = quant_loss + ((m.weight - target) ** 2).mean()
-                    loss = loss + args.quant_reg_weight * quant_loss
+                    loss = ce_loss / args.grad_accum_steps
 
-                loss.backward()
-                actual_iters += 1
-                _iter_loss += ce_loss.detach()
+                    if args.quant_reg_weight > 0:
+                        from model.bitlinear import BitLinear as _BL, quantize_weights_158 as _qw
+                        quant_loss = torch.tensor(0.0, device=device)
+                        for m in raw_model.modules():
+                            if isinstance(m, _BL):
+                                quant_loss = quant_loss + m.quantization_loss()
+                            elif isinstance(m, nn.Linear) and m.weight.requires_grad:
+                                with torch.no_grad():
+                                    gamma = m.weight.abs().mean().clamp(min=1e-5)
+                                    target = gamma * (m.weight / gamma).clamp(-1.0, 1.0).round()
+                                quant_loss = quant_loss + ((m.weight - target) ** 2).mean()
+                        loss = loss + args.quant_reg_weight * quant_loss
 
-                # 다음 iteration 준비: GPU-native O(N) refinement
-                if it < max_iter - 1:
-                    with torch.no_grad():
-                        pred_tags = tag_logits.argmax(dim=-1)  # (B, T)
+                    loss.backward()
+                    actual_iters += 1
+                    _iter_loss += ce_loss.detach()
 
-                        # Early stopping: 유효 위치 전부 KEEP이면 중단
-                        if (pred_tags[pad_mask] == TAG_KEEP).all():
-                            break
+                    if it < max_iter - 1:
+                        with torch.no_grad():
+                            pred_tags = tag_logits.argmax(dim=-1)
+                            if (pred_tags[pad_mask] == TAG_KEEP).all():
+                                break
+                            current_ids, edit_tags, pad_mask = refinement_step_gpu(
+                                current_ids, pred_tags, edit_tags, pad_mask,
+                                config.vocab_size, config.pad_id,
+                                max_seq_len=config.max_seq_len)
 
-                        # GPU refinement (CPU 전송 없음, max_seq_len으로 truncate)
-                        current_ids, edit_tags, pad_mask = refinement_step_gpu(
-                            current_ids, pred_tags, edit_tags, pad_mask,
-                            config.vocab_size, config.pad_id,
-                            max_seq_len=config.max_seq_len)
-
-            total_iter_count += actual_iters
-            _total_loss += _iter_loss / max(actual_iters, 1)
-            running_iters += actual_iters
+                total_iter_count += actual_iters
+                _total_loss += _iter_loss / max(actual_iters, 1)
+                running_iters += actual_iters
             running_tokens_t += batch["pad_mask"].sum()
             batch_chars = batch["n_chars"].sum().to(device)
             log_chars += batch_chars
@@ -895,6 +985,12 @@ def main():
                         choices=list(TOKENIZER_PRESETS.keys()))
     parser.add_argument("--n_iterations", type=int, default=1,
                         help="최대 iterative refinement 반복 횟수 (0=동적: 배치최장문장//2, 1=단일패스)")
+    parser.add_argument("--hybrid_decoder", action="store_true",
+                        help="하이브리드 모드: INSERT_START + autoregressive 디코더 (iterative refinement 대체)")
+    parser.add_argument("--decoder_n_layers", type=int, default=1,
+                        help="INSERT 디코더 레이어 수")
+    parser.add_argument("--max_insert_len", type=int, default=16,
+                        help="INSERT 디코더 최대 생성 길이")
 
     # 데이터
     parser.add_argument("--corpus", type=str, nargs="+", required=True)
