@@ -79,6 +79,12 @@ class DenseEditorConfig:
     # 양자화 모드
     int8_qat: bool = False            # True: BitLinear(ternary) → Int8Linear(INT8 QAT)
 
+    # 하이브리드 디코더 (INSERT autoregressive 생성)
+    hybrid_decoder: bool = False       # True: INSERT_START + Mamba2 디코더
+    decoder_n_layers: int = 1          # 디코더 레이어 수
+    max_insert_len: int = 16           # 최대 삽입 시퀀스 길이
+    eos_id: int = 3                    # 삽입 시퀀스 종료 토큰
+
     def save(self, path: str) -> None:
         """설정을 JSON 파일로 저장"""
         with open(path, "w", encoding="utf-8") as f:
@@ -98,8 +104,13 @@ class DenseEditorConfig:
             f"d_model({self.d_model})은 n_heads({self.n_heads})로 나누어떨어져야 함"
         assert self.d_model // self.n_heads == self.headdim, \
             f"headdim({self.headdim})은 d_model//n_heads({self.d_model // self.n_heads})이어야 함"
-        assert self.n_tags == 2 + 2 * self.vocab_size, \
-            f"n_tags({self.n_tags})는 2 + 2*vocab_size({2 + 2 * self.vocab_size})이어야 함"
+        if self.hybrid_decoder:
+            expected_tags = 3 + self.vocab_size  # KEEP + DELETE + REPLACE_x(V) + INSERT_START
+            assert self.n_tags == expected_tags, \
+                f"hybrid n_tags({self.n_tags})는 3+vocab_size({expected_tags})이어야 함"
+        else:
+            assert self.n_tags == 2 + 2 * self.vocab_size, \
+                f"n_tags({self.n_tags})는 2 + 2*vocab_size({2 + 2 * self.vocab_size})이어야 함"
         valid_types = {"mamba", "mamba2", "fnet", "tcn", "rwkv", "retnet", "xlstm", "xlstm_mamba", "mlstm", "attention", "hybrid"}
         assert self.mixing_type in valid_types, \
             f"mixing_type '{self.mixing_type}'은 {valid_types} 중 하나여야 함"
@@ -215,6 +226,10 @@ def make_config(
     if mixing_type in ("attention", "hybrid"):
         kwargs.setdefault("attn_n_kv_heads", 4)
     kwargs.update(overrides)
+    # 하이브리드 디코더 모드: n_tags 자동 계산
+    if kwargs.get("hybrid_decoder", False):
+        vs = kwargs.get("vocab_size", 303)
+        kwargs["n_tags"] = 3 + vs  # KEEP + DELETE + REPLACE_x(V) + INSERT_START
     return DenseEditorConfig(**kwargs)
 
 

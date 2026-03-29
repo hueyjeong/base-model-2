@@ -3,12 +3,14 @@
 Levenshtein 정렬을 사용하여 소스 → 타겟 간 편집 태그를 생성하고 적용한다.
 
 태그 ID 체계 (vocab_size = V):
-    KEEP      = 0
-    DELETE    = 1
-    REPLACE_x = 2 .. V+1        (V개, x는 대체할 토큰 ID)
-    INSERT_x  = V+2 .. 2V+1     (V개, x는 삽입할 토큰 ID)
+    KEEP         = 0
+    DELETE       = 1
+    REPLACE_x    = 2 .. V+1        (V개, x는 대체할 토큰 ID)
+    INSERT_x     = V+2 .. 2V+1     (V개, x는 삽입할 토큰 ID) — 레거시 호환
+    INSERT_START = V+2             (하이브리드 모드: 디코더가 삽입 토큰 결정)
 
-총 태그 수: 2 + 2V
+레거시 모드: n_tags = 2 + 2V (INSERT_x 개별 태그)
+하이브리드 모드: n_tags = 2 + V + 1 = V + 3 (INSERT_START 단일 태그)
 """
 from __future__ import annotations
 
@@ -18,6 +20,16 @@ import torch
 # 태그 상수
 TAG_KEEP = 0
 TAG_DELETE = 1
+
+
+def tag_insert_start(vocab_size: int) -> int:
+    """INSERT_START 태그 ID (하이브리드 모드)"""
+    return 2 + vocab_size
+
+
+def n_tags_hybrid(vocab_size: int) -> int:
+    """하이브리드 모드 태그 수: KEEP + DELETE + REPLACE_x(V) + INSERT_START"""
+    return 3 + vocab_size
 
 
 def tag_replace(token_id: int, vocab_size: int) -> int:
@@ -128,6 +140,97 @@ def compute_edit_tags(
                 insert_used.add(ins_at)
 
     return tags
+
+
+def compute_edit_tags_hybrid(
+    source_ids: list[int],
+    target_ids: list[int],
+    vocab_size: int,
+    eos_id: int = 3,
+) -> tuple[list[int], dict[int, list[int]]]:
+    """Levenshtein DP → 하이브리드 태그 (INSERT_START + 삽입 시퀀스)
+
+    기존 compute_edit_tags와 동일한 DP/backtrace를 사용하되,
+    INSERT_x 대신 INSERT_START 태그 + 위치별 삽입 시퀀스를 반환한다.
+    한 위치에 여러 토큰 삽입이 필요하면 전부 해당 위치의 시퀀스에 포함.
+
+    Args:
+        source_ids: 소스 토큰 ID 시퀀스
+        target_ids: 타겟 토큰 ID 시퀀스
+        vocab_size: 어휘 크기
+        eos_id: 삽입 시퀀스 종료 토큰
+
+    Returns:
+        tags: 소스 길이만큼의 태그 리스트 (KEEP/DELETE/REPLACE_x/INSERT_START)
+        insert_seqs: {위치: [토큰1, 토큰2, ..., eos_id]} 삽입 시퀀스
+    """
+    INSERT_START = tag_insert_start(vocab_size)
+    n = len(source_ids)
+    m = len(target_ids)
+
+    # Levenshtein DP (compute_edit_tags와 동일)
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n + 1):
+        dp[i][0] = i
+    for j in range(m + 1):
+        dp[0][j] = j
+    for i in range(1, n + 1):
+        for j in range(1, m + 1):
+            if source_ids[i - 1] == target_ids[j - 1]:
+                dp[i][j] = dp[i - 1][j - 1]
+            else:
+                dp[i][j] = 1 + min(
+                    dp[i - 1][j],
+                    dp[i][j - 1],
+                    dp[i - 1][j - 1],
+                )
+
+    # Backtrace
+    ops: list[tuple[str, int, int]] = []
+    i, j = n, m
+    while i > 0 or j > 0:
+        if i > 0 and j > 0 and source_ids[i - 1] == target_ids[j - 1]:
+            ops.append(("match", i - 1, -1))
+            i -= 1; j -= 1
+        elif i > 0 and j > 0 and dp[i][j] == dp[i - 1][j - 1] + 1:
+            ops.append(("sub", i - 1, target_ids[j - 1]))
+            i -= 1; j -= 1
+        elif j > 0 and dp[i][j] == dp[i][j - 1] + 1:
+            ops.append(("ins", i, target_ids[j - 1]))
+            j -= 1
+        elif i > 0 and dp[i][j] == dp[i - 1][j] + 1:
+            ops.append(("del", i - 1, -1))
+            i -= 1
+        else:
+            break
+    ops.reverse()
+
+    # 연산 → 태그 + 삽입 시퀀스
+    tags = [TAG_KEEP] * n
+    insert_seqs: dict[int, list[int]] = {}
+
+    for op, src_idx, tgt_token in ops:
+        if op == "match":
+            pass
+        elif op == "sub":
+            tags[src_idx] = tag_replace(tgt_token, vocab_size)
+        elif op == "del":
+            tags[src_idx] = TAG_DELETE
+        elif op == "ins":
+            # 삽입 위치: src_idx 직전 (src_idx-1)
+            ins_at = max(0, src_idx - 1)
+            if ins_at not in insert_seqs:
+                # 첫 삽입: INSERT_START 태그 설정 (KEEP 위치만)
+                if tags[ins_at] == TAG_KEEP:
+                    tags[ins_at] = INSERT_START
+                insert_seqs[ins_at] = []
+            insert_seqs[ins_at].append(tgt_token)
+
+    # 삽입 시퀀스에 EOS 추가
+    for pos in insert_seqs:
+        insert_seqs[pos].append(eos_id)
+
+    return tags, insert_seqs
 
 
 def apply_edit_tags(

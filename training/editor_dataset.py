@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from tokenizer_base import BaseTokenizer
 from training.noising import DenoisingNoiser
 from model.edit_tags import compute_edit_tags as _compute_edit_tags_py, TAG_KEEP
+from model.edit_tags import compute_edit_tags_hybrid as _compute_edit_tags_hybrid_py
 
 # C++ Levenshtein 가속 (DataLoader 워커에서도 사용 가능)
 _lev_ext = None
@@ -88,6 +89,8 @@ class EditorDataset(IterableDataset):
         rank: int = 0,
         world_size: int = 1,
         pack: bool = True,
+        hybrid_decoder: bool = False,
+        max_insert_len: int = 16,
     ):
         self.file_paths = [file_paths] if isinstance(file_paths, str) else list(file_paths)
         self.tokenizer = tokenizer
@@ -106,6 +109,8 @@ class EditorDataset(IterableDataset):
         self._last_file_order: list[str] = []
         self._resume_file_order: list[str] | None = None
         self.pack = pack
+        self.hybrid_decoder = hybrid_decoder
+        self.max_insert_len = max_insert_len
 
     def state_dict(self) -> dict:
         return {
@@ -166,10 +171,10 @@ class EditorDataset(IterableDataset):
                     line_idx += 1
 
     def _tokenize_pair(self, text: str, lang: str | None):
-        """텍스트 → (noised_ids, edit_tags, original_ids) 변환 (패딩 없음)
+        """텍스트 → (noised_ids, edit_tags, original_ids[, insert_seqs]) 변환
 
         BOS/EOS로 감싸서 문서 경계를 표시한다.
-        RWKV state 리셋 + SharedLinearSelfAttention 문서 격리에 사용.
+        hybrid_decoder 모드에서는 INSERT_START + 삽입 시퀀스도 반환.
         """
         if lang is None:
             lang = self.noiser._detect_lang(text)
@@ -188,7 +193,13 @@ class EditorDataset(IterableDataset):
         noised_ids = noised_ids[:max_content]
         original_ids = original_ids[:max_content]
 
-        tags = compute_edit_tags(noised_ids, original_ids, self.vocab_size)
+        if self.hybrid_decoder:
+            tags, insert_seqs = _compute_edit_tags_hybrid_py(
+                noised_ids, original_ids, self.vocab_size,
+                eos_id=self.tokenizer.eos_id)
+        else:
+            tags = compute_edit_tags(noised_ids, original_ids, self.vocab_size)
+            insert_seqs = None
 
         # BOS/EOS 감싸기 — 문서 경계 표시
         bos_id = self.tokenizer.bos_id
@@ -196,6 +207,11 @@ class EditorDataset(IterableDataset):
         noised_ids = [bos_id] + noised_ids + [eos_id]
         tags = [TAG_KEEP] + tags + [TAG_KEEP]
         original_ids = [bos_id] + original_ids + [eos_id]
+
+        if self.hybrid_decoder and insert_seqs is not None:
+            # BOS 추가로 위치가 1 증가 → insert_seqs 키 보정
+            shifted_seqs = {k + 1: v for k, v in insert_seqs.items()}
+            return noised_ids, tags, original_ids, shifted_seqs
 
         return noised_ids, tags, original_ids
 
@@ -217,20 +233,41 @@ class EditorDataset(IterableDataset):
             "_line_counter": self._line_counter,
         }
 
-    def _make_packed_sample(self, buf_input, buf_tags, n_chars):
+    def _make_packed_sample(self, buf_input, buf_tags, n_chars, insert_seqs=None):
         """패킹된 버퍼를 max_seq_len으로 패딩하여 dict 반환"""
         seq_len = len(buf_input)
         pad_len = self.max_seq_len - seq_len
         pad_id = self.tokenizer.pad_id
 
-        return {
+        sample = {
             "input_ids": torch.tensor(buf_input + [pad_id] * pad_len, dtype=torch.long),
             "edit_tags": torch.tensor(buf_tags + [TAG_KEEP] * pad_len, dtype=torch.long),
             "pad_mask": torch.tensor([True] * seq_len + [False] * pad_len, dtype=torch.bool),
-            "original_ids": torch.zeros(self.max_seq_len, dtype=torch.long),  # 패킹 시 미사용
+            "original_ids": torch.zeros(self.max_seq_len, dtype=torch.long),
             "n_chars": n_chars,
             "_line_counter": self._line_counter,
         }
+
+        # 하이브리드: INSERT 위치 + 삽입 시퀀스
+        if insert_seqs:
+            positions = sorted(insert_seqs.keys())
+            max_ins_len = max(len(insert_seqs[p]) for p in positions)
+            max_ins_len = min(max_ins_len, self.max_insert_len)
+
+            ins_positions = torch.tensor(positions, dtype=torch.long)
+            ins_targets = torch.full((len(positions), max_ins_len), pad_id, dtype=torch.long)
+            ins_mask = torch.zeros(len(positions), max_ins_len, dtype=torch.bool)
+
+            for i, pos in enumerate(positions):
+                seq = insert_seqs[pos][:max_ins_len]
+                ins_targets[i, :len(seq)] = torch.tensor(seq, dtype=torch.long)
+                ins_mask[i, :len(seq)] = True
+
+            sample["insert_positions"] = ins_positions
+            sample["insert_targets"] = ins_targets
+            sample["insert_mask"] = ins_mask
+
+        return sample
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
@@ -273,6 +310,7 @@ class EditorDataset(IterableDataset):
         buf_input = []
         buf_tags = []
         buf_chars = 0
+        buf_insert_seqs = {}
 
         for i, (text, lang) in enumerate(self._iter_lines(
                 skip_worker_id=global_worker_id, skip_total=total_workers)):
@@ -286,26 +324,42 @@ class EditorDataset(IterableDataset):
             if result is None:
                 continue
 
-            noised_ids, tags, _ = result
+            if self.hybrid_decoder and len(result) == 4:
+                noised_ids, tags, _, insert_seqs = result
+            else:
+                noised_ids, tags, _ = result
+                insert_seqs = None
+
             remaining = self.max_seq_len - len(buf_input)
 
             if len(noised_ids) > remaining:
                 # 버퍼 방출
                 if buf_input:
-                    yield self._make_packed_sample(buf_input, buf_tags, buf_chars)
+                    yield self._make_packed_sample(buf_input, buf_tags, buf_chars,
+                                                   buf_insert_seqs if self.hybrid_decoder else None)
                 buf_input = []
                 buf_tags = []
                 buf_chars = 0
+                buf_insert_seqs = {}
 
             # 버퍼에 추가 (max_seq_len 초과 시 truncate)
-            remaining = self.max_seq_len - len(buf_input)
+            offset = len(buf_input)
+            remaining = self.max_seq_len - offset
             buf_input.extend(noised_ids[:remaining])
             buf_tags.extend(tags[:remaining])
             buf_chars += len(text)
 
+            # hybrid: insert_seqs 위치를 packed buffer 내 절대 위치로 변환
+            if self.hybrid_decoder and insert_seqs:
+                for pos, seq in insert_seqs.items():
+                    abs_pos = offset + pos
+                    if abs_pos < self.max_seq_len:
+                        buf_insert_seqs[abs_pos] = seq
+
         # 잔여 버퍼 방출
         if buf_input:
-            yield self._make_packed_sample(buf_input, buf_tags, buf_chars)
+            yield self._make_packed_sample(buf_input, buf_tags, buf_chars,
+                                           buf_insert_seqs if self.hybrid_decoder else None)
 
 
 if __name__ == "__main__":
