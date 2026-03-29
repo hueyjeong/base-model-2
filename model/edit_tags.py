@@ -220,9 +220,10 @@ def compute_edit_tags_hybrid(
             # 삽입 위치: src_idx 직전 (src_idx-1)
             ins_at = max(0, src_idx - 1)
             if ins_at not in insert_seqs:
-                # 첫 삽입: INSERT_START 태그 설정 (KEEP 위치만)
-                if tags[ins_at] == TAG_KEEP:
-                    tags[ins_at] = INSERT_START
+                # INSERT_START 태그 설정 (KEEP 위치만 — REPLACE 등이면 삽입 불가)
+                if tags[ins_at] != TAG_KEEP:
+                    continue  # 이 위치에 INSERT 불가 → 건너뜀
+                tags[ins_at] = INSERT_START
                 insert_seqs[ins_at] = []
             insert_seqs[ins_at].append(tgt_token)
 
