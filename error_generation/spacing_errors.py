@@ -213,60 +213,79 @@ def _dynamic_spacing_error(text: str, rng: random.Random) -> Optional[str]:
     if len(words) < 2:
         return None
 
-    strategy = rng.choice(["join", "join", "split", "dep_noun"])  # join 빈도 2배
+    # MeCab 기반 전략: 공백 제거(join)와 공백 삽입(split) 후보를 먼저 수집
+    try:
+        from error_generation.utils import get_mecab_offsets
+        tokens = get_mecab_offsets(text)
+    except Exception:
+        tokens = None
 
-    if strategy == "join":
-        # 어절 합치기: 랜덤 위치에서 인접 어절 결합
-        idx = rng.randrange(len(words) - 1)
-        merged = list(words)
-        merged[idx] = merged[idx] + merged.pop(idx + 1)
-        return " ".join(merged)
+    # ── 공백 제거 후보 (띄어 쓴 곳을 붙이기) ──
+    join_candidates = []
+    if tokens:
+        for i, t in enumerate(tokens):
+            if t.start > 0 and text[t.start - 1] == ' ':
+                pos_tag = t.pos.split('+')[0]
+                # 의존명사 앞: "먹을 거야" → "먹을거야"
+                if pos_tag == 'NNB':
+                    join_candidates.append((t.start - 1, 3))   # 가중치 3
+                # 보조용언 앞: "해 주세요" → "해주세요"
+                elif pos_tag == 'VX':
+                    join_candidates.append((t.start - 1, 3))
+                # 단위명사 앞: "몇 년" → "몇년"
+                elif pos_tag == 'NNBC':
+                    join_candidates.append((t.start - 1, 2))
+                # 접미사 앞: 붙여야 함
+                elif pos_tag in ('XSN', 'XSV', 'XSA'):
+                    join_candidates.append((t.start - 1, 2))
+                # 일반 어절 합치기 (낮은 가중치)
+                else:
+                    join_candidates.append((t.start - 1, 1))
 
-    elif strategy == "split":
-        # 어절 내부 쪼개기: MeCab 형태소 경계에서 공백 삽입
-        try:
-            from error_generation.utils import get_mecab_offsets
-            tokens = get_mecab_offsets(text)
-        except Exception:
-            return None
-
-        # 같은 어절 내 인접 형태소 경계 찾기
-        split_candidates = []
+    # ── 공백 삽입 후보 (붙여 쓴 곳을 띄우기) ──
+    split_candidates = []
+    if tokens:
         for i in range(len(tokens) - 1):
             t1, t2 = tokens[i], tokens[i + 1]
-            # 공백 없이 붙어있는 형태소 쌍 (같은 어절)
             if t1.end == t2.start and len(t1.surface) > 0 and len(t2.surface) > 0:
-                # 명사+조사 또는 어간+어미 경계
-                if (t1.pos.startswith('N') and t2.pos.startswith('J')) or \
-                   (t1.pos.startswith('V') and t2.pos.startswith('E')):
+                p1 = t1.pos.split('+')[-1]  # 마지막 복합 태그
+                p2 = t2.pos.split('+')[0]   # 첫 복합 태그
+                # 명사+조사, 어간+어미 경계
+                if (p1.startswith('N') and p2.startswith('J')) or \
+                   (p1.startswith('V') and p2.startswith('E')) or \
+                   (p1.startswith('E') and p2.startswith('V')) or \
+                   (p1.startswith('N') and p2.startswith('X')):
                     split_candidates.append(t1.end)
 
-        if not split_candidates:
-            return None
+    # 전략 선택: join 60%, split 40% (공백 제거가 더 흔한 오류)
+    has_join = len(join_candidates) > 0
+    has_split = len(split_candidates) > 0
 
+    if not has_join and not has_split:
+        # fallback: 단순 어절 합치기
+        if len(words) >= 2:
+            idx = rng.randrange(len(words) - 1)
+            merged = list(words)
+            merged[idx] = merged[idx] + merged.pop(idx + 1)
+            return " ".join(merged)
+        return None
+
+    if has_join and has_split:
+        strategy = "join" if rng.random() < 0.6 else "split"
+    elif has_join:
+        strategy = "join"
+    else:
+        strategy = "split"
+
+    if strategy == "join":
+        # 가중치 기반 선택
+        positions = [c[0] for c in join_candidates]
+        weights = [c[1] for c in join_candidates]
+        [pos] = rng.choices(positions, weights=weights, k=1)
+        return text[:pos] + text[pos + 1:]
+    else:
         pos = rng.choice(split_candidates)
         return text[:pos] + " " + text[pos:]
-
-    elif strategy == "dep_noun":
-        # 의존명사(NNB) 앞 공백 제거: "할 수" → "할수"
-        try:
-            from error_generation.utils import get_mecab_offsets
-            tokens = get_mecab_offsets(text)
-        except Exception:
-            return None
-
-        dep_noun_candidates = []
-        for i, t in enumerate(tokens):
-            if t.pos == 'NNB' and t.start > 0 and text[t.start - 1] == ' ':
-                dep_noun_candidates.append(t.start - 1)
-
-        if not dep_noun_candidates:
-            return None
-
-        pos = rng.choice(dep_noun_candidates)
-        return text[:pos] + text[pos + 1:]
-
-    return None
 
 
 def apply_spacing_error(text: str, rng: random.Random) -> Optional[str]:
