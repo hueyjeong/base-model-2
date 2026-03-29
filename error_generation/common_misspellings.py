@@ -4,6 +4,8 @@
 올바른 표현 → 흔히 사용하는 잘못된 표현으로의 치환 딕셔너리를 기반으로 동작.
 """
 
+import json
+import os
 import random
 from typing import Optional
 
@@ -456,6 +458,22 @@ MISSPELLING_MAP: dict[str, list[str]] = {
     "블록": ["블럭"],
     "스케줄": ["스케쥴"],
 }
+
+# NIKL PARA 전수 분석 자동 추출 사전 (5,751키, 9,282변형)
+_NIKL_DICT_PATH = os.path.join(os.path.dirname(__file__), "nikl_para_misspellings.json")
+if os.path.exists(_NIKL_DICT_PATH):
+    with open(_NIKL_DICT_PATH, encoding="utf-8") as _f:
+        _nikl_dict = json.load(_f)
+    for _correct, _wrongs in _nikl_dict.items():
+        if _correct in MISSPELLING_MAP:
+            # 기존에 있으면 병합 (중복 제거)
+            existing = set(MISSPELLING_MAP[_correct])
+            for w in _wrongs:
+                if w not in existing:
+                    MISSPELLING_MAP[_correct].append(w)
+        else:
+            MISSPELLING_MAP[_correct] = _wrongs
+    del _nikl_dict
 
 
 import re
