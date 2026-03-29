@@ -226,17 +226,24 @@ def _dynamic_spacing_error(text: str, rng: random.Random) -> Optional[str]:
         for i, t in enumerate(tokens):
             if t.start > 0 and text[t.start - 1] == ' ':
                 pos_tag = t.pos.split('+')[0]
+                prev_pos = tokens[i - 1].pos.split('+')[-1] if i > 0 else ''
                 # 의존명사 앞: "먹을 거야" → "먹을거야"
                 if pos_tag == 'NNB':
-                    join_candidates.append((t.start - 1, 3))   # 가중치 3
+                    join_candidates.append((t.start - 1, 4))
                 # 보조용언 앞: "해 주세요" → "해주세요"
                 elif pos_tag == 'VX':
-                    join_candidates.append((t.start - 1, 3))
+                    join_candidates.append((t.start - 1, 4))
                 # 단위명사 앞: "몇 년" → "몇년"
                 elif pos_tag == 'NNBC':
-                    join_candidates.append((t.start - 1, 2))
+                    join_candidates.append((t.start - 1, 3))
                 # 접미사 앞: 붙여야 함
                 elif pos_tag in ('XSN', 'XSV', 'XSA'):
+                    join_candidates.append((t.start - 1, 3))
+                # 부사 + 동사/형용사: "빨리 해" → "빨리해"
+                elif prev_pos == 'MAG' and pos_tag in ('VV', 'VA'):
+                    join_candidates.append((t.start - 1, 2))
+                # 명사 + 동사화접미사(이미 어절): "공부 하다" → "공부하다"
+                elif prev_pos.startswith('N') and pos_tag == 'XSV':
                     join_candidates.append((t.start - 1, 2))
                 # 일반 어절 합치기 (낮은 가중치)
                 else:
@@ -250,16 +257,35 @@ def _dynamic_spacing_error(text: str, rng: random.Random) -> Optional[str]:
             if t1.end == t2.start and len(t1.surface) > 0 and len(t2.surface) > 0:
                 p1 = t1.pos.split('+')[-1]  # 마지막 복합 태그
                 p2 = t2.pos.split('+')[0]   # 첫 복합 태그
-                # 명사+조사, 어간+어미 경계
-                if (p1.startswith('N') and p2.startswith('J')) or \
-                   (p1.startswith('V') and p2.startswith('E')) or \
-                   (p1.startswith('E') and p2.startswith('V')) or \
-                   (p1.startswith('N') and p2.startswith('X')):
-                    split_candidates.append(t1.end)
+                weight = 1
+                # 명사+조사: "아이들이" → "아이들 이"
+                if p1.startswith('N') and p2.startswith('J'):
+                    weight = 2
+                # 어간+어미: "먹었다" → "먹 었다"
+                elif p1.startswith('V') and p2.startswith('E'):
+                    weight = 2
+                # 어미+보조용언: "먹고있다" → "먹고 있다"
+                elif p1.startswith('E') and p2.startswith('V'):
+                    weight = 2
+                # 명사+접미사: "아이들" → "아이 들"
+                elif p1.startswith('N') and p2.startswith('X'):
+                    weight = 3
+                # 명사+동사화접미사: "공부하다" → "공부 하다"
+                elif p1.startswith('N') and p2 == 'XSV':
+                    weight = 3
+                # 용언+선어말어미: "먹었" → "먹 었"
+                elif p1.startswith('V') and p2 == 'EP':
+                    weight = 1
+                # 종결어미 앞: "걸려요" → "걸려 요"
+                elif p2 == 'EF':
+                    weight = 2
+                else:
+                    continue
+                split_candidates.append((t1.end, weight))
 
     # 전략 선택: join 60%, split 40% (공백 제거가 더 흔한 오류)
-    has_join = len(join_candidates) > 0
-    has_split = len(split_candidates) > 0
+    has_join = bool(join_candidates)
+    has_split = bool(split_candidates)
 
     if not has_join and not has_split:
         # fallback: 단순 어절 합치기
@@ -278,13 +304,14 @@ def _dynamic_spacing_error(text: str, rng: random.Random) -> Optional[str]:
         strategy = "split"
 
     if strategy == "join":
-        # 가중치 기반 선택
         positions = [c[0] for c in join_candidates]
         weights = [c[1] for c in join_candidates]
         [pos] = rng.choices(positions, weights=weights, k=1)
         return text[:pos] + text[pos + 1:]
     else:
-        pos = rng.choice(split_candidates)
+        positions = [c[0] for c in split_candidates]
+        weights = [c[1] for c in split_candidates]
+        [pos] = rng.choices(positions, weights=weights, k=1)
         return text[:pos] + " " + text[pos:]
 
 
