@@ -445,6 +445,8 @@ def train(args):
             rank=global_rank,
             world_size=world_size,
             pack=False,
+            hybrid_decoder=hybrid_mode,
+            max_insert_len=getattr(config, 'max_insert_len', 16),
         )
         val_loader = DataLoader(
             val_dataset,
@@ -454,6 +456,7 @@ def train(args):
             drop_last=True,
             prefetch_factor=4,
             persistent_workers=True,
+            collate_fn=collate_fn,
         )
 
     if global_rank == 0:

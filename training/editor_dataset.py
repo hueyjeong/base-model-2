@@ -298,7 +298,11 @@ class EditorDataset(IterableDataset):
 
             result = self._tokenize_pair(text, lang)
             if result is not None:
-                noised_ids, tags, original_ids = result
+                if self.hybrid_decoder and len(result) == 4:
+                    noised_ids, tags, original_ids, insert_seqs = result
+                else:
+                    noised_ids, tags, original_ids = result
+                    insert_seqs = None
                 yield self._make_padded_sample(noised_ids, tags, original_ids, len(text))
 
     def _iter_packed(self, global_worker_id, total_workers):
