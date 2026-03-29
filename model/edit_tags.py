@@ -203,6 +203,121 @@ def compute_edit_tags_batch(
     return tags_batch
 
 
+# ── GPU-native iterative refinement (O(N) tag composition, CPU 전송 없음) ──
+
+def refinement_step_gpu(
+    current_ids: torch.Tensor,
+    pred_tags: torch.Tensor,
+    edit_tags: torch.Tensor,
+    pad_mask: torch.Tensor,
+    vocab_size: int,
+    pad_id: int = 0,
+    max_seq_len: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """GPU-native refinement: apply tags + O(N) tag composition (Levenshtein 불필요)
+
+    pred_tags를 적용하여 modified를 생성하고, old edit_tags와 비교하여
+    다음 iteration의 정답 태그를 O(N)으로 계산한다.
+
+    Args:
+        current_ids: (B, T) 현재 입력 토큰
+        pred_tags:   (B, T) 모델 예측 태그
+        edit_tags:   (B, T) 현재 정답 태그
+        pad_mask:    (B, T) bool
+        vocab_size:  어휘 크기
+        pad_id:      패딩 토큰 ID
+        max_seq_len: 출력 최대 길이 (None=무제한, 패킹 시 고정 길이 유지)
+
+    Returns:
+        modified:  (B, T') 수정된 토큰
+        new_tags:  (B, T') 다음 iteration 정답 태그
+        new_mask:  (B, T') bool
+    """
+    B, T = current_ids.shape
+    device = current_ids.device
+
+    is_del_pred = (pred_tags == TAG_DELETE)
+    is_ins_pred = (pred_tags >= 2 + vocab_size)
+    is_rep_pred = (pred_tags >= 2) & (pred_tags < 2 + vocab_size)
+
+    is_del_old = (edit_tags == TAG_DELETE)
+    is_ins_old = (edit_tags >= 2 + vocab_size)
+    is_rep_old = (edit_tags >= 2) & (edit_tags < 2 + vocab_size)
+
+    # ── 출력 위치 계산 (cumsum) ──
+    out_count = torch.ones(B, T, dtype=torch.long, device=device)
+    out_count[is_del_pred] = 0
+    out_count[is_ins_pred] = 2
+    out_count[~pad_mask] = 0
+
+    out_pos = out_count.cumsum(dim=1) - out_count
+    max_out = int(out_count.sum(dim=1).max().item())
+    if max_seq_len is not None:
+        max_out = min(max_out, max_seq_len)
+    max_out = max(max_out, 1)
+
+    modified = torch.full((B, max_out), pad_id, dtype=torch.long, device=device)
+    new_tags = torch.full((B, max_out), TAG_KEEP, dtype=torch.long, device=device)
+    new_mask = torch.zeros(B, max_out, dtype=torch.bool, device=device)
+
+    batch_idx = torch.arange(B, device=device).unsqueeze(1).expand_as(current_ids)
+    valid_A = pad_mask & ~is_del_pred
+
+    # ── Position A: 메인 토큰 + 태그 ──
+
+    # 실제 토큰 (pred 적용 결과)
+    actual_A = current_ids.clone()
+    actual_A[is_rep_pred] = pred_tags[is_rep_pred] - 2
+
+    # 목표 토큰 (old_tag이 지시하는 정답): KEEP/INSERT→current, REPLACE_x→x
+    target_A = current_ids.clone()
+    target_A[is_rep_old] = edit_tags[is_rep_old] - 2
+
+    # 태그 결정
+    tag_A = torch.full_like(edit_tags, TAG_KEEP)
+    tag_A[is_del_old] = TAG_DELETE
+    mismatch = (actual_A != target_A) & ~is_del_old & pad_mask
+    tag_A[mismatch] = 2 + target_A[mismatch]
+    # old=INSERT_z이고 pred가 INSERT가 아님 → INSERT 보존
+    ins_not_done = is_ins_old & ~is_ins_pred & (tag_A == TAG_KEEP) & pad_mask
+    tag_A[ins_not_done] = edit_tags[ins_not_done]
+
+    # scatter (max_out 범위 내만)
+    pos_A = out_pos[valid_A]
+    in_range_A = pos_A < max_out
+    if in_range_A.any():
+        modified[batch_idx[valid_A][in_range_A], pos_A[in_range_A]] = actual_A[valid_A][in_range_A]
+        new_tags[batch_idx[valid_A][in_range_A], pos_A[in_range_A]] = tag_A[valid_A][in_range_A]
+        new_mask[batch_idx[valid_A][in_range_A], pos_A[in_range_A]] = True
+
+    # ── Position B: INSERT 추가 토큰 + 태그 ──
+    ins_mask = is_ins_pred & pad_mask
+    if ins_mask.any():
+        ins_token = pred_tags[ins_mask] - 2 - vocab_size
+        ins_pos = out_pos[ins_mask] + 1
+
+        # 기본: 불필요한 삽입 → DELETE
+        tag_B = torch.full_like(ins_token, TAG_DELETE)
+        old_was_ins = is_ins_old[ins_mask]
+        if old_was_ins.any():
+            old_ins_token = edit_tags[ins_mask][old_was_ins] - 2 - vocab_size
+            actual_ins = ins_token[old_was_ins]
+            correct = (actual_ins == old_ins_token)
+            tag_B[old_was_ins] = torch.where(
+                correct,
+                torch.zeros_like(old_ins_token),   # KEEP
+                2 + old_ins_token,                  # REPLACE_z
+            )
+
+        in_range_B = ins_pos < max_out
+        if in_range_B.any():
+            modified[batch_idx[ins_mask][in_range_B], ins_pos[in_range_B]] = ins_token[in_range_B]
+            new_tags[batch_idx[ins_mask][in_range_B], ins_pos[in_range_B]] = tag_B[in_range_B]
+            new_mask[batch_idx[ins_mask][in_range_B], ins_pos[in_range_B]] = True
+
+    return modified, new_tags, new_mask
+
+
 if __name__ == "__main__":
     # 기본 테스트
     vocab_size = 303

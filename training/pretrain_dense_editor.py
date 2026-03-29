@@ -45,7 +45,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from model.dense_editor_config import DenseEditorConfig, make_config
 from model.dense_editor import DenseEditor
-from model.edit_tags import compute_edit_tags, apply_edit_tags, TAG_KEEP
+from model.edit_tags import compute_edit_tags, apply_edit_tags, TAG_KEEP, refinement_step_gpu
 from training.noising import DenoisingNoiser, NoiseConfig
 from training.editor_dataset import EditorDataset
 from training.upload_gdrive import upload_and_cleanup
@@ -354,8 +354,7 @@ def train(args):
         use_korean_errors=True,
     )
 
-    # 데이터셋 — n_iterations > 1이면 패킹 비활성 (per-doc original_ids 필요)
-    use_pack = (args.n_iterations <= 1)
+    # 데이터셋 — 패킹 항상 활성 (GPU refinement로 original_ids 불필요)
     dataset = EditorDataset(
         args.corpus, tokenizer, noiser,
         vocab_size=tokenizer.vocab_size,
@@ -365,7 +364,7 @@ def train(args):
         seed=args.seed,
         rank=global_rank,
         world_size=world_size,
-        pack=use_pack,
+        pack=True,
     )
     loader = DataLoader(
         dataset,
@@ -474,6 +473,18 @@ def train(args):
 
         del ckpt
         gc.collect()
+    elif args.init_weights:
+        ckpt = torch.load(args.init_weights, map_location=device, weights_only=False)
+        state_dict = ckpt.get("model", ckpt)
+        missing, unexpected = raw_model.load_state_dict(state_dict, strict=False)
+        if global_rank == 0:
+            print(f"\n사전학습 가중치 로드: {args.init_weights}")
+            if missing:
+                print(f"  missing keys ({len(missing)}): {missing[:3]}...")
+            if unexpected:
+                print(f"  unexpected keys ({len(unexpected)}): {unexpected[:3]}...")
+        del ckpt, state_dict
+        gc.collect()
 
     # 학습 루프
     if global_rank == 0:
@@ -481,7 +492,8 @@ def train(args):
         print(f"\n학습 시작: step {start_step} → {args.max_steps}{epoch_str}")
         print(f"  batch_size={args.batch_size}, grad_accum={args.grad_accum_steps}")
         print(f"  lr={args.lr}, warmup={args.warmup_steps}")
-        print(f"  n_iterations={args.n_iterations}")
+        iter_desc = "동적 (배치최장//2)" if args.n_iterations == 0 else str(args.n_iterations)
+        print(f"  n_iterations={iter_desc} (early stopping + active 마스킹)")
         print()
 
     model.train()
@@ -503,6 +515,7 @@ def train(args):
     total_chars = torch.zeros(1, dtype=torch.long, device=device) + restored_total_chars
     _total_loss = torch.zeros(1, device=device)
     _iter_loss = torch.zeros(1, device=device)
+    running_iters = torch.zeros(1, device=device)
     _ignore_idx = torch.tensor(-100, dtype=torch.long, device=device)
     _max_line_counter = 0  # worker→main _line_counter 추적
     _current_epoch = 0
@@ -544,6 +557,7 @@ def train(args):
         optimizer.zero_grad(set_to_none=True)
 
         _total_loss.zero_()
+        total_iter_count = 0
 
         for accum_step in range(args.grad_accum_steps):
             try:
@@ -572,22 +586,28 @@ def train(args):
             input_ids = batch["input_ids"].to(device, non_blocking=True)
             edit_tags = batch["edit_tags"].to(device, non_blocking=True)
             pad_mask = batch["pad_mask"].to(device, non_blocking=True)
-            original_ids = batch["original_ids"].to(device, non_blocking=True)
 
-            # Iterative refinement 학습
+            # 동적 max_iterations 계산
+            if args.n_iterations == 0:
+                max_iter = int(pad_mask.sum(dim=1).max().item()) // 2
+                max_iter = max(max_iter, 1)
+            else:
+                max_iter = args.n_iterations
+
+            # Iterative refinement 학습 + 샘플별 active 마스킹
             current_ids = input_ids
+            actual_iters = 0
             _iter_loss.zero_()
+            B_cur = current_ids.shape[0]
 
             # DDP: 마지막 accum step에서만 gradient sync (중간 step은 no_sync)
             is_last_accum = (accum_step == args.grad_accum_steps - 1)
             ctx = model.no_sync() if (is_distributed and not is_last_accum) else nullcontext()
 
             with ctx:
-              # CUDA graph 호환: reduce-overhead compile 시 step 경계 표시
-              # grad_accum + n_iterations 각 forward마다 호출 필요
-              if args.compile:
-                  torch.compiler.cudagraph_mark_step_begin()
-              for it in range(args.n_iterations):
+              for it in range(max_iter):
+                if args.compile:
+                    torch.compiler.cudagraph_mark_step_begin()
                 if use_amp:
                     with torch.amp.autocast("cuda", dtype=amp_dtype):
                         tag_logits = model(current_ids, pad_mask)
@@ -602,9 +622,14 @@ def train(args):
                     targets.view(-1),
                 )
 
-                loss = ce_loss / (args.n_iterations * args.grad_accum_steps)
+                # 첫 iteration NaN = 모델 손상, 이후 NaN = refinement 문제
+                if it > 0 and ce_loss.isnan():
+                    break
 
-                # Ternary proximity regularization (모든 linear 가중치의 ternary 근접성 유지)
+                # grad_accum만 나눔 — iteration 나누기는 후에 gradient 보정
+                loss = ce_loss / args.grad_accum_steps
+
+                # Ternary proximity regularization
                 if args.quant_reg_weight > 0:
                     from model.bitlinear import BitLinear as _BL, quantize_weights_158 as _qw
                     quant_loss = torch.tensor(0.0, device=device)
@@ -612,7 +637,6 @@ def train(args):
                         if isinstance(m, _BL):
                             quant_loss = quant_loss + m.quantization_loss()
                         elif isinstance(m, nn.Linear) and m.weight.requires_grad:
-                            # Mamba2 nn.Linear projection도 ternary 근접성 유지
                             with torch.no_grad():
                                 gamma = m.weight.abs().mean().clamp(min=1e-5)
                                 target = gamma * (m.weight / gamma).clamp(-1.0, 1.0).round()
@@ -620,50 +644,27 @@ def train(args):
                     loss = loss + args.quant_reg_weight * quant_loss
 
                 loss.backward()
-
+                actual_iters += 1
                 _iter_loss += ce_loss.detach()
 
-                # 다음 iteration 준비: 예측 태그 적용 → 새 편집 태그 계산
-                if it < args.n_iterations - 1:
+                # 다음 iteration 준비: GPU-native O(N) refinement
+                if it < max_iter - 1:
                     with torch.no_grad():
                         pred_tags = tag_logits.argmax(dim=-1)  # (B, T)
 
-                        if _LEVENSHTEIN_CPP is not None:
-                            # C++ OpenMP 가속 (배치 병렬 처리)
-                            new_ids, new_tags_t, new_mask = _LEVENSHTEIN_CPP.batch_refinement_step(
-                                current_ids, pred_tags, original_ids, pad_mask,
-                                config.vocab_size, config.pad_id, config.max_seq_len,
-                            )
-                            current_ids = new_ids
-                            edit_tags = new_tags_t
-                            pad_mask = new_mask
-                        else:
-                            # Python 폴백
-                            B, T = current_ids.shape
-                            new_ids_list = []
-                            new_tags_list = []
-                            for b in range(B):
-                                valid = pad_mask[b]
-                                src = current_ids[b][valid].tolist()
-                                tags_b = pred_tags[b][valid].tolist()
+                        # Early stopping: 유효 위치 전부 KEEP이면 중단
+                        if (pred_tags[pad_mask] == TAG_KEEP).all():
+                            break
 
-                                modified = apply_edit_tags(src, tags_b, config.vocab_size)
-                                modified = modified[:config.max_seq_len]
-                                pad_len = config.max_seq_len - len(modified)
-                                modified_padded = modified + [config.pad_id] * pad_len
+                        # GPU refinement (CPU 전송 없음, max_seq_len으로 truncate)
+                        current_ids, edit_tags, pad_mask = refinement_step_gpu(
+                            current_ids, pred_tags, edit_tags, pad_mask,
+                            config.vocab_size, config.pad_id,
+                            max_seq_len=config.max_seq_len)
 
-                                orig = original_ids[b][original_ids[b] != config.pad_id].tolist()
-                                new_tags = compute_edit_tags(modified, orig, config.vocab_size)
-                                new_tags = new_tags + [TAG_KEEP] * pad_len
-
-                                new_ids_list.append(modified_padded)
-                                new_tags_list.append(new_tags)
-
-                            current_ids = torch.tensor(new_ids_list, dtype=torch.long, device=device)
-                            edit_tags = torch.tensor(new_tags_list, dtype=torch.long, device=device)
-                            pad_mask = (current_ids != config.pad_id)
-
-            _total_loss += _iter_loss / args.n_iterations
+            total_iter_count += actual_iters
+            _total_loss += _iter_loss / max(actual_iters, 1)
+            running_iters += actual_iters
             running_tokens_t += batch["pad_mask"].sum()
             batch_chars = batch["n_chars"].sum().to(device)
             log_chars += batch_chars
@@ -673,6 +674,13 @@ def train(args):
 
         if _epoch_done:
             break
+
+        # Gradient 보정: iteration 횟수로 정규화
+        if total_iter_count > args.grad_accum_steps:
+            correction = args.grad_accum_steps / total_iter_count
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad *= correction
 
         # Gradient step
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -710,12 +718,15 @@ def train(args):
                     resv = torch.cuda.max_memory_reserved() / 1024**3
                     mem_str = f" | mem {alloc:.1f}G/{resv:.1f}G"
                 gpu_str = f" ({world_size}GPU)" if world_size > 1 else ""
+                avg_it = running_iters.item() / (log_interval * args.grad_accum_steps)
+                iter_str = f" | iter {avg_it:.1f}" if args.n_iterations != 1 else ""
                 print(f"step {step + 1:>6d} | loss {avg_loss:.4f} | "
                       f"chars {format_chars(_total_chars)} | "
-                      f"lr {lr:.2e} | {tok_s:.0f} tok/s{gpu_str} | {dt:.1f}s{mem_str}", flush=True)
+                      f"lr {lr:.2e} | {tok_s:.0f} tok/s{gpu_str} | {dt:.1f}s{mem_str}{iter_str}", flush=True)
             running_loss_t.zero_()
             running_tokens_t.zero_()
             log_chars.zero_()
+            running_iters.zero_()
             t0 = time.time()
 
         # 검증 (DDP: 전체 GPU가 참여 → all_reduce로 평균)
@@ -883,7 +894,7 @@ def main():
     parser.add_argument("--tokenizer", type=str, default="keyboard",
                         choices=list(TOKENIZER_PRESETS.keys()))
     parser.add_argument("--n_iterations", type=int, default=1,
-                        help="Iterative refinement 반복 횟수 (초기 학습 1, fine-tuning 2-3)")
+                        help="최대 iterative refinement 반복 횟수 (0=동적: 배치최장문장//2, 1=단일패스)")
 
     # 데이터
     parser.add_argument("--corpus", type=str, nargs="+", required=True)
@@ -944,6 +955,8 @@ def main():
     parser.add_argument("--save_interval", type=int, default=5000)
     parser.add_argument("--save_dir", type=str, default="checkpoints")
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--init_weights", type=str, default=None,
+                        help="사전학습 가중치 경로 (모델만 로드, optimizer/scheduler/data 무시)")
     parser.add_argument("--gdrive_remote", default=None,
                         help="체크포인트 업로드용 rclone 대상 폴더 (예: 'gdrive:my_checkpoints/')")
     parser.add_argument("--log_file", default=None,
