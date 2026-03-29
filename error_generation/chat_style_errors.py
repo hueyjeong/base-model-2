@@ -30,10 +30,13 @@ _CHAT_STYLE_PATTERNS = [
     # ── 초성어 (NIKL PARA 빈출) ──
     (re.compile(r"레알"), ["ㄹㅇ"]),
     (re.compile(r"인정"), ["ㅇㅈ", "ㅇㅈㅇㅈ"]),
-    (re.compile(r"감사"), ["ㄱㅅ"]),
+    (re.compile(r"감사"), ["ㄱㅅ", "ㄱㅅㄱㅅ"]),
     (re.compile(r"응응"), ["ㅇㅇ"]),
     (re.compile(r"오키"), ["ㅇㅋ", "ㅇㅋㅇㅋ"]),
     (re.compile(r"맞아"), ["ㅁㅈ"]),
+    (re.compile(r"고고"), ["ㄱㄱ"]),
+    (re.compile(r"그니까"), ["ㄱㄴㄲ"]),
+    (re.compile(r"괜찮아"), ["ㄱㅊ"]),
 
     # ── 구어 축약 (NIKL PARA 전수 분석 — 빈출순) ──
     (re.compile(r"나도"), ["나두"]),
