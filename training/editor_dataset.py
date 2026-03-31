@@ -71,6 +71,8 @@ class EditorDataset(IterableDataset):
         rank: DDP rank
         world_size: DDP 프로세스 수
         pack: 패킹 활성화 (여러 문장을 연결하여 PAD 제거)
+        pack_fill_ratio: 패킹 시 max_seq_len의 몇 %까지 채울지 (기본 0.8).
+            INSERT 태그가 확장될 여유 공간을 확보하기 위해 20% PAD를 남긴다.
     """
 
     def __init__(
@@ -88,12 +90,14 @@ class EditorDataset(IterableDataset):
         rank: int = 0,
         world_size: int = 1,
         pack: bool = True,
+        pack_fill_ratio: float = 0.8,
     ):
         self.file_paths = [file_paths] if isinstance(file_paths, str) else list(file_paths)
         self.tokenizer = tokenizer
         self.noiser = noiser
         self.vocab_size = vocab_size
         self.max_seq_len = max_seq_len
+        self.pack_limit = int(max_seq_len * pack_fill_ratio)
         self.text_key = text_key
         self.lang_key = lang_key
         self.min_length = min_length
@@ -287,7 +291,7 @@ class EditorDataset(IterableDataset):
                 continue
 
             noised_ids, tags, _ = result
-            remaining = self.max_seq_len - len(buf_input)
+            remaining = self.pack_limit - len(buf_input)
 
             if len(noised_ids) > remaining:
                 # 버퍼 방출
@@ -297,8 +301,8 @@ class EditorDataset(IterableDataset):
                 buf_tags = []
                 buf_chars = 0
 
-            # 버퍼에 추가 (max_seq_len 초과 시 truncate)
-            remaining = self.max_seq_len - len(buf_input)
+            # 버퍼에 추가 (pack_limit 초과 시 truncate)
+            remaining = self.pack_limit - len(buf_input)
             buf_input.extend(noised_ids[:remaining])
             buf_tags.extend(tags[:remaining])
             buf_chars += len(text)

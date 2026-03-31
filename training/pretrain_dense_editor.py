@@ -366,6 +366,7 @@ def train(args):
         rank=global_rank,
         world_size=world_size,
         pack=use_pack,
+        pack_fill_ratio=args.pack_fill_ratio,
     )
     loader = DataLoader(
         dataset,
@@ -890,6 +891,8 @@ def main():
     parser.add_argument("--text_key", type=str, default=None)
     parser.add_argument("--lang_key", type=str, default=None)
     parser.add_argument("--max_seq_len", type=int, default=512)
+    parser.add_argument("--pack_fill_ratio", type=float, default=0.8,
+                        help="패킹 시 max_seq_len의 몇 %%까지 채울지 (기본 0.8, INSERT 여유 공간 확보)")
 
     # 학습
     parser.add_argument("--batch_size", type=int, default=6)
