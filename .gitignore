@@ -65,6 +65,7 @@ exported_768/
 Thumbs.db
 corpus/sample_10g.zip
 corpus/*
+corpus
 
 *.bmmq
 
