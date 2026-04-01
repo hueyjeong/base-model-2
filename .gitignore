@@ -77,3 +77,5 @@ exp-2-pass-consensus/exported_step2000_f32/
 *.onnx.data
 error_generation/nikl_para_misspellings.json
 error_generation/nikl_para_spacing.json
+
+.env
