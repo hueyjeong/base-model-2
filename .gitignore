@@ -35,6 +35,9 @@ exports/
 *.log
 _tmp_*
 
+# Profiling
+callgrind.out*
+
 # IDE
 .vscode/
 .idea/
