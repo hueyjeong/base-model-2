@@ -100,6 +100,29 @@ class DenseEditor(nn.Module):
             if hasattr(layer.mixing, '_init_weights'):
                 layer.mixing._init_weights()
 
+    def forward_hidden(
+        self,
+        input_ids: torch.Tensor,
+        pad_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """hidden state 반환 (tag_head 미적용). RTD discriminator 등 외부 head 사용 시.
+
+        Returns:
+            hidden: (B, T, d_model)
+        """
+        x = self.embedding(input_ids) * self.embed_scale
+        x = self.embed_dropout(x)
+
+        reset_mask = (input_ids == self.cfg.bos_id)
+
+        for layer in self.layers:
+            if self.gradient_checkpointing and self.training:
+                x = checkpoint(layer, x, pad_mask, reset_mask, use_reentrant=False)
+            else:
+                x = layer(x, pad_mask=pad_mask, reset_mask=reset_mask)
+
+        return self.final_norm(x)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -113,23 +136,8 @@ class DenseEditor(nn.Module):
         Returns:
             tag_logits: (B, T, n_tags)
         """
-        x = self.embedding(input_ids) * self.embed_scale
-        x = self.embed_dropout(x)
-
-        # 문서 경계 감지 (패킹 시 BOS 위치에서 state 리셋)
-        reset_mask = (input_ids == self.cfg.bos_id)
-
-        for layer in self.layers:
-            if self.gradient_checkpointing and self.training:
-                x = checkpoint(layer, x, pad_mask, reset_mask, use_reentrant=False)
-            else:
-                x = layer(x, pad_mask=pad_mask, reset_mask=reset_mask)
-
-        x = self.final_norm(x)
-        # tag_head 내부에서 LayerNorm + quantization 수행 → float 캐스팅은 CE loss 직전으로 이동
-        tag_logits = self.tag_head(x)
-
-        return tag_logits
+        h = self.forward_hidden(input_ids, pad_mask)
+        return self.tag_head(h)
 
     def count_parameters(self) -> dict[str, int]:
         """파라미터 수 집계"""

@@ -141,8 +141,32 @@ class SwiGLUFFN(nn.Module):
     def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1):
         super().__init__()
         self.d_ff = d_ff
-        self.gate_up_proj = Int8Linear(d_model, 2 * d_ff, bias=False)
-        self.down_proj = Int8Linear(d_ff, d_model, bias=False)
+        # use_norm=False: INT8 absmax 자체 스케일링 → Sub-LayerNorm 불필요, BF16 유지
+        self.gate_up_proj = Int8Linear(d_model, 2 * d_ff, bias=False, use_norm=False)
+        self.down_proj = Int8Linear(d_ff, d_model, bias=False, use_norm=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gu = self.gate_up_proj(x)
+        gate, up = gu.split(self.d_ff, dim=-1)
+        x = F.silu(gate) * up
+        x = self.dropout(x)
+        x = self.down_proj(x)
+        return x
+
+
+class PlainSwiGLUFFN(nn.Module):
+    """SwiGLU FFN — nn.Linear (양자화 없음, BF16 학습용)
+
+    Generator 등 양자화 불필요한 소형 모델용.
+    x → gate_up_proj → SiLU(gate) * up → dropout → down_proj
+    """
+
+    def __init__(self, d_model: int, d_ff: int, dropout: float = 0.1):
+        super().__init__()
+        self.d_ff = d_ff
+        self.gate_up_proj = nn.Linear(d_model, 2 * d_ff, bias=False)
+        self.down_proj = nn.Linear(d_ff, d_model, bias=False)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

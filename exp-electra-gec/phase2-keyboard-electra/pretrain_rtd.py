@@ -1,21 +1,37 @@
 """ELECTRA RTD 사전학습 스크립트
 
-커스텀 Diamond 인코더(Discriminator) + 소형 Transformer(Generator)를 joint training.
-DDP, BF16 AMP, torch.compile, AdamW, cosine/wsd LR schedule 지원.
+BiMamba2 Discriminator(128M) + Transformer Generator(5M) joint training.
+DDP, BF16 AMP, INT8 QAT, torch.compile, AdamW, cosine/wsd LR schedule 지원.
 체크포인트에 dataset state 포함 → resume 시 동일 에포크/위치에서 재개.
 rclone 업로드 + 이전 체크포인트 자동 삭제.
 
 Usage:
-    # 단일 GPU
-    python -m exp-electra-gec.phase2-keyboard-electra.pretrain_rtd \
-        --preset small --corpus corpus/sample_full.jsonl --text_key text \
-        --bf16 --batch_size 32 --lr 5e-4 --schedule wsd --max_steps 100000
+    # ── 환경변수 (필수) ──
+    export BITLINEAR_CUDA_FUSED_ACT=1
+    export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-    # DDP (4 GPU)
-    torchrun --nproc_per_node=4 \
-        -m exp-electra-gec.phase2-keyboard-electra.pretrain_rtd \
-        --preset small --corpus corpus/sample_full.jsonl --text_key text \
-        --bf16 --batch_size 32 --lr 5e-4 --schedule wsd --max_steps 100000
+    # ── 단일 GPU ──
+    cd exp-electra-gec/phase2-keyboard-electra
+    python pretrain_rtd.py \\
+        --corpus ../../corpus/train.parquet \\
+        --val_corpus ../../corpus/val.parquet \\
+        --bf16 --int8_qat --batch_size 8 --lr 5e-4 \\
+        --schedule wsd --max_steps 100000
+
+    # ── DDP (4 GPU) ──
+    cd exp-electra-gec/phase2-keyboard-electra
+    torchrun --nproc_per_node=4 pretrain_rtd.py \\
+        --corpus ../../corpus/train.parquet \\
+        --val_corpus ../../corpus/val.parquet \\
+        --bf16 --int8_qat --batch_size 8 --lr 5e-4 \\
+        --schedule wsd --max_steps 100000
+
+NOTE:
+    - python -m 대신 cd + python/torchrun 직접 실행 권장
+      (python -m에서 Int8LinearCuda CUDA 상태 비정상 발생)
+    - BITLINEAR_CUDA_BACKWARD, GRADW_LT, FUSED_WEIGHT는 사용 금지
+      (ELECTRA 2-class CE의 큰 gradient에서 nan 유발)
+    - BITLINEAR_CUDA_FUSED_ACT만 안전
 """
 import argparse
 import gc
@@ -36,7 +52,7 @@ from torch.utils.data import DataLoader
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 
-from config import ElectraConfig, make_small_config, make_base_config, make_large_config
+from config import ElectraConfig, make_electra_config
 from electra_rtd import ElectraRTD
 from rtd_dataset import RTDDataset
 from keyboard_tokenizer.keyboard_wrapper import KeyboardTokenizer
@@ -196,6 +212,8 @@ def main():
     parser.add_argument("--schedule", choices=["cosine", "wsd"], default="wsd")
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--bf16", action="store_true")
+    parser.add_argument("--int8_qat", action="store_true",
+                        help="Int8Linear → Int8LinearCuda 교체 (CUDA 텐서코어)")
     parser.add_argument("--gradient_checkpointing", action="store_true")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--compile_mode", default="reduce-overhead")
@@ -235,12 +253,7 @@ def main():
     is_main = (rank == 0)
 
     # ── Config ──
-    preset_map = {
-        "small": make_small_config,
-        "base": make_base_config,
-        "large": make_large_config,
-    }
-    cfg = preset_map[args.preset](
+    cfg = make_electra_config(
         mask_prob=args.mask_prob,
         disc_loss_weight=args.disc_loss_weight,
         temperature=args.temperature,
@@ -252,19 +265,34 @@ def main():
     model = ElectraRTD(cfg).to(device)
     raw_model = model  # 항상 원본 ElectraRTD 참조 (config/메서드 접근용)
 
+    # INT8 QAT CUDA 커널 교체 — Discriminator만 (Generator Transformer는 제외)
+    if args.int8_qat:
+        try:
+            from model.cuda_bitlinear import replace_int8linear_with_cuda
+            replace_int8linear_with_cuda(raw_model.discriminator)
+            replace_int8linear_with_cuda(raw_model.rtd_head)
+            if is_main:
+                print("Int8LinearCuda 교체 완료 (discriminator + rtd_head)")
+        except Exception as e:
+            if is_main:
+                print(f"Int8LinearCuda 교체 실패: {e}, 기존 Int8Linear 유지")
+
     if args.gradient_checkpointing:
         raw_model.discriminator.gradient_checkpointing = True
+        raw_model.generator.gradient_checkpointing = True
 
     total_params = sum(p.numel() for p in model.parameters())
     gen_params = model.generator.count_parameters()
     disc_params = sum(p.numel() for p in model.discriminator.parameters())
 
     if is_main:
-        print(f"=== ELECTRA RTD Pretrain ({args.preset}) ===")
+        print(f"=== ELECTRA RTD Pretrain (BiMamba2) ===")
         print(f"Generator: {gen_params:,} ({gen_params/1e6:.2f}M)")
         print(f"Discriminator: {disc_params:,} ({disc_params/1e6:.2f}M)")
         print(f"총: {total_params:,} ({total_params/1e6:.2f}M)")
-        print(f"layer_spec: {cfg.disc.layer_spec}")
+        print(f"Disc: mixing={cfg.disc.mixing_type}, int8_qat={cfg.disc.int8_qat}, "
+              f"n_layers={cfg.disc.n_layers}, d={cfg.disc.d_model}")
+        print(f"Gen: n_layers={cfg.gen.n_layers}, d={cfg.gen.d_model}")
         print(f"mask_prob={cfg.mask_prob}, disc_weight={cfg.disc_loss_weight}, "
               f"temp={cfg.temperature}")
         print(f"LR={args.lr}, schedule={args.schedule}, warmup={args.warmup_steps}")
@@ -284,6 +312,8 @@ def main():
 
     # ── Optimizer ──
     use_fused = torch.cuda.is_available()
+    gen_params = list(raw_model.generator.parameters())
+    disc_params = list(raw_model.discriminator.parameters()) + list(raw_model.rtd_head.parameters())
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr,
         betas=(0.9, 0.98), weight_decay=args.weight_decay,
@@ -426,38 +456,11 @@ def main():
             ctx = model.no_sync() if (ddp and not is_last_accum) else nullcontext()
 
             with ctx:
-                if args.split_backward:
-                    # ── Split backward: Gen→backward→Disc→backward ──
-                    # Gen activation을 Disc forward 전에 해제하여 메모리 절약
-                    with amp_ctx:
-                        gen_out = raw_model.forward_gen(input_ids, pad_mask)
-                        gen_loss_scaled = (
-                            gen_out["gen_loss"] * raw_model.cfg.gen_loss_weight
-                            / args.grad_accum_steps
-                        )
-                    gen_loss_scaled.backward()  # Gen activation 해제!
-
-                    with amp_ctx:
-                        disc_out = raw_model.forward_disc(
-                            gen_out["disc_input"], pad_mask,
-                            gen_out["rtd_labels"], gen_out["valid_mask"],
-                        )
-                        disc_loss_scaled = (
-                            disc_out["disc_loss"] * raw_model.cfg.disc_loss_weight
-                            / args.grad_accum_steps
-                        )
-                    disc_loss_scaled.backward()
-
-                    outputs = {**gen_out, **disc_out}
-                else:
-                    # ── 기존 경로: joint forward + single backward ──
-                    # model = compiled(DDP(raw_model)) 또는 compiled(raw_model) 사용
-                    with amp_ctx:
-                        outputs = model(input_ids, pad_mask)
-                        total_loss = raw_model.get_total_loss(outputs)
-                        loss_scaled = total_loss / args.grad_accum_steps
-
-                    loss_scaled.backward()
+                with amp_ctx:
+                    outputs = model(input_ids, pad_mask)
+                    total_loss = raw_model.get_total_loss(outputs)
+                    loss_scaled = total_loss / args.grad_accum_steps
+                loss_scaled.backward()
 
             # GPU 텐서에 축적 — GPU→CPU sync 없음
             with torch.no_grad():
@@ -476,6 +479,7 @@ def main():
 
         # Gradient step
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
         optimizer.step()
 
         # Logging — 여기서만 GPU→CPU sync 발생 (log_every 간격)

@@ -30,6 +30,8 @@ class DenseEditorConfig:
     # 토큰 ID
     pad_id: int = 0
     bos_id: int = 2
+    eos_id: int = 3
+    mask_id: int = 6
 
     # Mixing layer 선택
     mixing_type: str = "rwkv"  # mamba|fnet|tcn|rwkv|retnet|xlstm

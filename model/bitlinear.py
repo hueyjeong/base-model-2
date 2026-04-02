@@ -322,9 +322,12 @@ class Int8Linear(nn.Linear):
         - INT8 weight 고정 저장 → VNNI/AMX 가속
     """
 
-    def __init__(self, in_features: int, out_features: int, bias: bool = False):
+    def __init__(self, in_features: int, out_features: int, bias: bool = False,
+                 use_norm: bool = True):
         super().__init__(in_features, out_features, bias=bias)
-        self.norm = nn.LayerNorm(in_features, elementwise_affine=False)
+        # use_norm=True: BitNet 스타일 Sub-LayerNorm (FP32, 기존 호환)
+        # use_norm=False: INT8 absmax가 자체 스케일링하므로 norm 불필요 → BF16 유지
+        self.norm = nn.LayerNorm(in_features, elementwise_affine=False) if use_norm else None
         # weight 양자화 캐시 (optimizer.step() 전까지 불변)
         self._weight_version: int = -1
         self._w_quant_cache: torch.Tensor | None = None
@@ -332,8 +335,8 @@ class Int8Linear(nn.Linear):
 
     @torch.compiler.disable
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # LayerNorm (BitLinear과 동일한 sub-layer norm)
-        x = self.norm(x)
+        if self.norm is not None:
+            x = self.norm(x)
 
         # Activation: per-token absmax → INT8 + STE
         x_quant, x_scale = quantize_activations_8bit(x)

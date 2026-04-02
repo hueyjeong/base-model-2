@@ -15,9 +15,10 @@ from torch import Tensor
 
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+sys.path.insert(0, os.path.dirname(__file__))
 
 from config import ElectraConfig
-from diamond_encoder import DiamondEncoder
+from model.dense_editor import DenseEditor
 from generator import TransformerGenerator
 
 
@@ -29,7 +30,7 @@ class ElectraRTD(nn.Module):
         self.cfg = cfg
 
         self.generator = TransformerGenerator(cfg.gen)
-        self.discriminator = DiamondEncoder(cfg.disc)
+        self.discriminator = DenseEditor(cfg.disc)
         self.rtd_head = nn.Linear(cfg.disc.d_model, 2)
 
         nn.init.xavier_uniform_(self.rtd_head.weight)
@@ -71,6 +72,16 @@ class ElectraRTD(nn.Module):
         mask_probs = torch.rand(B, T, device=device)
         mask_positions = can_mask & (mask_probs < self.cfg.mask_prob)
 
+        # 마스크 위치가 0이면 학습 신호 없음 → 빈 배치 방어
+        if not mask_positions.any():
+            zero = torch.tensor(0.0, device=device, requires_grad=True)
+            return {
+                "gen_loss": zero, "disc_loss": zero,
+                "rtd_acc": torch.tensor(0.0, device=device),
+                "gen_acc": torch.tensor(0.0, device=device),
+                "replaced_ratio": torch.tensor(0.0, device=device),
+            }
+
         # ── 2. Generator 입력: 마스크 위치를 [MASK]로 ──
         gen_input = input_ids.clone()
         gen_input[mask_positions] = disc_cfg.mask_id
@@ -86,7 +97,7 @@ class ElectraRTD(nn.Module):
 
         # ── 4. 마스크 위치에서만 샘플링 ──
         with torch.no_grad():
-            gen_probs_masked = F.softmax(gen_logits_masked / self.cfg.temperature, dim=-1)
+            gen_probs_masked = F.softmax(gen_logits_masked.float() / self.cfg.temperature, dim=-1)
             sampled_tokens = torch.multinomial(gen_probs_masked, 1).squeeze(-1)  # (N_mask,)
 
         disc_input = input_ids.clone()
@@ -97,7 +108,7 @@ class ElectraRTD(nn.Module):
         rtd_labels = (disc_input != input_ids).long()
 
         # ── 6. Discriminator forward → RTD loss ──
-        disc_hidden = self.discriminator(disc_input, pad_mask)  # (B, T, D)
+        disc_hidden = self.discriminator.forward_hidden(disc_input, pad_mask)  # (B, T, D)
         rtd_logits = self.rtd_head(disc_hidden)                  # (B, T, 2)
 
         valid_mask = pad_mask if pad_mask is not None else \
@@ -166,7 +177,7 @@ class ElectraRTD(nn.Module):
         gen_loss = F.cross_entropy(gen_logits_masked, input_ids[mask_positions])
 
         with torch.no_grad():
-            gen_probs_masked = F.softmax(gen_logits_masked / self.cfg.temperature, dim=-1)
+            gen_probs_masked = F.softmax(gen_logits_masked.float() / self.cfg.temperature, dim=-1)
             sampled_tokens = torch.multinomial(gen_probs_masked, 1).squeeze(-1)
             gen_preds = gen_logits_masked.argmax(dim=-1)
             gen_acc = (gen_preds == input_ids[mask_positions]).float().mean()
@@ -196,7 +207,7 @@ class ElectraRTD(nn.Module):
         valid_mask: Tensor,
     ) -> dict[str, Tensor]:
         """Phase 2: Discriminator forward + RTD loss"""
-        disc_hidden = self.discriminator(disc_input, pad_mask)
+        disc_hidden = self.discriminator.forward_hidden(disc_input, pad_mask)
         rtd_logits = self.rtd_head(disc_hidden)
 
         disc_loss = F.cross_entropy(
@@ -214,8 +225,8 @@ class ElectraRTD(nn.Module):
 if __name__ == "__main__":
     print("=== ElectraRTD Smoke Test ===\n")
 
-    from config import make_small_config
-    cfg = make_small_config()
+    from config import make_electra_config
+    cfg = make_electra_config()
     model = ElectraRTD(cfg)
 
     gen_params = model.generator.count_parameters()

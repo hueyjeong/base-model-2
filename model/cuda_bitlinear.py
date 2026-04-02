@@ -495,7 +495,8 @@ class _Int8LinearCudaFn(torch.autograd.Function):
 class Int8LinearCuda(nn.Module):
     """CUDA extension 기반 Int8Linear 대체 모듈"""
 
-    def __init__(self, in_features: int, out_features: int, bias: bool = False):
+    def __init__(self, in_features: int, out_features: int, bias: bool = False,
+                 use_norm: bool = True):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -506,11 +507,11 @@ class Int8LinearCuda(nn.Module):
         else:
             self.register_parameter("bias", None)
 
-        self.norm = nn.LayerNorm(in_features, elementwise_affine=False)
+        self.norm = nn.LayerNorm(in_features, elementwise_affine=False) if use_norm else None
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_norm = self.norm(x)
+        x_norm = self.norm(x) if self.norm is not None else x
 
         if torch.is_autocast_enabled('cuda'):
             out_dtype = torch.get_autocast_dtype('cuda')
@@ -587,11 +588,14 @@ def replace_int8linear_with_cuda(model: nn.Module) -> nn.Module:
 
         old = getattr(parent, parts[-1])
         old_device = old.weight.device
-        new = Int8LinearCuda(old.in_features, old.out_features, bias=old.bias is not None)
+        has_norm = old.norm is not None
+        new = Int8LinearCuda(old.in_features, old.out_features, bias=old.bias is not None,
+                             use_norm=has_norm)
         new.weight.data.copy_(old.weight.data)
         if old.bias is not None:
             new.bias.data.copy_(old.bias.data)
-        new.norm.load_state_dict(old.norm.state_dict())
+        if has_norm:
+            new.norm.load_state_dict(old.norm.state_dict())
         new = new.to(old_device)
         setattr(parent, parts[-1], new)
 

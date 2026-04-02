@@ -87,10 +87,11 @@ class FullAttentionMixing(MixingLayer):
         d_kv = self.n_kv_heads * self.headdim
 
         # Q,K,V,O 프로젝션 (INT8 QAT: per-token act + per-tensor weight)
-        self.q_proj = Int8Linear(d, d, bias=False)
-        self.k_proj = Int8Linear(d, d_kv, bias=False)
-        self.v_proj = Int8Linear(d, d_kv, bias=False)
-        self.o_proj = Int8Linear(d, d, bias=False)
+        # use_norm=False: INT8 absmax가 자체 스케일링 → Sub-LayerNorm 불필요, BF16 유지
+        self.q_proj = Int8Linear(d, d, bias=False, use_norm=False)
+        self.k_proj = Int8Linear(d, d_kv, bias=False, use_norm=False)
+        self.v_proj = Int8Linear(d, d_kv, bias=False, use_norm=False)
+        self.o_proj = Int8Linear(d, d, bias=False, use_norm=False)
 
         # RoPE
         self.rope = RotaryEmbedding(self.headdim, max_seq_len=cfg.max_seq_len)

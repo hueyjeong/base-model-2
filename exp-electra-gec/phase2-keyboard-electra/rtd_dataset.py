@@ -85,7 +85,15 @@ class RTDDataset(IterableDataset):
 
         line_idx = 0
         for fpath in files:
+            is_parquet = fpath.endswith(".parquet")
             is_jsonl = fpath.endswith(".jsonl") or fpath.endswith(".json")
+
+            if is_parquet:
+                yield from self._iter_parquet(
+                    fpath, line_idx, skip_worker_id, skip_total)
+                # parquet 행 수만큼 line_idx 전진 (정확한 값은 _iter_parquet 내부에서 관리)
+                continue
+
             with open(fpath, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
@@ -112,6 +120,32 @@ class RTDDataset(IterableDataset):
 
                     yield text
                     line_idx += 1
+
+    def _iter_parquet(self, fpath, line_idx_start, skip_worker_id, skip_total):
+        """Parquet 파일을 row group 단위 스트리밍 + 버퍼 (메모리 효율적)
+
+        pyarrow iter_batches로 64K행씩 읽어 내부 버퍼에 저장.
+        전체 파일을 메모리에 올리지 않으면서도 I/O 횟수 최소화.
+        """
+        import pyarrow.parquet as pq
+
+        pf = pq.ParquetFile(fpath)
+        text_col = self.text_key or "text"
+        line_idx = line_idx_start
+
+        for batch in pf.iter_batches(batch_size=65536, columns=[text_col]):
+            texts = batch[text_col].to_pylist()
+            for text in texts:
+                if not text or len(text) < self.min_length:
+                    continue
+
+                if skip_total is not None and line_idx % skip_total != skip_worker_id:
+                    line_idx += 1
+                    continue
+
+                self._line_counter = line_idx + 1
+                yield text
+                line_idx += 1
 
     def _tokenize(self, text: str) -> list[int] | None:
         """텍스트 → [BOS] + token_ids + [EOS]"""

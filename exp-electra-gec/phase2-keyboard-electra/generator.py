@@ -1,8 +1,7 @@
-"""TransformerGenerator — ELECTRA Generator (소형 Transformer + MLM Head)
+"""TransformerGenerator — ELECTRA Generator (Transformer + INT8 QAT + MLM Head)
 
-FP16/BF16 학습, INT8 QAT 미적용.
-nn.TransformerEncoder 사용 (표준 구현).
-~2M 파라미터 (d=128, 4L, d_ff=512).
+nn.TransformerEncoder 기반, Int8Linear MLM head.
+Mamba2 fused CUDA kernel과 workspace 충돌 방지를 위해 Transformer 사용.
 """
 import torch
 import torch.nn as nn
@@ -10,12 +9,11 @@ from torch import Tensor
 
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+sys.path.insert(0, os.path.dirname(__file__))
 
 from config import GeneratorConfig
-
-
 class TransformerGenerator(nn.Module):
-    """ELECTRA Generator — 소형 Transformer Encoder + MLM Head"""
+    """ELECTRA Generator — Transformer Encoder + Int8Linear MLM Head"""
 
     def __init__(self, cfg: GeneratorConfig):
         super().__init__()
@@ -36,6 +34,7 @@ class TransformerGenerator(nn.Module):
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=cfg.n_layers)
         self.mlm_head = nn.Linear(cfg.d_model, cfg.vocab_size)
 
+        self.gradient_checkpointing = False
         self._init_weights()
 
     def _init_weights(self):
@@ -43,8 +42,6 @@ class TransformerGenerator(nn.Module):
         nn.init.normal_(self.pos_embedding.weight, std=0.02)
         if self.cfg.pad_id is not None:
             nn.init.zeros_(self.embedding.weight[self.cfg.pad_id])
-        nn.init.xavier_uniform_(self.mlm_head.weight)
-        nn.init.zeros_(self.mlm_head.bias)
 
     def forward(
         self, input_ids: Tensor, pad_mask: Tensor | None = None,
@@ -79,14 +76,15 @@ class TransformerGenerator(nn.Module):
 if __name__ == "__main__":
     print("=== TransformerGenerator Smoke Test ===\n")
 
-    cfg = GeneratorConfig(d_model=128, n_layers=4, d_ff=512, n_heads=2)
+    cfg = GeneratorConfig(d_model=256, n_layers=6, d_ff=1024, n_heads=4)
     gen = TransformerGenerator(cfg)
     n_params = gen.count_parameters()
     print(f"파라미터: {n_params:,} ({n_params/1e6:.2f}M)")
 
     # Forward
     B, T = 2, 64
-    ids = torch.randint(1, 303, (B, T))
+    ids = torch.randint(7, 303, (B, T))
+    ids[:, 0] = cfg.bos_id
     mask = torch.ones(B, T, dtype=torch.bool)
     mask[0, T-5:] = False
 
@@ -94,14 +92,14 @@ if __name__ == "__main__":
     assert logits.shape == (B, T, 303), f"shape: {logits.shape}"
     print(f"Forward OK: {logits.shape}")
 
+    # return_hidden
+    hidden = gen(ids, mask, return_hidden=True)
+    assert hidden.shape == (B, T, 256), f"hidden shape: {hidden.shape}"
+    print(f"Hidden OK: {hidden.shape}")
+
     # Backward
     logits.sum().backward()
     assert gen.embedding.weight.grad is not None
     print("Backward OK")
-
-    # 파라미터 상세
-    for name, p in gen.named_parameters():
-        if "." not in name or name.count(".") <= 1:
-            print(f"  {name}: {p.shape} ({p.numel():,})")
 
     print("\n모든 테스트 통과!")
