@@ -81,10 +81,10 @@ def make_electra_config(**overrides) -> ElectraConfig:
     )
 
     gen = GeneratorConfig(
-        d_model=256,
-        n_layers=6,
-        d_ff=1024,
-        n_heads=4,
+        d_model=768,
+        n_layers=4,
+        d_ff=3072,
+        n_heads=12,
         vocab_size=303,
         max_seq_len=4096,
     )

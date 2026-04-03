@@ -308,7 +308,8 @@ def main():
 
     # DDP — compiled 모델을 감싸기
     if ddp:
-        model = DDP(model, device_ids=[rank], find_unused_parameters=False)
+        # find_unused_parameters=True: discriminator.tag_head가 RTD pretrain에서 미사용
+        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
 
     # ── Optimizer ──
     use_fused = torch.cuda.is_available()
