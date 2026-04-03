@@ -218,11 +218,13 @@ def main():
     parser.add_argument("--disc_loss_weight", type=float, default=50.0)
     parser.add_argument("--temperature", type=float, default=1.0)
     # 저장/로깅
-    parser.add_argument("--save_dir", default="checkpoints/electra_rtd")
+    parser.add_argument("--out_dir", default="output/electra_rtd",
+                        help="출력 부모 폴더 (하위에 checkpoints/ 자동 생성)")
     parser.add_argument("--save_every", type=int, default=20000)
     parser.add_argument("--val_every", type=int, default=5000)
     parser.add_argument("--log_every", type=int, default=100)
-    parser.add_argument("--log_file", default=None)
+    parser.add_argument("--log_file", default=None,
+                        help="로컬 로그 파일 (예: training.log)")
     parser.add_argument("--gdrive_remote", default=None,
                         help="rclone 원격지 (예: gdrive:electra-ckpts/)")
     parser.add_argument("--resume", default=None)
@@ -372,9 +374,11 @@ def main():
     use_amp = args.bf16 and torch.cuda.is_available()
     amp_ctx = torch.amp.autocast("cuda", dtype=torch.bfloat16) if use_amp else nullcontext()
 
-    os.makedirs(args.save_dir, exist_ok=True)
+    # 출력 폴더: out_dir/checkpoints/
+    save_dir = os.path.join(args.out_dir, "checkpoints")
+    os.makedirs(save_dir, exist_ok=True)
 
-    # 로그 파일
+    # 로그 파일 (로컬: --log_file 그대로, 서버 업로드 시 타임스탬프 이름)
     log_file = args.log_file
     if log_file and is_main:
         os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
@@ -529,8 +533,8 @@ def main():
             train_ds._line_counter = _max_line_counter
 
             ckpt_path = os.path.join(
-                args.save_dir,
-                f"electra_{args.preset}_step_{step+1}.pt",
+                save_dir,
+                f"electra_step_{step+1}.pt",
             )
 
             # 이전 저장 스레드 완료 대기
@@ -548,28 +552,45 @@ def main():
                 "dataset_state": train_ds.state_dict(),
             }, ckpt_buf)
 
-            # 백그라운드 스레드: 디스크 기록 + 이전 삭제 + 업로드
+            # 백그라운드 스레드: 디스크 기록 + gdrive 업로드
             _prev = _prev_ckpt_path
             _gdrive = args.gdrive_remote
-            _logf = args.log_file
+            _logf = log_file
+            _log_dir_remote = os.path.join(args.out_dir, "logs") if _gdrive else None
 
-            def _save_task(buf, path, prev, gdrive, logf):
+            def _save_task(buf, path, prev, gdrive, logf, log_dir_r):
                 buf.seek(0)
                 with open(path, "wb") as f:
                     f.write(buf.getvalue())
                 print(f"  체크포인트 저장 완료: {path}", flush=True)
-                if prev and os.path.exists(prev):
-                    try:
-                        os.remove(prev)
-                        print(f"  이전 체크포인트 삭제: {prev}", flush=True)
-                    except OSError:
-                        pass
                 if gdrive:
-                    upload_and_cleanup(path, logf, gdrive, keep_latest_n=1)
+                    # 로그 파일을 타임스탬프 이름으로 서버 logs/에 업로드
+                    if logf and os.path.exists(logf):
+                        from datetime import datetime
+                        ts_name = f"training-{datetime.now():%y-%m-%d-%H-%M-%S}.log"
+                        remote_log_dest = gdrive.rstrip("/") + "/logs/"
+                        import shlex, subprocess
+                        cmd = (f"rclone copyto {shlex.quote(logf)} "
+                               f"{shlex.quote(remote_log_dest + ts_name)}")
+                        try:
+                            subprocess.run(cmd, shell=True, check=True,
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        except Exception as e:
+                            print(f"  로그 업로드 실패: {e}", flush=True)
+                    # 체크포인트 업로드 + 이전 삭제
+                    upload_and_cleanup(path, None, gdrive, keep_latest_n=1)
+                else:
+                    # gdrive 없으면 이전 체크포인트 로컬 삭제만
+                    if prev and os.path.exists(prev):
+                        try:
+                            os.remove(prev)
+                            print(f"  이전 체크포인트 삭제: {prev}", flush=True)
+                        except OSError:
+                            pass
 
             _save_thread = threading.Thread(
                 target=_save_task,
-                args=(ckpt_buf, ckpt_path, _prev, _gdrive, _logf),
+                args=(ckpt_buf, ckpt_path, _prev, _gdrive, _logf, _log_dir_remote),
                 daemon=True,
             )
             _save_thread.start()
@@ -581,7 +602,7 @@ def main():
 
     final_step = step + 1
     if is_main:
-        final_path = os.path.join(args.save_dir, f"electra_{args.preset}_final.pt")
+        final_path = os.path.join(save_dir, "electra_final.pt")
         torch.save({
             "step": final_step,
             "current_epoch": _current_epoch,
