@@ -126,10 +126,16 @@ class RTDDataset(IterableDataset):
 
         pyarrow iter_batches로 64K행씩 읽어 내부 버퍼에 저장.
         전체 파일을 메모리에 올리지 않으면서도 I/O 횟수 최소화.
+        로컬 파일 및 HTTP URL 모두 지원.
         """
         import pyarrow.parquet as pq
 
-        pf = pq.ParquetFile(fpath)
+        if fpath.startswith("http://") or fpath.startswith("https://"):
+            import fsspec
+            fp = fsspec.open(fpath, "rb").open()
+            pf = pq.ParquetFile(fp)
+        else:
+            pf = pq.ParquetFile(fpath)
         text_col = self.text_key or "text"
         line_idx = line_idx_start
 
