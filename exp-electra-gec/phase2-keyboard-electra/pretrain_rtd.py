@@ -1,37 +1,31 @@
 """ELECTRA RTD 사전학습 스크립트
 
-BiMamba2 Discriminator(128M) + Transformer Generator(5M) joint training.
-DDP, BF16 AMP, INT8 QAT, torch.compile, AdamW, cosine/wsd LR schedule 지원.
+Full Attention Discriminator(123M, d=768 20L) + Transformer Generator(32M, d=768 4L).
+DDP, BF16 AMP, INT8 QAT, torch.compile, AdamW, WSD LR schedule 지원.
 체크포인트에 dataset state 포함 → resume 시 동일 에포크/위치에서 재개.
-rclone 업로드 + 이전 체크포인트 자동 삭제.
+HTTP URL parquet 스트리밍, rclone 업로드 + 이전 체크포인트 자동 삭제.
 
 Usage:
-    # ── 환경변수 (필수) ──
+    # ── 환경변수 ──
+    export BITLINEAR_CUDA_BACKWARD=bf16_tc
+    export BITLINEAR_CUDA_GRADW_LT=1
     export BITLINEAR_CUDA_FUSED_ACT=1
+    export BITLINEAR_CUDA_FUSED_WEIGHT=1
     export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
     # ── 단일 GPU ──
     cd exp-electra-gec/phase2-keyboard-electra
     python pretrain_rtd.py \\
-        --corpus ../../corpus/train.parquet \\
-        --val_corpus ../../corpus/val.parquet \\
-        --bf16 --int8_qat --batch_size 8 --lr 5e-4 \\
-        --schedule wsd --max_steps 100000
+        --corpus http://server/train.parquet \\
+        --val_corpus http://server/val_10k.parquet \\
+        --bf16 --int8_qat --compile --compile_mode default
 
     # ── DDP (4 GPU) ──
     cd exp-electra-gec/phase2-keyboard-electra
     torchrun --nproc_per_node=4 pretrain_rtd.py \\
-        --corpus ../../corpus/train.parquet \\
-        --val_corpus ../../corpus/val.parquet \\
-        --bf16 --int8_qat --batch_size 8 --lr 5e-4 \\
-        --schedule wsd --max_steps 100000
-
-NOTE:
-    - python -m 대신 cd + python/torchrun 직접 실행 권장
-      (python -m에서 Int8LinearCuda CUDA 상태 비정상 발생)
-    - BITLINEAR_CUDA_BACKWARD, GRADW_LT, FUSED_WEIGHT는 사용 금지
-      (ELECTRA 2-class CE의 큰 gradient에서 nan 유발)
-    - BITLINEAR_CUDA_FUSED_ACT만 안전
+        --corpus http://server/train.parquet \\
+        --val_corpus http://server/val_10k.parquet \\
+        --bf16 --int8_qat --compile --compile_mode default
 """
 import argparse
 import gc
@@ -203,12 +197,12 @@ def main():
     parser.add_argument("--val_corpus", default=None, nargs="*")
     parser.add_argument("--max_seq_len", type=int, default=4096)
     # 학습
-    parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--grad_accum_steps", type=int, default=1)
-    parser.add_argument("--max_steps", type=int, default=100000)
-    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--grad_accum_steps", type=int, default=4)
+    parser.add_argument("--max_steps", type=int, default=2000000)
+    parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--min_lr_ratio", type=float, default=0.01)
-    parser.add_argument("--warmup_steps", type=int, default=2000)
+    parser.add_argument("--warmup_steps", type=int, default=10000)
     parser.add_argument("--schedule", choices=["cosine", "wsd"], default="wsd")
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--bf16", action="store_true")
@@ -225,9 +219,9 @@ def main():
     parser.add_argument("--temperature", type=float, default=1.0)
     # 저장/로깅
     parser.add_argument("--save_dir", default="checkpoints/electra_rtd")
-    parser.add_argument("--save_every", type=int, default=5000)
-    parser.add_argument("--val_every", type=int, default=1000)
-    parser.add_argument("--log_every", type=int, default=50)
+    parser.add_argument("--save_every", type=int, default=20000)
+    parser.add_argument("--val_every", type=int, default=5000)
+    parser.add_argument("--log_every", type=int, default=100)
     parser.add_argument("--log_file", default=None)
     parser.add_argument("--gdrive_remote", default=None,
                         help="rclone 원격지 (예: gdrive:electra-ckpts/)")
