@@ -224,7 +224,7 @@ if __name__ == "__main__":
     # 시퀀스 길이 비교
     print("--- 시퀀스 길이 비교 ---")
     sample = "맞춤법을 확인해 주세요."
-    from tokenizers.byte_tokenizer import ByteTokenizer
+    from tok.byte_tokenizer import ByteTokenizer
     btok = ByteTokenizer()
     j_ids = tok.encode(sample, add_special=False)
     b_ids = btok.encode(sample, add_special=False)

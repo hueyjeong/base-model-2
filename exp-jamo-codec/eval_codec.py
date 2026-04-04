@@ -17,6 +17,7 @@ from codec.conv_codec import ConvCodec
 from train_codec import CodecDataset, load_tokenizer
 
 
+
 def evaluate(codec, tokenizer, corpus_paths, text_key, max_seq_len,
              batch_size, device, max_samples=None):
     """codec 복원 정확도 평가

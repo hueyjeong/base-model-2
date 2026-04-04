@@ -111,10 +111,10 @@ class CodecDataset(IterableDataset):
 def load_tokenizer(name: str):
     """토크나이저 이름으로 로드"""
     if name == "byte":
-        from tokenizers.byte_tokenizer import ByteTokenizer
+        from tok.byte_tokenizer import ByteTokenizer
         return ByteTokenizer()
     elif name == "jamo":
-        from tokenizers.jamo_tokenizer import JamoTokenizer
+        from tok.jamo_tokenizer import JamoTokenizer
         return JamoTokenizer()
     elif name == "keyboard":
         from keyboard_tokenizer.keyboard_wrapper import KeyboardTokenizer
