@@ -146,3 +146,43 @@ Phase 1(Conv) → 2(Cross-Attention) → 3(가변 패칭) → 4(Backbone 통합)
 
 ---
 
+## 2026-04-05 — Phase 2 결과: Cross-Attention vs Conv
+
+### 설정
+
+- CrossAttentionCodec: d=256, 2 local transformer layers, 4 heads (~5.0M params)
+- ConvCodec: d=256, 3 layers (~3.1M params) — Phase 1 결과 재활용
+- jamo 토크나이저, stride 4/8/16, 10K steps
+
+### 복원 정확도 비교
+
+| stride | Conv 토큰acc | Conv 문자acc | XAttn 토큰acc | XAttn 문자acc |
+|--------|-------------|-------------|--------------|--------------|
+| 4x | 100% | 100% | 76.2% | 11.2% |
+| 8x | 100% | 100% | 47.8% | 6.3% |
+| 16x | 100% | 99.98% | 25.4% | 5.1% |
+
+### z 공간 비교
+
+| stride | Conv 오타cos | Conv 다른의미cos | Conv 분리도 | XAttn 오타cos | XAttn 다른의미cos | XAttn 분리도 |
+|--------|------------|----------------|-----------|-------------|-----------------|------------|
+| 4x | 0.892 | 0.126 | 0.766 | 0.916 | 0.306 | 0.611 |
+| 8x | 0.888 | 0.069 | 0.819 | 0.933 | 0.379 | 0.554 |
+| 16x | 0.891 | 0.087 | 0.804 | 0.910 | 0.418 | 0.492 |
+
+### 관찰
+
+1. **Conv가 복원 정확도에서 압도적** — XAttn은 10K steps에서 미수렴
+2. **z 분리도도 Conv 우위** — XAttn은 다른 의미 cos_sim이 0.3~0.4로 높아 분리 부족
+3. XAttn은 오타 cos_sim이 약간 높지만 (0.91~0.93 vs 0.89), 다른 의미도 함께 높아져서 **상대적 분리는 더 나쁨**
+4. XAttn은 더 많은 스텝/더 큰 모델이 필요할 수 있으나, 경량 codec 용도로는 **Conv 확정**
+5. 학습 속도: Conv ~700K tok/s vs XAttn ~170K tok/s (4x 차이)
+
+### 결론
+
+- **Phase 2 결과: Conv > XAttn** (복원, z 구조, 속도 모두)
+- Cross-attention은 경량 codec에는 과도, 복잡도 대비 이득 없음
+- Phase 3(가변 패칭)은 Conv encoder 위에 적용하는 것이 합리적
+
+---
+
