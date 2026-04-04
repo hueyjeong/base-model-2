@@ -273,6 +273,10 @@ def main():
             if is_main:
                 print(f"Int8LinearCuda 교체 실패: {e}, 기존 Int8Linear 유지")
 
+    # tag_head는 RTD pretrain에서 미사용 → grad 끄기 (DDP find_unused_parameters 불필요)
+    for p in raw_model.discriminator.tag_head.parameters():
+        p.requires_grad = False
+
     if args.gradient_checkpointing:
         raw_model.discriminator.gradient_checkpointing = True
         raw_model.generator.gradient_checkpointing = True
@@ -304,8 +308,7 @@ def main():
 
     # DDP — compiled 모델을 감싸기
     if ddp:
-        # find_unused_parameters=True: discriminator.tag_head가 RTD pretrain에서 미사용
-        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
+        model = DDP(model, device_ids=[rank], find_unused_parameters=False)
 
     # ── Optimizer ──
     use_fused = torch.cuda.is_available()
