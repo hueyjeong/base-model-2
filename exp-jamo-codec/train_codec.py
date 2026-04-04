@@ -17,6 +17,7 @@ from torch.utils.data import DataLoader, IterableDataset
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from codec.conv_codec import ConvCodec
+from codec.xattn_codec import CrossAttentionCodec
 
 
 # ── 데이터셋 ──────────────────────────────────────────────────────────
@@ -134,16 +135,30 @@ def train(args):
     print(f"토크나이저: {args.tokenizer} (vocab={tokenizer.vocab_size})")
 
     # 모델
-    codec = ConvCodec(
-        vocab_size=tokenizer.vocab_size,
-        d_model=args.d_model,
-        stride=args.stride,
-        n_layers=args.n_layers,
-        kernel_size=args.kernel_size,
-        dropout=args.dropout,
-    ).to(device)
+    if args.codec == "conv":
+        codec = ConvCodec(
+            vocab_size=tokenizer.vocab_size,
+            d_model=args.d_model,
+            stride=args.stride,
+            n_layers=args.n_layers,
+            kernel_size=args.kernel_size,
+            dropout=args.dropout,
+        ).to(device)
+        codec_name = "ConvCodec"
+    elif args.codec == "xattn":
+        codec = CrossAttentionCodec(
+            vocab_size=tokenizer.vocab_size,
+            d_model=args.d_model,
+            stride=args.stride,
+            n_local_layers=args.n_layers,
+            n_heads=args.n_heads,
+            dropout=args.dropout,
+        ).to(device)
+        codec_name = "XAttnCodec"
+    else:
+        raise ValueError(f"알 수 없는 codec: {args.codec}")
     n_params = sum(p.numel() for p in codec.parameters())
-    print(f"ConvCodec: d={args.d_model}, stride={args.stride}, "
+    print(f"{codec_name}: d={args.d_model}, stride={args.stride}, "
           f"layers={args.n_layers}, params={n_params/1e6:.2f}M")
 
     # 데이터
@@ -243,7 +258,7 @@ def train(args):
         # 체크포인트
         if args.save_every > 0 and global_step % args.save_every == 0:
             save_path = os.path.join(
-                args.out_dir, f"codec_{args.tokenizer}_s{args.stride}_step{global_step}.pt"
+                args.out_dir, f"{args.codec}_{args.tokenizer}_s{args.stride}_step{global_step}.pt"
             )
             os.makedirs(args.out_dir, exist_ok=True)
             torch.save({
@@ -259,7 +274,7 @@ def train(args):
     # 최종 저장
     if args.out_dir:
         save_path = os.path.join(
-            args.out_dir, f"codec_{args.tokenizer}_s{args.stride}_final.pt"
+            args.out_dir, f"{args.codec}_{args.tokenizer}_s{args.stride}_final.pt"
         )
         os.makedirs(args.out_dir, exist_ok=True)
         torch.save({
@@ -273,7 +288,7 @@ def train(args):
 # ── CLI ────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Conv Codec 학습")
+    parser = argparse.ArgumentParser(description="Codec 학습")
 
     # 데이터
     parser.add_argument("--corpus", nargs="+", required=True)
@@ -282,10 +297,12 @@ def main():
     parser.add_argument("--max_seq_len", type=int, default=512)
 
     # 모델
+    parser.add_argument("--codec", choices=["conv", "xattn"], default="conv")
     parser.add_argument("--d_model", type=int, default=256)
     parser.add_argument("--stride", type=int, default=4)
     parser.add_argument("--n_layers", type=int, default=3)
     parser.add_argument("--kernel_size", type=int, default=5)
+    parser.add_argument("--n_heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.1)
 
     # 학습

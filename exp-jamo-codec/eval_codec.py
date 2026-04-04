@@ -14,8 +14,8 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from codec.conv_codec import ConvCodec
+from codec.xattn_codec import CrossAttentionCodec
 from train_codec import CodecDataset, load_tokenizer
-
 
 
 def evaluate(codec, tokenizer, corpus_paths, text_key, max_seq_len,
@@ -202,6 +202,7 @@ def main():
     parser.add_argument("--n_show", type=int, default=5)
 
     # 모델 (체크포인트 없을 때)
+    parser.add_argument("--codec", choices=["conv", "xattn"], default="conv")
     parser.add_argument("--d_model", type=int, default=256)
     parser.add_argument("--stride", type=int, default=4)
     parser.add_argument("--n_layers", type=int, default=3)
@@ -213,27 +214,34 @@ def main():
     tokenizer = load_tokenizer(args.tokenizer)
 
     # 모델 로드
+    def _make_codec(saved_args, fallback_args):
+        codec_type = saved_args.get("codec", fallback_args.codec)
+        d = saved_args.get("d_model", fallback_args.d_model)
+        s = saved_args.get("stride", fallback_args.stride)
+        nl = saved_args.get("n_layers", fallback_args.n_layers)
+        if codec_type == "xattn":
+            return CrossAttentionCodec(
+                vocab_size=tokenizer.vocab_size, d_model=d, stride=s,
+                n_local_layers=nl,
+                n_heads=saved_args.get("n_heads", 4),
+                dropout=saved_args.get("dropout", 0.1),
+            )
+        else:
+            return ConvCodec(
+                vocab_size=tokenizer.vocab_size, d_model=d, stride=s,
+                n_layers=nl,
+                kernel_size=saved_args.get("kernel_size", fallback_args.kernel_size),
+            )
+
     if args.checkpoint:
         ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
         saved_args = ckpt.get("args", {})
-        codec = ConvCodec(
-            vocab_size=tokenizer.vocab_size,
-            d_model=saved_args.get("d_model", args.d_model),
-            stride=saved_args.get("stride", args.stride),
-            n_layers=saved_args.get("n_layers", args.n_layers),
-            kernel_size=saved_args.get("kernel_size", args.kernel_size),
-        ).to(device)
+        codec = _make_codec(saved_args, args).to(device)
         codec.load_state_dict(ckpt["model"])
         step = ckpt.get("step", "?")
         print(f"체크포인트 로드: {args.checkpoint} (step {step})")
     else:
-        codec = ConvCodec(
-            vocab_size=tokenizer.vocab_size,
-            d_model=args.d_model,
-            stride=args.stride,
-            n_layers=args.n_layers,
-            kernel_size=args.kernel_size,
-        ).to(device)
+        codec = _make_codec({}, args).to(device)
         print("체크포인트 없음 — 랜덤 초기화 모델로 평가")
 
     n_params = sum(p.numel() for p in codec.parameters())

@@ -15,6 +15,7 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from codec.conv_codec import ConvCodec
+from codec.xattn_codec import CrossAttentionCodec
 from train_codec import load_tokenizer
 
 
@@ -80,13 +81,21 @@ def analyze(args):
     # 체크포인트 로드
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     saved_args = ckpt.get("args", {})
-    codec = ConvCodec(
-        vocab_size=tokenizer.vocab_size,
-        d_model=saved_args.get("d_model", args.d_model),
-        stride=saved_args.get("stride", args.stride),
-        n_layers=saved_args.get("n_layers", 3),
-        kernel_size=saved_args.get("kernel_size", 5),
-    ).to(device)
+    codec_type = saved_args.get("codec", "conv")
+    d = saved_args.get("d_model", args.d_model)
+    s = saved_args.get("stride", args.stride)
+    if codec_type == "xattn":
+        codec = CrossAttentionCodec(
+            vocab_size=tokenizer.vocab_size, d_model=d, stride=s,
+            n_local_layers=saved_args.get("n_layers", 2),
+            n_heads=saved_args.get("n_heads", 4),
+        ).to(device)
+    else:
+        codec = ConvCodec(
+            vocab_size=tokenizer.vocab_size, d_model=d, stride=s,
+            n_layers=saved_args.get("n_layers", 3),
+            kernel_size=saved_args.get("kernel_size", 5),
+        ).to(device)
     codec.load_state_dict(ckpt["model"])
     codec.eval()
 
