@@ -3,6 +3,7 @@
 # jamo 토크나이저, stride 4/8/16
 
 set -e
+export PYTHONUNBUFFERED=1
 
 CORPUS="corpus/val.parquet"
 EVAL_CORPUS="corpus/test.parquet"

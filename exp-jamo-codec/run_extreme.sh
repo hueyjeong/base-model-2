@@ -3,6 +3,7 @@
 # jamo 토크나이저 기준 (Phase 1에서 차이 없었으므로 대표 1종)
 
 set -e
+export PYTHONUNBUFFERED=1
 
 CORPUS="corpus/val.parquet"
 EVAL_CORPUS="corpus/test.parquet"

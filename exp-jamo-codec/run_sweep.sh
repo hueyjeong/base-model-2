@@ -3,6 +3,7 @@
 # 학습: val.parquet, 평가: test.parquet
 
 set -e
+export PYTHONUNBUFFERED=1
 
 CORPUS="corpus/val.parquet"
 EVAL_CORPUS="corpus/test.parquet"
