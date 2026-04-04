@@ -30,3 +30,47 @@ Phase 1(Conv) → 2(Cross-Attention) → 3(가변 패칭) → 4(Backbone 통합)
 
 ---
 
+## 2026-04-05 — Phase 1 결과: Conv Codec 9조합 sweep
+
+### 실험 설정
+
+- 학습: val.parquet (525만 rows), 평가: test.parquet (525만 rows)
+- 모델: ConvCodec d=256, 3 layers, kernel=5 (2.6~4.2M params)
+- 10K steps, batch=32, seq=512, lr=3e-4, BF16
+- 9조합: 3 토크나이저(byte/jamo/keyboard) × 3 stride(2/4/8)
+
+### 결과
+
+| 조합 | 500step | 1000step | 2000step | test 토큰acc | test seq EM |
+|------|---------|----------|----------|-------------|-------------|
+| byte_s2 | 83.8% | 99.98% | 100% | 100% | 100% |
+| byte_s4 | 81.8% | 99.95% | 100% | 100% | 100% |
+| byte_s8 | 78.8% | 99.86% | 100% | 100% | 100% |
+| jamo_s2 | 84.0% | 99.95% | 100% | 100% | 100% |
+| jamo_s4 | 81.5% | 99.89% | 100% | 100% | 100% |
+| jamo_s8 | 79.2% | 99.74% | 99.99% | 100% | **99.95%** |
+| kbd_s2 | 85.0% | 99.96% | 100% | 100% | 100% |
+| kbd_s4 | 82.7% | 99.89% | 100% | 100% | 100% |
+| kbd_s8 | 80.7% | 99.76% | 99.99% | 100% | 100% |
+
+레이턴시 (GPU, stride=4 기준):
+- seq=512: encode 0.37ms, decode 0.36ms, total 0.73ms
+- seq=2048: encode 0.47ms, decode 0.55ms, total 1.02ms
+
+### 관찰
+
+1. **Conv 3M params로 모든 조합에서 거의 완벽 복원** — 2K steps면 수렴
+2. **입력 표현 간 차이 거의 없음** — byte/jamo/keyboard 모두 동일 수준
+3. **stride=8에서도 복원 가능** — jamo_s8만 seq EM 99.95%, 나머지 100%
+4. **codec 레이턴시 무시 가능** — seq=2048에서 총 1ms
+5. **복원은 쉬운 태스크** — Conv baseline만으로 충분, cross-attention 불필요
+
+### 시사점
+
+- 복원 정확도만으로는 codec 구조/입력 표현 간 차별화 불가
+- 진짜 차이는 **backbone 결합 후 downstream(GEC) 성능**에서 나올 것
+- Phase 2(cross-attention) 건너뛰고 **Phase 4(backbone 통합) 직행** 고려
+- 또는: 더 높은 압축률(16x, 32x) 실험하여 Conv의 한계점 탐색
+
+---
+
