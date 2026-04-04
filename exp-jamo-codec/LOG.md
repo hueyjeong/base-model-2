@@ -137,9 +137,12 @@ Phase 1(Conv) → 2(Cross-Attention) → 3(가변 패칭) → 4(Backbone 통합)
 ### 결론
 
 - Conv codec의 z 공간은 의미적 거리를 보존 + 오타에 대한 robustness 보유
-- **Phase 2/3 스킵, Phase 4 backbone 통합 직행 권장**
-- stride=8~16이 적절한 트레이드오프 (복원 100% + 분리도 좋음)
-- stride=32는 복원은 약간 떨어지지만 z 구조는 가장 유리
+- Conv 결과는 **하한선** — cross-attention/가변 패칭이 더 나은 z 구조를 만들 수 있음
+  - z의 오타 cos_sim 0.9 → 0.95+ 가능?
+  - 저빈도어(인명/신조어)에서 가변 패칭의 이점?
+  - downstream GEC 성능에서의 차이?
+- Phase 2/3을 Conv baseline 대비 비교 실험으로 진행
+- stride=8~16이 현재까지 적절한 트레이드오프 (복원 100% + 분리도 좋음)
 
 ---
 
