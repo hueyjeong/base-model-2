@@ -43,7 +43,7 @@ for NLAYER in 2 4 6 8; do
           --max_seq_len ${SEQ_LEN} \
           --batch_size ${BATCH_SIZE} --max_steps ${MAX_STEPS} \
           --lr 3e-4 --warmup_steps 2000 \
-          --bf16 --num_workers 2 \
+          --bf16 --compile --num_workers 2 \
           --log_every ${LOG_EVERY} --save_every ${SAVE_EVERY} \
           --out_dir ${OUT_BASE}
 
@@ -90,7 +90,7 @@ for NLAYER in 3 6 9; do
           --max_seq_len ${SEQ_LEN} \
           --batch_size ${BATCH_SIZE} --max_steps ${MAX_STEPS} \
           --lr 3e-4 --warmup_steps 2000 \
-          --bf16 --num_workers 2 \
+          --bf16 --compile --num_workers 2 \
           --log_every ${LOG_EVERY} --save_every ${SAVE_EVERY} \
           --out_dir ${OUT_BASE}
 

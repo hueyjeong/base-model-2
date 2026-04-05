@@ -198,13 +198,21 @@ def train(args):
     else:
         raise ValueError(f"알 수 없는 codec: {args.codec}")
 
-    if is_distributed:
-        codec = DDP(codec, device_ids=[rank])
-
     n_params = sum(p.numel() for p in codec.parameters())
     if rank == 0:
         print(f"{codec_name}: d={args.d_model}, stride={args.stride}, "
               f"layers={args.n_layers}, params={n_params/1e6:.2f}M")
+
+    # torch.compile
+    if args.compile:
+        if rank == 0:
+            print("torch.compile 적용 중...")
+        codec = torch.compile(codec)
+        if rank == 0:
+            print("torch.compile 완료")
+
+    if is_distributed:
+        codec = DDP(codec, device_ids=[rank])
 
     # 데이터
     dataset = CodecDataset(
@@ -370,6 +378,7 @@ def main():
     parser.add_argument("--max_steps", type=int, default=10000)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--bf16", action="store_true")
+    parser.add_argument("--compile", action="store_true", help="torch.compile 적용")
     parser.add_argument("--num_workers", type=int, default=2)
 
     # 로깅/저장
