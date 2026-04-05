@@ -334,6 +334,17 @@ Phase 1(Conv) → 2(Cross-Attention) → 3(가변 패칭) → 4(Backbone 통합)
   - XAttn: 어디든 attend 가능 → 가변 경계 적응에 유리
 - 일정 수준까지 학습시켜서 성능 차이 확인 필요
 
+**BLT 원본 구조 참고 (Meta, 2024.12)**
+- 인코더: self-attention + cross-attention 교대, **hash n-gram 있으면 1L로 충분**
+- 디코더: cross-attention + transformer 교대, 9L (인코더 아낀 예산을 디코더로)
+- 엔트로피 모델: 1M~100M 테스트, **50M 넘으면 수확 체감**, 실사용 100M/14L/d=512
+- 스케일링: 400M→8B (20x)에서 인/디코더는 2배만 증가 → 대형일수록 비중 감소
+- hash n-gram: 3~8gram rolling hash → embedding table → 바이트 embedding에 합산
+  - 없으면 0.850 BPB → 있으면 0.826 BPB (큰 차이)
+  - 인코더 레이어를 대체: hash+1L+디코더9L (0.822) > 5L+5L (0.844)
+  - 3~5gram이 6~8gram보다 중요, ~300K embedding이면 포화
+  - Conv encoder는 BLT에서 **테스트 안 함** — 우리 실험에서 Conv가 압도했으므로 Conv+hash n-gram 조합도 실험 대상
+
 **실험 순서 (우선순위)**
 0. **KoELECTRA-base GEC fine-tune** — 타겟 수치 확보 (pretrain 비용 0)
    - KEEP 정확도 (원문 망가지는 비율), Precision 확인
