@@ -301,5 +301,38 @@ Phase 1(Conv) → 2(Cross-Attention) → 3(가변 패칭) → 4(Backbone 통합)
 - `torch.compile` → `_orig_mod.` 접두사 문제: `_unwrap_state_dict`에서 키 이름 직접 strip
 - `eval_codec.py`, `analyze_z.py`에도 로드 시 strip 추가
 
+### 생각 정리: 앞으로 결정해야 할 것들
+
+**1. 모델 예산 배분 (128M 기준)**
+- 동적 패치를 쓰면 엔트로피 모델 + 인/디코더 + backbone으로 예산이 나뉨
+- Conv codec 3~9M → 부담 없음. 문제는 엔트로피 모델
+- BLT는 1B 모델에서 50M 엔트로피 모델 (5%) → 128M 기준이면 50M은 ~40%로 과도
+- 소형 엔트로피 모델(0.5M~5M)이 실용적 수준인지 스케일링 실험 필요
+
+**2. 인/디코더 용량 (expand, layers)**
+- 고정 stride에서는 로컬 패턴만 학습 → 3~5M이면 충분 (이번 실험에서 확인)
+- 동적 패치에서는 엔트로피 모델이 정해준 가변 경계에 맞춰야 하니 더 어려운 태스크
+- 현재 expand=3 (d_ff = 3 × d_model). 더 늘릴지, 레이어를 추가할지 ablation 대상
+- 동적 패치에서는 BBPE/WordPiece처럼 패치 하나가 의미 덩어리가 되므로, 인코더가 그 의미를 잘 압축해야 → 용량 요구가 올라갈 수 있음
+
+**3. 토크나이저 옥석 가리기**
+- byte vs jamo(keyboard-SHIFT) vs keyboard — 동일 조건 비교 아직 미수행
+- Phase 1에서 "차이 없다"고 봤지만 고정 stride 10K steps 기준이었음
+- 동적 패치 + 더 긴 학습에서는 차이 날 수 있음 (특히 jamo의 음절 구조 정보)
+
+**4. Conv vs XAttn — 동적 패치에서 재대결**
+- 고정 stride에서는 Conv 압도적 (100% vs 96%, 3x 빠름)
+- 하지만 가변 길이 패치에서는 XAttn이 유리할 수 있음
+  - Conv: 고정 receptive field → 패치 길이 변동에 약할 수 있음
+  - XAttn: 어디든 attend 가능 → 가변 경계 적응에 유리
+- 일정 수준까지 학습시켜서 성능 차이 확인 필요
+
+**실험 순서 (우선순위)**
+1. 레이어 스케일링 완료 (6L/8L + Conv) — 진행 중
+2. 토크나이저 ablation (빠름, 현재 설정 재활용)
+3. Conv vs XAttn 동적 패치 비교
+4. 엔트로피 모델 스케일링
+5. 최종 예산 배분 → Phase 4 backbone 통합
+
 ---
 
