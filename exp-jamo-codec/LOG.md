@@ -335,6 +335,10 @@ Phase 1(Conv) → 2(Cross-Attention) → 3(가변 패칭) → 4(Backbone 통합)
 - 일정 수준까지 학습시켜서 성능 차이 확인 필요
 
 **실험 순서 (우선순위)**
+0. **KoELECTRA-base GEC fine-tune** — 타겟 수치 확보 (pretrain 비용 0)
+   - KEEP 정확도 (원문 망가지는 비율), Precision 확인
+   - 이 결과가 codec 방식이 이겨야 할 baseline
+   - 레이어 스케일링과 병렬 가능
 1. 레이어 스케일링 완료 (6L/8L + Conv) — 진행 중
 2. 엔트로피 모델 스케일링 (byte, 0.5M → 5M → 50M) — 적정 크기 탐색
 3. 동적 패치에서 Conv vs XAttn 비교 — 가변 경계 적응 능력 비교
@@ -346,6 +350,12 @@ Phase 1(Conv) → 2(Cross-Attention) → 3(가변 패칭) → 4(Backbone 통합)
 7. 양자화 내성 테스트 (INT8, INT4 등)
    - 인/디코더, 엔트로피 모델, backbone 각각
    - 어느 수준까지 정확도 유지하는지 → 메모리 절감 + 추론 속도 향상
+
+### 메모: KoELECTRA baseline이 필요한 이유
+
+- KoELECTRA-base = WordPiece + RTD pretrain 완료 모델 → GEC fine-tune만 하면 baseline 수치 확보
+- 이 수치가 codec 방식이 이겨야 할 타겟
+- pretrain 비용 0, fine-tune만 → 레이어 스케일링과 병렬 가능
 
 ---
 
