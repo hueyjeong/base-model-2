@@ -268,13 +268,17 @@ def train(args):
     accum_total = 0
     t_start = time.time()
 
+    grad_accum = args.grad_accum_steps
     if rank == 0:
-        print(f"\n학습 시작: max_steps={args.max_steps}, batch={args.batch_size}, "
-              f"seq_len={args.max_seq_len}"
+        eff_batch = args.batch_size * grad_accum
+        print(f"\n학습 시작: max_steps={args.max_steps}, batch={args.batch_size}"
+              + (f"×{grad_accum}={eff_batch}" if grad_accum > 1 else "")
+              + f", seq_len={args.max_seq_len}"
               + (f", DDP {world_size} GPUs" if is_distributed else ""))
         print(f"{'step':>8} {'loss':>8} {'bpb':>7} {'acc':>8} {'lr':>10} {'tok/s':>8}")
         print("-" * 58)
 
+    micro_step = 0
     for batch in loader:
         if global_step >= args.max_steps:
             break
@@ -284,9 +288,24 @@ def train(args):
 
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
             out = codec(ids, pad_mask)
-            loss = out["loss"]
+            loss = out["loss"] / grad_accum
 
         loss.backward()
+
+        # 통계 (스케일 전 loss 기록)
+        with torch.no_grad():
+            pred = out["logits"].argmax(dim=-1)
+            valid = pad_mask & (ids != 0)
+            correct = ((pred == ids) & valid).sum().item()
+            total = valid.sum().item()
+
+        accum_loss += loss.item() * grad_accum  # 원래 스케일로 복원
+        accum_correct += correct
+        accum_total += total
+        micro_step += 1
+
+        if micro_step % grad_accum != 0:
+            continue
 
         if args.max_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(codec.parameters(), args.max_grad_norm)
@@ -294,17 +313,6 @@ def train(args):
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad(set_to_none=True)
-
-        # 통계
-        with torch.no_grad():
-            pred = out["logits"].argmax(dim=-1)
-            valid = pad_mask & (ids != 0)  # PAD 제외
-            correct = ((pred == ids) & valid).sum().item()
-            total = valid.sum().item()
-
-        accum_loss += loss.item()
-        accum_correct += correct
-        accum_total += total
         global_step += 1
 
         # 로깅
@@ -389,6 +397,7 @@ def main():
     parser.add_argument("--warmup_steps", type=int, default=500)
     parser.add_argument("--max_steps", type=int, default=10000)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--grad_accum_steps", type=int, default=1)
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--compile", action="store_true", help="torch.compile 적용")
     parser.add_argument("--num_workers", type=int, default=2)

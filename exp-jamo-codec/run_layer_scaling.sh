@@ -10,7 +10,8 @@ CORPUS="corpus/val.parquet"
 EVAL_CORPUS="corpus/test.parquet"
 TEXT_KEY="text"
 MAX_STEPS=25000
-BATCH_SIZE=256
+BATCH_SIZE=128
+GRAD_ACCUM=2
 SEQ_LEN=512
 D_MODEL=256
 LOG_EVERY=2000
@@ -49,8 +50,31 @@ python exp-jamo-codec/analyze_z.py \
 echo ""
 echo ""
 
-# ── XAttn 4L/6L/8L: 학습 + eval ──
-for NLAYER in 4 6 8; do
+# ── XAttn 4L: 기존 체크포인트로 eval/z분석만 ──
+TAG="xattn_4L_s${STRIDE}"
+CKPT="${OUT_BASE}/${TAG}_final.pt"
+echo "══════════════════════════════════════════"
+echo "[${TAG}] XAttn 4L — 학습 스킵, 체크포인트 eval만"
+echo "══════════════════════════════════════════"
+
+echo "[${TAG}] 평가"
+python exp-jamo-codec/eval_codec.py \
+  --checkpoint ${CKPT} \
+  --tokenizer ${TOK} \
+  --corpus ${EVAL_CORPUS} --text_key ${TEXT_KEY} \
+  --max_seq_len ${SEQ_LEN} \
+  --batch_size 64 --max_samples 2000 --n_show 2
+
+echo ""
+echo "[${TAG}] z 공간 분석"
+python exp-jamo-codec/analyze_z.py \
+  --checkpoint ${CKPT} --tokenizer ${TOK}
+
+echo ""
+echo ""
+
+# ── XAttn 6L/8L: 학습 + eval ──
+for NLAYER in 6 8; do
     TAG="xattn_${NLAYER}L_s${STRIDE}"
     CKPT="${OUT_BASE}/${TAG}_final.pt"
 
@@ -64,7 +88,7 @@ for NLAYER in 4 6 8; do
       --d_model ${D_MODEL} --n_layers ${NLAYER} \
       --corpus ${CORPUS} --text_key ${TEXT_KEY} \
       --max_seq_len ${SEQ_LEN} \
-      --batch_size ${BATCH_SIZE} --max_steps ${MAX_STEPS} \
+      --batch_size ${BATCH_SIZE} --grad_accum_steps ${GRAD_ACCUM} --max_steps ${MAX_STEPS} \
       --lr 2.4e-3 --warmup_steps 250 \
       --bf16 --compile --num_workers 2 \
       --log_every ${LOG_EVERY} --save_every ${SAVE_EVERY} \
@@ -108,7 +132,7 @@ for NLAYER in 3 6 9; do
       --d_model ${D_MODEL} --n_layers ${NLAYER} \
       --corpus ${CORPUS} --text_key ${TEXT_KEY} \
       --max_seq_len ${SEQ_LEN} \
-      --batch_size ${BATCH_SIZE} --max_steps ${MAX_STEPS} \
+      --batch_size ${BATCH_SIZE} --grad_accum_steps ${GRAD_ACCUM} --max_steps ${MAX_STEPS} \
       --lr 2.4e-3 --warmup_steps 250 \
       --bf16 --compile --num_workers 2 \
       --log_every ${LOG_EVERY} --save_every ${SAVE_EVERY} \
