@@ -1,7 +1,8 @@
-"""Conv Codec 단독 학습 스크립트
+"""Codec 학습 스크립트 (Conv / XAttn / Entropy)
 
 토크나이저 3종(byte/jamo/keyboard) × 압축률(2/4/8) sweep.
 코퍼스에서 스트리밍으로 읽어 codec reconstruction 학습.
+DDP 지원 (torchrun --nproc_per_node=N).
 """
 import argparse
 import json
@@ -12,12 +13,15 @@ import time
 
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, IterableDataset
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from codec.conv_codec import ConvCodec
 from codec.xattn_codec import CrossAttentionCodec
+from codec.entropy_codec import EntropyPatchCodec
 
 
 # ── 데이터셋 ──────────────────────────────────────────────────────────
@@ -127,12 +131,26 @@ def load_tokenizer(name: str):
 # ── 학습 루프 ──────────────────────────────────────────────────────────
 
 def train(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    # DDP 초기화
+    is_distributed = "RANK" in os.environ
+    if is_distributed:
+        dist.init_process_group("nccl")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        device = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(device)
+    else:
+        rank = 0
+        world_size = 1
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if rank == 0:
+        print(f"Device: {device}" + (f" (DDP {world_size} GPUs)" if is_distributed else ""))
 
     # 토크나이저
     tokenizer = load_tokenizer(args.tokenizer)
-    print(f"토크나이저: {args.tokenizer} (vocab={tokenizer.vocab_size})")
+    if rank == 0:
+        print(f"토크나이저: {args.tokenizer} (vocab={tokenizer.vocab_size})")
 
     # 모델
     if args.codec == "conv":
@@ -155,11 +173,38 @@ def train(args):
             dropout=args.dropout,
         ).to(device)
         codec_name = "XAttnCodec"
+    elif args.codec == "entropy_conv":
+        codec = EntropyPatchCodec(
+            vocab_size=tokenizer.vocab_size,
+            d_model=args.d_model,
+            encoder_type="conv",
+            entropy_threshold=args.entropy_threshold,
+            n_layers=args.n_layers,
+            kernel_size=args.kernel_size,
+            dropout=args.dropout,
+        ).to(device)
+        codec_name = "EntropyConv"
+    elif args.codec == "entropy_xattn":
+        codec = EntropyPatchCodec(
+            vocab_size=tokenizer.vocab_size,
+            d_model=args.d_model,
+            encoder_type="xattn",
+            entropy_threshold=args.entropy_threshold,
+            n_layers=args.n_layers,
+            n_heads=args.n_heads,
+            dropout=args.dropout,
+        ).to(device)
+        codec_name = "EntropyXAttn"
     else:
         raise ValueError(f"알 수 없는 codec: {args.codec}")
+
+    if is_distributed:
+        codec = DDP(codec, device_ids=[rank])
+
     n_params = sum(p.numel() for p in codec.parameters())
-    print(f"{codec_name}: d={args.d_model}, stride={args.stride}, "
-          f"layers={args.n_layers}, params={n_params/1e6:.2f}M")
+    if rank == 0:
+        print(f"{codec_name}: d={args.d_model}, stride={args.stride}, "
+              f"layers={args.n_layers}, params={n_params/1e6:.2f}M")
 
     # 데이터
     dataset = CodecDataset(
@@ -203,10 +248,12 @@ def train(args):
     accum_total = 0
     t_start = time.time()
 
-    print(f"\n학습 시작: max_steps={args.max_steps}, batch={args.batch_size}, "
-          f"seq_len={args.max_seq_len}")
-    print(f"{'step':>8} {'loss':>8} {'acc':>8} {'lr':>10} {'tok/s':>8}")
-    print("-" * 50)
+    if rank == 0:
+        print(f"\n학습 시작: max_steps={args.max_steps}, batch={args.batch_size}, "
+              f"seq_len={args.max_seq_len}"
+              + (f", DDP {world_size} GPUs" if is_distributed else ""))
+        print(f"{'step':>8} {'loss':>8} {'acc':>8} {'lr':>10} {'tok/s':>8}")
+        print("-" * 50)
 
     for batch in loader:
         if global_step >= args.max_steps:
@@ -241,11 +288,13 @@ def train(args):
         global_step += 1
 
         # 로깅
-        if global_step % args.log_every == 0:
+        if global_step % args.log_every == 0 and rank == 0:
             dt = time.time() - t_start
             avg_loss = accum_loss / args.log_every
             avg_acc = accum_correct / max(accum_total, 1) * 100
             tok_s = accum_total / max(dt, 1e-6)
+            if is_distributed:
+                tok_s *= world_size  # 전체 GPU 합산
             lr = scheduler.get_last_lr()[0]
 
             print(f"{global_step:8d} {avg_loss:8.4f} {avg_acc:7.2f}% {lr:10.2e} {tok_s:8.0f}")
@@ -256,33 +305,39 @@ def train(args):
             t_start = time.time()
 
         # 체크포인트
-        if args.save_every > 0 and global_step % args.save_every == 0:
+        if args.save_every > 0 and global_step % args.save_every == 0 and rank == 0:
+            model_sd = codec.module.state_dict() if is_distributed else codec.state_dict()
             save_path = os.path.join(
                 args.out_dir, f"{args.codec}_{args.tokenizer}_s{args.stride}_step{global_step}.pt"
             )
             os.makedirs(args.out_dir, exist_ok=True)
             torch.save({
-                "model": codec.state_dict(),
+                "model": model_sd,
                 "optimizer": optimizer.state_dict(),
                 "step": global_step,
                 "args": vars(args),
             }, save_path)
             print(f"  → 체크포인트 저장: {save_path}")
 
-    print(f"\n학습 완료: {global_step} steps")
+    if rank == 0:
+        print(f"\n학습 완료: {global_step} steps")
 
     # 최종 저장
-    if args.out_dir:
+    if args.out_dir and rank == 0:
+        model_sd = codec.module.state_dict() if is_distributed else codec.state_dict()
         save_path = os.path.join(
             args.out_dir, f"{args.codec}_{args.tokenizer}_s{args.stride}_final.pt"
         )
         os.makedirs(args.out_dir, exist_ok=True)
         torch.save({
-            "model": codec.state_dict(),
+            "model": model_sd,
             "step": global_step,
             "args": vars(args),
         }, save_path)
         print(f"최종 저장: {save_path}")
+
+    if is_distributed:
+        dist.destroy_process_group()
 
 
 # ── CLI ────────────────────────────────────────────────────────────────
@@ -297,7 +352,8 @@ def main():
     parser.add_argument("--max_seq_len", type=int, default=512)
 
     # 모델
-    parser.add_argument("--codec", choices=["conv", "xattn"], default="conv")
+    parser.add_argument("--codec", choices=["conv", "xattn", "entropy_conv", "entropy_xattn"], default="conv")
+    parser.add_argument("--entropy_threshold", type=float, default=8.0)
     parser.add_argument("--d_model", type=int, default=256)
     parser.add_argument("--stride", type=int, default=4)
     parser.add_argument("--n_layers", type=int, default=3)
