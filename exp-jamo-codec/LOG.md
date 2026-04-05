@@ -329,10 +329,16 @@ Phase 1(Conv) → 2(Cross-Attention) → 3(가변 패칭) → 4(Backbone 통합)
 
 **실험 순서 (우선순위)**
 1. 레이어 스케일링 완료 (6L/8L + Conv) — 진행 중
-2. 토크나이저 ablation (빠름, 현재 설정 재활용)
-3. Conv vs XAttn 동적 패치 비교
-4. 엔트로피 모델 스케일링
-5. 최종 예산 배분 → Phase 4 backbone 통합
+2. 엔트로피 모델 스케일링 (byte, 0.5M → 5M → 50M) — 적정 크기 탐색
+3. 동적 패치에서 Conv vs XAttn 비교 — 가변 경계 적응 능력 비교
+4. 토크나이저 ablation (byte vs jamo vs keyboard) — 동적 패치 기준으로
+5. 최종 예산 배분 결정 → Phase 4 backbone 통합
+6. 인/디코더 + 엔트로피 모델에 ModernBERT 구조 적용 (Full/Sliding Window Attention, RoPE)
+   - 성능 하락 없이 추론 속도 향상 가능한지 확인
+   - backbone 완성 후에도 동일 실험
+7. 양자화 내성 테스트 (INT8, INT4 등)
+   - 인/디코더, 엔트로피 모델, backbone 각각
+   - 어느 수준까지 정확도 유지하는지 → 메모리 절감 + 추론 속도 향상
 
 ---
 
