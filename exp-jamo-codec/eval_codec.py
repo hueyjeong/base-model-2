@@ -241,7 +241,12 @@ def main():
         ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
         saved_args = ckpt.get("args", {})
         codec = _make_codec(saved_args, args).to(device)
-        codec.load_state_dict(ckpt["model"])
+        # torch.compile _orig_mod. 접두사 제거
+        sd = ckpt["model"]
+        prefix = "_orig_mod."
+        if any(k.startswith(prefix) for k in sd):
+            sd = {k[len(prefix):] if k.startswith(prefix) else k: v for k, v in sd.items()}
+        codec.load_state_dict(sd)
         step = ckpt.get("step", "?")
         print(f"체크포인트 로드: {args.checkpoint} (step {step})")
     else:

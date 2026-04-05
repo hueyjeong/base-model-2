@@ -96,7 +96,12 @@ def analyze(args):
             n_layers=saved_args.get("n_layers", 3),
             kernel_size=saved_args.get("kernel_size", 5),
         ).to(device)
-    codec.load_state_dict(ckpt["model"])
+    # torch.compile _orig_mod. 접두사 제거
+    sd = ckpt["model"]
+    prefix = "_orig_mod."
+    if any(k.startswith(prefix) for k in sd):
+        sd = {k[len(prefix):] if k.startswith(prefix) else k: v for k, v in sd.items()}
+    codec.load_state_dict(sd)
     codec.eval()
 
     stride = saved_args.get("stride", args.stride)
