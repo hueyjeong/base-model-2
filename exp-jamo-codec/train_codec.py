@@ -252,8 +252,8 @@ def train(args):
         print(f"\n학습 시작: max_steps={args.max_steps}, batch={args.batch_size}, "
               f"seq_len={args.max_seq_len}"
               + (f", DDP {world_size} GPUs" if is_distributed else ""))
-        print(f"{'step':>8} {'loss':>8} {'acc':>8} {'lr':>10} {'tok/s':>8}")
-        print("-" * 50)
+        print(f"{'step':>8} {'loss':>8} {'bpb':>7} {'acc':>8} {'lr':>10} {'tok/s':>8}")
+        print("-" * 58)
 
     for batch in loader:
         if global_step >= args.max_steps:
@@ -291,13 +291,14 @@ def train(args):
         if global_step % args.log_every == 0 and rank == 0:
             dt = time.time() - t_start
             avg_loss = accum_loss / args.log_every
+            bpb = avg_loss / math.log(2)  # bits-per-byte (CE nats → bits)
             avg_acc = accum_correct / max(accum_total, 1) * 100
             tok_s = accum_total / max(dt, 1e-6)
             if is_distributed:
                 tok_s *= world_size  # 전체 GPU 합산
             lr = scheduler.get_last_lr()[0]
 
-            print(f"{global_step:8d} {avg_loss:8.4f} {avg_acc:7.2f}% {lr:10.2e} {tok_s:8.0f}")
+            print(f"{global_step:8d} {avg_loss:8.4f} {bpb:7.4f} {avg_acc:7.2f}% {lr:10.2e} {tok_s:8.0f}")
 
             accum_loss = 0.0
             accum_correct = 0

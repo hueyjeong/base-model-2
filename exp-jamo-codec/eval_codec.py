@@ -96,11 +96,15 @@ def evaluate(codec, tokenizer, corpus_paths, text_key, max_seq_len,
     seq_em = seq_exact / max(seq_total, 1)
     avg_loss = total_loss / max(n_batches, 1)
 
+    import math as _math
+    bpb = avg_loss / _math.log(2)
+
     return {
         "token_acc": token_acc,
         "char_acc": char_acc,
         "seq_exact_match": seq_em,
         "avg_loss": avg_loss,
+        "bpb": bpb,
         "n_sequences": seq_total,
         "n_tokens": total_tokens,
     }
@@ -258,6 +262,7 @@ def main():
     print(f"  문자 정확도:   {metrics['char_acc']*100:.2f}%")
     print(f"  시퀀스 EM:     {metrics['seq_exact_match']*100:.2f}%")
     print(f"  평균 loss:     {metrics['avg_loss']:.4f}")
+    print(f"  BPB:           {metrics['bpb']:.4f}")
     print(f"  평가 시퀀스:   {metrics['n_sequences']}")
     print(f"  평가 토큰:     {metrics['n_tokens']}")
 
