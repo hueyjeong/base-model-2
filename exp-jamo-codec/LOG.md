@@ -435,6 +435,12 @@ Phase 1(Conv) → 2(Cross-Attention) → 3(가변 패칭) → 4(Backbone 통합)
 - Hash n-gram은 Conv codec에서 불필요 — XAttn/Transformer encoder에서만 유효
 - 남은 실험은 이 Conv 1L 위에서 진행
 
+### 나중에 시도 가능한 것 (현재 100% 천장이라 불필요, 성능 모자랄 때 후보)
+
+- ConvBlock의 GELU → SwiGLU 교체
+- LayerNorm → RMSNorm 교체
+- FFN 추가 (현재 Conv→Norm→GELU만, 별도 FFN 없음)
+
 ---
 
 ### 메모: KoELECTRA baseline이 필요한 이유
