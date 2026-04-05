@@ -235,6 +235,7 @@ def main():
                 vocab_size=tokenizer.vocab_size, d_model=d, stride=s,
                 n_layers=nl,
                 kernel_size=saved_args.get("kernel_size", fallback_args.kernel_size),
+                use_hash_ngram=saved_args.get("use_hash_ngram", False),
             )
 
     if args.checkpoint:

@@ -95,6 +95,7 @@ def analyze(args):
             vocab_size=tokenizer.vocab_size, d_model=d, stride=s,
             n_layers=saved_args.get("n_layers", 3),
             kernel_size=saved_args.get("kernel_size", 5),
+            use_hash_ngram=saved_args.get("use_hash_ngram", False),
         ).to(device)
     # torch.compile _orig_mod. 접두사 제거
     sd = ckpt["model"]

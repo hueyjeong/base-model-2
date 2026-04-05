@@ -10,6 +10,87 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class HashNgramEmbedding(nn.Module):
+    """Hash n-gram embedding — BLT 방식
+
+    각 위치에서 n-gram(3~8)의 rolling polynomial hash → embedding table lookup → 합산.
+    base embedding에 더해서 로컬 문맥 정보를 입력 단계에서 주입.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        ngram_sizes: tuple = (3, 4, 5, 6, 7, 8),
+        table_size: int = 10000,
+        embed_dim: int = 64,
+    ):
+        super().__init__()
+        self.ngram_sizes = ngram_sizes
+        self.table_size = table_size
+        # n-gram 크기별 embedding table (작은 차원)
+        self.tables = nn.ModuleList([
+            nn.Embedding(table_size, embed_dim, padding_idx=0)
+            for _ in ngram_sizes
+        ])
+        # 작은 차원 → d_model로 projection
+        self.proj = nn.Linear(embed_dim, d_model, bias=False)
+        # 초기화: 작은 값으로 (base embedding 대비 보조적 역할)
+        for table in self.tables:
+            nn.init.normal_(table.weight, std=0.02)
+            table.weight.data[0].zero_()
+
+    def _rolling_hash(self, ids: torch.Tensor, n: int) -> torch.Tensor:
+        """Rolling polynomial hash로 n-gram 인덱스 계산
+
+        Args:
+            ids: [B, L] 토큰 ID (long)
+            n: n-gram 크기
+
+        Returns:
+            [B, L] hash 인덱스 (0 = 길이 부족)
+        """
+        B, L = ids.shape
+        if L < n:
+            return torch.zeros(B, L, dtype=torch.long, device=ids.device)
+
+        # polynomial hash: h = (id[0]*P^(n-1) + id[1]*P^(n-2) + ... + id[n-1]) % table_size
+        P = 31
+        MOD = self.table_size
+
+        # powers[i] = P^i % MOD
+        powers = torch.ones(n, dtype=torch.long, device=ids.device)
+        for i in range(1, n):
+            powers[i] = (powers[i - 1] * P) % MOD
+
+        powers = powers.flip(0)  # [P^(n-1), P^(n-2), ..., P^0]
+
+        # ids를 n-gram 윈도우로 unfold: [B, L-n+1, n]
+        ids_long = ids.long()
+        windows = ids_long.unfold(1, n, 1)  # [B, L-n+1, n]
+
+        # hash 계산: 각 윈도우의 weighted sum
+        hashes = (windows * powers.unsqueeze(0).unsqueeze(0)) % MOD
+        hashes = hashes.sum(dim=-1) % MOD  # [B, L-n+1]
+        hashes = hashes.clamp(min=1)  # 0은 padding_idx이므로 회피
+
+        # 앞쪽 n-1 위치는 n-gram 불완전 → 0 (padding)
+        pad = torch.zeros(B, n - 1, dtype=torch.long, device=ids.device)
+        result = torch.cat([pad, hashes], dim=1)  # [B, L]
+        return result
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        """ids: [B, L] → n-gram embedding sum: [B, L, d_model]"""
+        result = None
+        for table, n in zip(self.tables, self.ngram_sizes):
+            indices = self._rolling_hash(ids, n)  # [B, L]
+            emb = table(indices)  # [B, L, embed_dim]
+            if result is None:
+                result = emb
+            else:
+                result = result + emb
+        return self.proj(result)  # [B, L, d_model]
+
+
 class ConvBlock(nn.Module):
     """Conv1d + LayerNorm + GELU + Dropout"""
 
@@ -55,6 +136,7 @@ class ConvCodec(nn.Module):
         n_layers: int = 3,
         kernel_size: int = 5,
         dropout: float = 0.1,
+        use_hash_ngram: bool = False,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -65,6 +147,11 @@ class ConvCodec(nn.Module):
         self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=0)
         self.embed_scale = math.sqrt(d_model)
         self.embed_dropout = nn.Dropout(dropout)
+
+        # Hash n-gram embeddings (BLT 방식)
+        self.use_hash_ngram = use_hash_ngram
+        if use_hash_ngram:
+            self.hash_ngram = HashNgramEmbedding(d_model=d_model)
 
         self.enc_layers = nn.ModuleList(
             [ConvBlock(d_model, kernel_size, dropout) for _ in range(n_layers)]
@@ -111,6 +198,9 @@ class ConvCodec(nn.Module):
         """[B, L] → [B, L//stride, d_model]"""
         ids = self._pad_to_stride(ids)
         x = self.embed_dropout(self.embedding(ids) * self.embed_scale)
+
+        if self.use_hash_ngram:
+            x = x + self.hash_ngram(ids)
 
         for layer in self.enc_layers:
             x = layer(x)
@@ -218,4 +308,24 @@ if __name__ == "__main__":
         print(f"  recon:  {recon.shape}")
         print()
 
-    print("모든 테스트 통과!")
+    # Hash n-gram 테스트
+    print("--- Hash N-gram 테스트 ---\n")
+    for n_layers in [1, 2, 3]:
+        codec = ConvCodec(
+            vocab_size=263, d_model=256, stride=16,
+            n_layers=n_layers, use_hash_ngram=True,
+        )
+        n_params = count_params(codec)
+        B, L = 2, 512
+        ids = torch.randint(1, 263, (B, L))
+        out = codec(ids)
+        loss = out["loss"]
+        loss.backward()
+        grad_ok = all(
+            p.grad is not None and not p.grad.isnan().any()
+            for p in codec.parameters() if p.requires_grad
+        )
+        print(f"Conv {n_layers}L + hash_ngram: {n_params/1e6:.2f}M, "
+              f"loss={loss.item():.4f}, backward={'OK' if grad_ok else 'FAIL'}")
+
+    print("\n모든 테스트 통과!")

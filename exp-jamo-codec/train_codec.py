@@ -173,6 +173,7 @@ def train(args):
             n_layers=args.n_layers,
             kernel_size=args.kernel_size,
             dropout=args.dropout,
+            use_hash_ngram=args.use_hash_ngram,
         ).to(device)
         codec_name = "ConvCodec"
     elif args.codec == "xattn":
@@ -389,6 +390,7 @@ def main():
     parser.add_argument("--kernel_size", type=int, default=5)
     parser.add_argument("--n_heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--use_hash_ngram", action="store_true", help="Hash n-gram embedding 적용 (Conv only)")
 
     # 학습
     parser.add_argument("--batch_size", type=int, default=32)
