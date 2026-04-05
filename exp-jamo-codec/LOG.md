@@ -329,9 +329,8 @@ Phase 1(Conv) → 2(Cross-Attention) → 3(가변 패칭) → 4(Backbone 통합)
 
 **4. Conv vs XAttn — 동적 패치에서 재대결**
 - 고정 stride에서는 Conv 압도적 (100% vs 96%, 3x 빠름)
-- 하지만 가변 길이 패치에서는 XAttn이 유리할 수 있음
-  - Conv: 고정 receptive field → 패치 길이 변동에 약할 수 있음
-  - XAttn: 어디든 attend 가능 → 가변 경계 적응에 유리
+- Conv든 XAttn이든, 동적 패치(가변 경계)가 고정 stride보다 유리할 것으로 예상
+- 둘 중 어느 쪽이 동적 패치에서 나은지는 실험으로 확인
 - 일정 수준까지 학습시켜서 성능 차이 확인 필요
 
 **BLT 원본 구조 참고 (Meta, 2024.12)**
