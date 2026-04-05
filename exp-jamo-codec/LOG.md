@@ -287,7 +287,7 @@ Phase 1(Conv) → 2(Cross-Attention) → 3(가변 패칭) → 4(Backbone 통합)
 
 - 처리량: 2L ~5.6M tok/s, 4L ~3.3M tok/s (compile 효과 큼)
 - **4L이 2L 대비 모든 지표에서 우위** — 토큰acc 100%, 분리도 +0.06
-- Phase 3(jamo s4, 200K, GELU FFN) 96% 정체 vs 여기서 2L도 99.97% → **SwiGLU + 큰 배치 + 높은 lr + byte가 수렴에 유리**
+- Phase 3(jamo s4, 200K, GELU FFN) 96% 정체 vs 여기서 2L도 99.97% → **SwiGLU + 큰 배치 + 높은 lr이 수렴에 유리** (토크나이저 차이는 동일 조건 비교 필요)
 
 ### 6L OOM (batch=256, DDP 4x)
 
