@@ -231,3 +231,36 @@ Phase 1(Conv) → 2(Cross-Attention) → 3(가변 패칭) → 4(Backbone 통합)
 
 ---
 
+## 2026-04-05 — 레이어 스케일링 실험 설계 + 학습 최적화
+
+### 배경
+
+- XAttn 2L이 200K steps에서 96% 천장 → capacity 부족 확정
+- **레이어 수가 독립변수**, stride/토크나이저는 통제변수로 고정
+- 목표: XAttn이 100% 복원 도달하는 최소 레이어 수 탐색 + Conv 동일 조건 비교
+
+### 실험 설계
+
+- **7개 조합**: XAttn 2/4/6/8L + Conv 3/6/9L
+- **stride=16 고정**: Conv가 이미 100% 통과한 어려운 조건, 여기서 되면 낮은 stride 보장
+- **byte 토크나이저**: 가장 중립적 (토크나이저 설계 영향 0), Phase 1에서 검증 완료
+- 토크나이저 ablation(byte vs jamo vs keyboard)은 레이어 수 확정 후 별도 진행
+
+### 학습 최적화 (vs Phase 3 기본 설정)
+
+| 항목 | Phase 3 | 레이어 스케일링 | 이유 |
+|------|---------|----------------|------|
+| batch | 32 | 128 | GPU 활용률 향상, 소형 모델은 배치 작으면 GPU 놀음 |
+| lr | 3e-4 | 1.2e-3 | batch 4x → lr 4x (linear scaling rule) |
+| warmup | 2000 | 500 | batch 비례 축소 |
+| max_steps | 200K | 50K | 총 토큰 수 동일 (50K×128 = 200K×32) |
+| compile | X | O | torch.compile 적용, XAttn에서 효과 기대 |
+
+### 메모
+
+- Flash Attention: `nn.MultiheadAttention`이 PyTorch 2.0+에서 SDPA 자동 선택 → 별도 작업 불필요
+- XAttn 2L은 이미 확인됐지만 동일 조건 비교를 위해 포함
+- Conv는 빠르게 끝남 (~1-2h), XAttn이 시간 대부분 차지 예상
+
+---
+
