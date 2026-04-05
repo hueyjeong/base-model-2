@@ -395,6 +395,48 @@ Phase 1(Conv) → 2(Cross-Attention) → 3(가변 패칭) → 4(Backbone 통합)
    - 인/디코더, 엔트로피 모델, backbone 각각
    - 어느 수준까지 정확도 유지하는지 → 메모리 절감 + 추론 속도 향상
 
+---
+
+## 2026-04-06 — Conv 하한선 + Hash N-gram 실험
+
+### 배경
+
+- Conv 3L이 stride=16에서 100% 복원 확정 → 1L/2L에서도 되는지?
+- BLT에서 hash n-gram + 1L encoder > 5L without hash → Conv에도 적용하면?
+
+### 설정
+
+- Conv 1L/2L/3L × hash_ngram 유무 = 6개 조합
+- stride=16, byte, 25K steps, batch=128×2, lr=2.4e-3, compile, DDP 4GPU
+- Hash n-gram: rolling polynomial hash, 6 tables × 10K × d64 → proj(d256), ~3.9M params
+
+### 결과
+
+| model | params | 토큰acc | 문자acc | seq EM | 분리도 | 레이턴시(s512) | tok/s |
+|-------|--------|---------|---------|--------|--------|---------------|-------|
+| **Conv 1L** | **4.9M** | **100%** | **100%** | **100%** | **0.751** | **0.62ms** | **13.2M** |
+| Conv 1L+hash | 8.8M | 100% | 100% | 100% | 0.742 | 2.73ms | 10.1M |
+| Conv 2L | 5.6M | 100% | 100% | 100% | 0.719 | 0.91ms | 10.5M |
+| Conv 2L+hash | 9.4M | 100% | 100% | 100% | 0.744 | 3.09ms | 8.3M |
+| Conv 3L | 6.2M | 100% | 100% | 100% | 0.755 | 1.21ms | 8.7M |
+| Conv 3L+hash | 10.1M | 100% | 100% | 100% | 0.740 | 3.39ms | 7.1M |
+
+### 핵심 관찰
+
+1. **Conv 1L로 stride=16에서 완벽 복원** — 4.9M params, 0.62ms, 13.2M tok/s
+2. **Hash n-gram 효과 없음** — 분리도 미세 하락, 레이턴시 4~5x 증가, 파라미터 +4M 낭비
+3. Conv가 로컬 패턴 캡처를 자체적으로 충분히 수행 → hash n-gram 정보가 중복
+4. BLT에서 효과가 있었던 이유: Transformer encoder(self-attention)가 로컬 패턴에 약함 → hash로 보완. Conv는 로컬 패턴이 본업이라 보완 불필요
+5. 레이어 추가도 불필요 — 1L/2L/3L 전부 100%, 분리도도 비슷
+
+### 결론
+
+- **고정 stride Conv codec = 1L 확정** (이전 3L에서 하향)
+- Hash n-gram은 Conv codec에서 불필요 — XAttn/Transformer encoder에서만 유효
+- 남은 실험은 이 Conv 1L 위에서 진행
+
+---
+
 ### 메모: KoELECTRA baseline이 필요한 이유
 
 - KoELECTRA-base = WordPiece + RTD pretrain 완료 모델 → GEC fine-tune만 하면 baseline 수치 확보
