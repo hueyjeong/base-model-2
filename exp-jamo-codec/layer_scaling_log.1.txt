@@ -1,0 +1,44 @@
+=== Layer Scaling Experiment ===
+XAttn: 2L, 4L, 6L, 8L + Conv: 3L, 6L, 9L
+Stride: 16, Tokenizer: byte
+Steps: 25000, GPUs: 4
+
+══════════════════════════════════════════
+[xattn_2L_s16] XAttn 2L, stride=16
+══════════════════════════════════════════
+Device: cuda:0 (DDP 4 GPUs)
+토크나이저: byte (vocab=263)
+XAttnCodec: d=256, stride=16, layers=2, params=5.32M
+torch.compile 적용 중...
+torch.compile 완료
+
+학습 시작: max_steps=25000, batch=256, seq_len=512, DDP 4 GPUs
+    step     loss     bpb      acc         lr    tok/s
+----------------------------------------------------------
+    2000   1.7861  2.5769   39.36%   2.37e-03  5080396
+    4000   0.6159  0.8886   77.48%   2.27e-03  5574549
+    6000   0.0861  0.1242   96.99%   2.09e-03  5570638
+    8000   0.0264  0.0381   99.10%   1.86e-03  5577271
+   10000   0.0140  0.0203   99.53%   1.59e-03  5575534
+   12000   0.0082  0.0119   99.73%   1.30e-03  5570104
+   14000   0.0054  0.0078   99.82%   9.92e-04  5580794
+   16000   0.0033  0.0048   99.89%   7.02e-04  5577344
+   18000   0.0023  0.0034   99.92%   4.43e-04  5578323
+   20000   0.0015  0.0022   99.95%   2.34e-04  5583715
+   22000   0.0011  0.0017   99.96%   8.60e-05  5573852
+   24000   0.0009  0.0013   99.97%   9.65e-06  5577219
+
+학습 완료: 25000 steps
+최종 저장: exp-jamo-codec/checkpoints/xattn_byte_s16_final.pt
+
+[xattn_2L_s16] 평가
+Traceback (most recent call last):
+  File "/workspace/base-model-2/exp-jamo-codec/eval_codec.py", line 287, in <module>
+    main()
+  File "/workspace/base-model-2/exp-jamo-codec/eval_codec.py", line 244, in main
+    codec.load_state_dict(ckpt["model"])
+  File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 2635, in load_state_dict
+    raise RuntimeError(
+RuntimeError: Error(s) in loading state_dict for CrossAttentionCodec:
+	Missing key(s) in state_dict: "embedding.weight", "enc_local.0.norm1.weight", "enc_local.0.self_attn.in_proj_weight", "enc_local.0.self_attn.in_proj_bias", "enc_local.0.self_attn.out_proj.weight", "enc_local.0.self_attn.out_proj.bias", "enc_local.0.norm2.weight", "enc_local.0.ffn.gate_proj.weight", "enc_local.0.ffn.up_proj.weight", "enc_local.0.ffn.down_proj.weight", "enc_local.1.norm1.weight", "enc_local.1.self_attn.in_proj_weight", "enc_local.1.self_attn.in_proj_bias", "enc_local.1.self_attn.out_proj.weight", "enc_local.1.self_attn.out_proj.bias", "enc_local.1.norm2.weight", "enc_local.1.ffn.gate_proj.weight", "enc_local.1.ffn.up_proj.weight", "enc_local.1.ffn.down_proj.weight", "patch_query_proj.weight", "patch_query_proj.bias", "enc_cross.norm_q.weight", "enc_cross.norm_kv.weight", "enc_cross.cross_attn.in_proj_weight", "enc_cross.cross_attn.in_proj_bias", "enc_cross.cross_attn.out_proj.weight", "enc_cross.cross_attn.out_proj.bias", "enc_cross.norm2.weight", "enc_cross.ffn.gate_proj.weight", "enc_cross.ffn.up_proj.weight", "enc_cross.ffn.down_proj.weight", "enc_norm.weight", "dec_cross.norm_q.weight", "dec_cross.norm_kv.weight", "dec_cross.cross_attn.in_proj_weight", "dec_cross.cross_attn.in_proj_bias", "dec_cross.cross_attn.out_proj.weight", "dec_cross.cross_attn.out_proj.bias", "dec_cross.norm2.weight", "dec_cross.ffn.gate_proj.weight", "dec_cross.ffn.up_proj.weight", "dec_cross.ffn.down_proj.weight", "dec_local.0.norm1.weight", "dec_local.0.self_attn.in_proj_weight", "dec_local.0.self_attn.in_proj_bias", "dec_local.0.self_attn.out_proj.weight", "dec_local.0.self_attn.out_proj.bias", "dec_local.0.norm2.weight", "dec_local.0.ffn.gate_proj.weight", "dec_local.0.ffn.up_proj.weight", "dec_local.0.ffn.down_proj.weight", "dec_local.1.norm1.weight", "dec_local.1.self_attn.in_proj_weight", "dec_local.1.self_attn.in_proj_bias", "dec_local.1.self_attn.out_proj.weight", "dec_local.1.self_attn.out_proj.bias", "dec_local.1.norm2.weight", "dec_local.1.ffn.gate_proj.weight", "dec_local.1.ffn.up_proj.weight", "dec_local.1.ffn.down_proj.weight", "dec_norm.weight", "head.weight", "head.bias". 
+	Unexpected key(s) in state_dict: "_orig_mod.embedding.weight", "_orig_mod.enc_local.0.norm1.weight", "_orig_mod.enc_local.0.self_attn.in_proj_weight", "_orig_mod.enc_local.0.self_attn.in_proj_bias", "_orig_mod.enc_local.0.self_attn.out_proj.weight", "_orig_mod.enc_local.0.self_attn.out_proj.bias", "_orig_mod.enc_local.0.norm2.weight", "_orig_mod.enc_local.0.ffn.gate_proj.weight", "_orig_mod.enc_local.0.ffn.up_proj.weight", "_orig_mod.enc_local.0.ffn.down_proj.weight", "_orig_mod.enc_local.1.norm1.weight", "_orig_mod.enc_local.1.self_attn.in_proj_weight", "_orig_mod.enc_local.1.self_attn.in_proj_bias", "_orig_mod.enc_local.1.self_attn.out_proj.weight", "_orig_mod.enc_local.1.self_attn.out_proj.bias", "_orig_mod.enc_local.1.norm2.weight", "_orig_mod.enc_local.1.ffn.gate_proj.weight", "_orig_mod.enc_local.1.ffn.up_proj.weight", "_orig_mod.enc_local.1.ffn.down_proj.weight", "_orig_mod.patch_query_proj.weight", "_orig_mod.patch_query_proj.bias", "_orig_mod.enc_cross.norm_q.weight", "_orig_mod.enc_cross.norm_kv.weight", "_orig_mod.enc_cross.cross_attn.in_proj_weight", "_orig_mod.enc_cross.cross_attn.in_proj_bias", "_orig_mod.enc_cross.cross_attn.out_proj.weight", "_orig_mod.enc_cross.cross_attn.out_proj.bias", "_orig_mod.enc_cross.norm2.weight", "_orig_mod.enc_cross.ffn.gate_proj.weight", "_orig_mod.enc_cross.ffn.up_proj.weight", "_orig_mod.enc_cross.ffn.down_proj.weight", "_orig_mod.enc_norm.weight", "_orig_mod.dec_cross.norm_q.weight", "_orig_mod.dec_cross.norm_kv.weight", "_orig_mod.dec_cross.cross_attn.in_proj_weight", "_orig_mod.dec_cross.cross_attn.in_proj_bias", "_orig_mod.dec_cross.cross_attn.out_proj.weight", "_orig_mod.dec_cross.cross_attn.out_proj.bias", "_orig_mod.dec_cross.norm2.weight", "_orig_mod.dec_cross.ffn.gate_proj.weight", "_orig_mod.dec_cross.ffn.up_proj.weight", "_orig_mod.dec_cross.ffn.down_proj.weight", "_orig_mod.dec_local.0.norm1.weight", "_orig_mod.dec_local.0.self_attn.in_proj_weight", "_orig_mod.dec_local.0.self_attn.in_proj_bias", "_orig_mod.dec_local.0.self_attn.out_proj.weight", "_orig_mod.dec_local.0.self_attn.out_proj.bias", "_orig_mod.dec_local.0.norm2.weight", "_orig_mod.dec_local.0.ffn.gate_proj.weight", "_orig_mod.dec_local.0.ffn.up_proj.weight", "_orig_mod.dec_local.0.ffn.down_proj.weight", "_orig_mod.dec_local.1.norm1.weight", "_orig_mod.dec_local.1.self_attn.in_proj_weight", "_orig_mod.dec_local.1.self_attn.in_proj_bias", "_orig_mod.dec_local.1.self_attn.out_proj.weight", "_orig_mod.dec_local.1.self_attn.out_proj.bias", "_orig_mod.dec_local.1.norm2.weight", "_orig_mod.dec_local.1.ffn.gate_proj.weight", "_orig_mod.dec_local.1.ffn.up_proj.weight", "_orig_mod.dec_local.1.ffn.down_proj.weight", "_orig_mod.dec_norm.weight", "_orig_mod.head.weight", "_orig_mod.head.bias". 

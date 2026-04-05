@@ -1,0 +1,735 @@
+=== Layer Scaling Experiment ===
+XAttn: 2L, 4L, 6L, 8L + Conv: 3L, 6L, 9L
+Stride: 16, Tokenizer: byte
+Steps: 25000, GPUs: 4
+
+══════════════════════════════════════════
+[xattn_2L_s16] XAttn 2L — 학습 스킵, 체크포인트 eval만
+══════════════════════════════════════════
+[xattn_2L_s16] 평가
+체크포인트 로드: exp-jamo-codec/checkpoints/xattn_2L_s16_final.pt (step 25000)
+모델: d=256, stride=16, params=5.32M
+토크나이저: byte (vocab=263)
+
+=== 복원 정확도 ===
+  토큰 정확도:   99.99%
+  문자 정확도:   99.88%
+  시퀀스 EM:     97.17%
+  평균 loss:     0.0002
+  BPB:           0.0004
+  평가 시퀀스:   2048
+  평가 토큰:     841116
+
+=== 레이턴시 (GPU) ===
+  seq=256: encode 2.11ms, decode 1.97ms, total 4.08ms (256→16)
+  seq=512: encode 2.25ms, decode 2.00ms, total 4.25ms (512→32)
+  seq=1024: encode 2.27ms, decode 2.02ms, total 4.29ms (1024→64)
+  seq=2048: encode 2.35ms, decode 2.04ms, total 4.39ms (2048→128)
+
+--- 복원 예시 ---
+
+[1] MATCH
+  원문: 게다가 국내 전기 사양 안전 인증 절차를 거치지 않은 무분별한 제품 사용으로 인한 전류 과부하, 과열로 인한 부품의 화재 발생 등 2차적인 사고 위험도 크다. 때문에 소비자의 안전...
+  복원: 게다가 국내 전기 사양 안전 인증 절차를 거치지 않은 무분별한 제품 사용으로 인한 전류 과부하, 과열로 인한 부품의 화재 발생 등 2차적인 사고 위험도 크다. 때문에 소비자의 안전...
+
+[2] MATCH
+  원문: 이렇게 2018년 국정감사에서도 독립기관으로서의 한은은 자존심에 상처를 입었다.
+  복원: 이렇게 2018년 국정감사에서도 독립기관으로서의 한은은 자존심에 상처를 입었다.
+
+[xattn_2L_s16] z 공간 분석
+모델: stride=16, d=256
+토크나이저: byte
+
+============================================================
+오타 쌍 z 거리
+============================================================
+정답           오타            cos_sim       L2 설명
+------------------------------------------------------------
+맞춤법          맞춤뻡            0.8017  16.6513 종성 오타
+습니다          스빈다            0.8492  14.5475 전형적 오타 패턴
+확인해          확인헤            0.8540  14.0685 모음 오타
+대한민국         대한민귝           0.8621  13.7180 종성 추가
+감사합니다        감사함니다          0.9603   7.4607 자음 오타
+안녕하세요        안녕하새요          0.9088  10.6972 모음 오타
+프로그래밍        프로그레밍          0.9151   8.8820 모음 오타
+인공지능         인공지늉           0.9368   9.4912 종성 오타
+김철수          김철쑤            0.8751  13.1204 쌍자음 오류
+고마워요         고마워욬           0.9433   8.7717 종성 추가 오류
+
+평균 오타 쌍: cos_sim=0.8906, L2=11.7408
+
+============================================================
+다른 의미 쌍 z 거리 (멀어야 정상)
+============================================================
+  맞춤법을 확인해 주세요       vs 오늘 날씨가 좋습니다        cos=0.0882 L2=35.8206
+  대한민국은 민주공화국이다      vs 사과는 빨간색이다          cos=0.1910 L2=33.3433
+  프로그래밍을 배우고 있습니다    vs 저녁에 치킨을 먹었다        cos=0.1706 L2=34.0841
+  감사합니다              vs 안녕하세요              cos=0.6341 L2=19.9169
+  인공지능이 발전하고 있다      vs 고양이가 귀엽다           cos=0.1469 L2=34.3884
+
+평균 다른 의미: cos_sim=0.2462, L2=31.5107
+
+============================================================
+요약
+============================================================
+  오타 쌍 평균 cos_sim:   0.8906
+  다른 의미 평균 cos_sim: 0.2462
+  분리도 (차이):          0.6445
+
+  오타 쌍 평균 L2:        11.7408
+  다른 의미 평균 L2:      31.5107
+  분리도 (비율):          2.68x
+
+  → 오타 쌍이 다른 의미보다 z 공간에서 더 가까움 (원하는 성질)
+
+
+══════════════════════════════════════════
+[xattn_4L_s16] XAttn 4L, stride=16
+══════════════════════════════════════════
+Device: cuda:0 (DDP 4 GPUs)
+토크나이저: byte (vocab=263)
+XAttnCodec: d=256, stride=16, layers=4, params=8.74M
+torch.compile 적용 중...
+torch.compile 완료
+
+학습 시작: max_steps=25000, batch=256, seq_len=512, DDP 4 GPUs
+    step     loss     bpb      acc         lr    tok/s
+----------------------------------------------------------
+    2000   1.7302  2.4961   41.14%   2.37e-03  2659664
+    4000   0.5854  0.8445   78.95%   2.27e-03  3268570
+    6000   0.0484  0.0698   98.33%   2.09e-03  3267846
+    8000   0.0158  0.0228   99.48%   1.86e-03  3269677
+   10000   0.0077  0.0111   99.75%   1.59e-03  3268540
+   12000   0.0056  0.0080   99.83%   1.30e-03  3261939
+   14000   0.0023  0.0034   99.92%   9.92e-04  3269487
+   16000   0.0017  0.0025   99.94%   7.02e-04  3267765
+   18000   0.0011  0.0016   99.97%   4.43e-04  3269495
+   20000   0.0006  0.0009   99.98%   2.34e-04  3271894
+   22000   0.0004  0.0006   99.99%   8.60e-05  3265615
+   24000   0.0003  0.0005   99.99%   9.65e-06  3267952
+
+학습 완료: 25000 steps
+최종 저장: exp-jamo-codec/checkpoints/xattn_byte_s16_final.pt
+
+[xattn_4L_s16] 평가
+체크포인트 로드: exp-jamo-codec/checkpoints/xattn_4L_s16_final.pt (step 25000)
+모델: d=256, stride=16, params=8.74M
+토크나이저: byte (vocab=263)
+
+=== 복원 정확도 ===
+  토큰 정확도:   100.00%
+  문자 정확도:   99.99%
+  시퀀스 EM:     98.93%
+  평균 loss:     0.0001
+  BPB:           0.0001
+  평가 시퀀스:   2048
+  평가 토큰:     841116
+
+=== 레이턴시 (GPU) ===
+  seq=256: encode 3.26ms, decode 2.98ms, total 6.24ms (256→16)
+  seq=512: encode 3.31ms, decode 2.96ms, total 6.27ms (512→32)
+  seq=1024: encode 3.44ms, decode 3.09ms, total 6.53ms (1024→64)
+  seq=2048: encode 3.49ms, decode 3.05ms, total 6.54ms (2048→128)
+
+--- 복원 예시 ---
+
+[1] MATCH
+  원문: 게다가 국내 전기 사양 안전 인증 절차를 거치지 않은 무분별한 제품 사용으로 인한 전류 과부하, 과열로 인한 부품의 화재 발생 등 2차적인 사고 위험도 크다. 때문에 소비자의 안전...
+  복원: 게다가 국내 전기 사양 안전 인증 절차를 거치지 않은 무분별한 제품 사용으로 인한 전류 과부하, 과열로 인한 부품의 화재 발생 등 2차적인 사고 위험도 크다. 때문에 소비자의 안전...
+
+[2] MATCH
+  원문: 이렇게 2018년 국정감사에서도 독립기관으로서의 한은은 자존심에 상처를 입었다.
+  복원: 이렇게 2018년 국정감사에서도 독립기관으로서의 한은은 자존심에 상처를 입었다.
+
+[xattn_4L_s16] z 공간 분석
+모델: stride=16, d=256
+토크나이저: byte
+
+============================================================
+오타 쌍 z 거리
+============================================================
+정답           오타            cos_sim       L2 설명
+------------------------------------------------------------
+맞춤법          맞춤뻡            0.8812  14.6901 종성 오타
+습니다          스빈다            0.8622  15.9883 전형적 오타 패턴
+확인해          확인헤            0.8899  14.0951 모음 오타
+대한민국         대한민귝           0.8897  14.2023 종성 추가
+감사합니다        감사함니다          0.9713   5.7301 자음 오타
+안녕하세요        안녕하새요          0.9492   7.4250 모음 오타
+프로그래밍        프로그레밍          0.9362   9.9393 모음 오타
+인공지능         인공지늉           0.9578   8.7242 종성 오타
+김철수          김철쑤            0.8583  16.1320 쌍자음 오류
+고마워요         고마워욬           0.9190  12.1668 종성 추가 오류
+
+평균 오타 쌍: cos_sim=0.9115, L2=11.9093
+
+============================================================
+다른 의미 쌍 z 거리 (멀어야 정상)
+============================================================
+  맞춤법을 확인해 주세요       vs 오늘 날씨가 좋습니다        cos=0.0856 L2=41.0694
+  대한민국은 민주공화국이다      vs 사과는 빨간색이다          cos=0.0441 L2=41.5059
+  프로그래밍을 배우고 있습니다    vs 저녁에 치킨을 먹었다        cos=0.1584 L2=39.2753
+  감사합니다              vs 안녕하세요              cos=0.6302 L2=21.1744
+  인공지능이 발전하고 있다      vs 고양이가 귀엽다           cos=0.1173 L2=39.8901
+
+평균 다른 의미: cos_sim=0.2071, L2=36.5830
+
+============================================================
+요약
+============================================================
+  오타 쌍 평균 cos_sim:   0.9115
+  다른 의미 평균 cos_sim: 0.2071
+  분리도 (차이):          0.7043
+
+  오타 쌍 평균 L2:        11.9093
+  다른 의미 평균 L2:      36.5830
+  분리도 (비율):          3.07x
+
+  → 오타 쌍이 다른 의미보다 z 공간에서 더 가까움 (원하는 성질)
+
+
+══════════════════════════════════════════
+[xattn_6L_s16] XAttn 6L, stride=16
+══════════════════════════════════════════
+Device: cuda:0 (DDP 4 GPUs)
+토크나이저: byte (vocab=263)
+XAttnCodec: d=256, stride=16, layers=6, params=12.15M
+torch.compile 적용 중...
+torch.compile 완료
+
+학습 시작: max_steps=25000, batch=256, seq_len=512, DDP 4 GPUs
+    step     loss     bpb      acc         lr    tok/s
+----------------------------------------------------------
+[rank1]: Traceback (most recent call last):
+[rank1]:   File "/workspace/base-model-2/exp-jamo-codec/train_codec.py", line 406, in <module>
+[rank1]:     main()
+[rank1]:   File "/workspace/base-model-2/exp-jamo-codec/train_codec.py", line 402, in main
+[rank1]:     train(args)
+[rank1]:   File "/workspace/base-model-2/exp-jamo-codec/train_codec.py", line 286, in train
+[rank1]:     out = codec(ids, pad_mask)
+[rank1]:           ^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank1]:     return self._call_impl(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank1]:     return forward_call(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/parallel/distributed.py", line 1666, in forward
+[rank1]:     else self._run_ddp_forward(*inputs, **kwargs)
+[rank1]:          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/parallel/distributed.py", line 1492, in _run_ddp_forward
+[rank1]:     return self.module(*inputs, **kwargs)  # type: ignore[index]
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 465, in __call__
+[rank1]:     return super().__call__(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank1]:     return self._call_impl(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank1]:     return forward_call(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 953, in compile_wrapper
+[rank1]:     return fn(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank1]:     return self._call_impl(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank1]:     return forward_call(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/workspace/base-model-2/exp-jamo-codec/codec/xattn_codec.py", line 230, in forward
+[rank1]:     def forward(self, ids: torch.Tensor, pad_mask: torch.Tensor = None) -> dict:
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 465, in __call__
+[rank1]:     return super().__call__(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank1]:     return self._call_impl(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank1]:     return forward_call(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1181, in _fn
+[rank1]:     return fn(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/fx/graph_module.py", line 936, in call_wrapped
+[rank1]:     return self._wrapped_call(self, *args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/fx/graph_module.py", line 455, in __call__
+[rank1]:     raise e
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/fx/graph_module.py", line 442, in __call__
+[rank1]:     return super(self.cls, obj).__call__(*args, **kwargs)  # type: ignore[misc]
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank1]:     return self._call_impl(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank1]:     return forward_call(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "<eval_with_key>.41", line 148, in forward
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank1]:     return self._call_impl(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank1]:     return forward_call(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_dynamo/backends/distributed.py", line 214, in forward
+[rank1]:     x = self.submod(*args)
+[rank1]:         ^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1181, in _fn
+[rank1]:     return fn(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/aot_autograd.py", line 1148, in forward
+[rank1]:     return compiled_fn(full_args)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 343, in runtime_wrapper
+[rank1]:     all_outs = call_func_at_runtime_with_args(
+[rank1]:                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+[rank1]:     out = normalize_as_list(f(args))
+[rank1]:                             ^^^^^^^
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 108, in g
+[rank1]:     return f(*args)
+[rank1]:            ^^^^^^^^
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/autograd/function.py", line 583, in apply
+[rank1]:     return super().apply(*args, **kwargs)  # type: ignore[misc]
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2152, in forward
+[rank1]:     fw_outs = call_func_at_runtime_with_args(
+[rank1]:               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+[rank1]:     out = normalize_as_list(f(args))
+[rank1]:                             ^^^^^^^
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 634, in wrapper
+[rank1]:     return compiled_fn(runtime_args)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 531, in wrapper
+[rank1]:     return compiled_fn(runtime_args)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 729, in inner_fn
+[rank1]:     outs = compiled_fn(args)
+[rank1]:            ^^^^^^^^^^^^^^^^^
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_inductor/output_code.py", line 638, in __call__
+[rank1]:     return self.current_callable(inputs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_inductor/utils.py", line 3220, in run
+[rank1]:     out = model(new_inputs)
+[rank1]:           ^^^^^^^^^^^^^^^^^
+[rank1]:   File "/tmp/torchinductor_root/t3/ct32nbetq6abpqffs2ivyfzylwtzl5byr6nm3hzfpq66aynzqrko.py", line 2968, in call
+[rank1]:     buf255 = empty_strided_cuda((1024, 512, 512), (262144, 512, 1), torch.bfloat16)
+[rank1]:              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 512.00 MiB. GPU 1 has a total capacity of 31.36 GiB of which 131.94 MiB is free. Including non-PyTorch memory, this process has 31.22 GiB memory in use. Of the allocated memory 30.32 GiB is allocated by PyTorch, and 126.01 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+[rank3]: Traceback (most recent call last):
+[rank3]:   File "/workspace/base-model-2/exp-jamo-codec/train_codec.py", line 406, in <module>
+[rank3]:     main()
+[rank3]:   File "/workspace/base-model-2/exp-jamo-codec/train_codec.py", line 402, in main
+[rank3]:     train(args)
+[rank3]:   File "/workspace/base-model-2/exp-jamo-codec/train_codec.py", line 286, in train
+[rank3]:     out = codec(ids, pad_mask)
+[rank3]:           ^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank3]:     return self._call_impl(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank3]:     return forward_call(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/parallel/distributed.py", line 1666, in forward
+[rank3]:     else self._run_ddp_forward(*inputs, **kwargs)
+[rank3]:          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/parallel/distributed.py", line 1492, in _run_ddp_forward
+[rank3]:     return self.module(*inputs, **kwargs)  # type: ignore[index]
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 465, in __call__
+[rank3]:     return super().__call__(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank3]:     return self._call_impl(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank3]:     return forward_call(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 953, in compile_wrapper
+[rank3]:     return fn(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank3]:     return self._call_impl(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank3]:     return forward_call(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/workspace/base-model-2/exp-jamo-codec/codec/xattn_codec.py", line 230, in forward
+[rank3]:     def forward(self, ids: torch.Tensor, pad_mask: torch.Tensor = None) -> dict:
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 465, in __call__
+[rank3]:     return super().__call__(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank3]:     return self._call_impl(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank3]:     return forward_call(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1181, in _fn
+[rank3]:     return fn(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/fx/graph_module.py", line 936, in call_wrapped
+[rank3]:     return self._wrapped_call(self, *args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/fx/graph_module.py", line 455, in __call__
+[rank3]:     raise e
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/fx/graph_module.py", line 442, in __call__
+[rank3]:     return super(self.cls, obj).__call__(*args, **kwargs)  # type: ignore[misc]
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank3]:     return self._call_impl(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank3]:     return forward_call(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "<eval_with_key>.41", line 148, in forward
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank3]:     return self._call_impl(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank3]:     return forward_call(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_dynamo/backends/distributed.py", line 214, in forward
+[rank3]:     x = self.submod(*args)
+[rank3]:         ^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1181, in _fn
+[rank3]:     return fn(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/aot_autograd.py", line 1148, in forward
+[rank3]:     return compiled_fn(full_args)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 343, in runtime_wrapper
+[rank3]:     all_outs = call_func_at_runtime_with_args(
+[rank3]:                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+[rank3]:     out = normalize_as_list(f(args))
+[rank3]:                             ^^^^^^^
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 108, in g
+[rank3]:     return f(*args)
+[rank3]:            ^^^^^^^^
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/autograd/function.py", line 583, in apply
+[rank3]:     return super().apply(*args, **kwargs)  # type: ignore[misc]
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2152, in forward
+[rank3]:     fw_outs = call_func_at_runtime_with_args(
+[rank3]:               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+[rank3]:     out = normalize_as_list(f(args))
+[rank3]:                             ^^^^^^^
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 634, in wrapper
+[rank3]:     return compiled_fn(runtime_args)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 531, in wrapper
+[rank3]:     return compiled_fn(runtime_args)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 729, in inner_fn
+[rank3]:     outs = compiled_fn(args)
+[rank3]:            ^^^^^^^^^^^^^^^^^
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_inductor/output_code.py", line 638, in __call__
+[rank3]:     return self.current_callable(inputs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_inductor/utils.py", line 3220, in run
+[rank3]:     out = model(new_inputs)
+[rank3]:           ^^^^^^^^^^^^^^^^^
+[rank3]:   File "/tmp/torchinductor_root/3s/c3sf2al6iu2lmeopjvuodrh2zp5rj3oe4e4575nmkwldqklhu6gk.py", line 2968, in call
+[rank3]:     buf255 = empty_strided_cuda((1024, 512, 512), (262144, 512, 1), torch.bfloat16)
+[rank3]:              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 512.00 MiB. GPU 3 has a total capacity of 31.36 GiB of which 131.94 MiB is free. Including non-PyTorch memory, this process has 31.22 GiB memory in use. Of the allocated memory 30.32 GiB is allocated by PyTorch, and 126.01 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/workspace/base-model-2/exp-jamo-codec/train_codec.py", line 406, in <module>
+[rank0]:     main()
+[rank0]:   File "/workspace/base-model-2/exp-jamo-codec/train_codec.py", line 402, in main
+[rank0]:     train(args)
+[rank0]:   File "/workspace/base-model-2/exp-jamo-codec/train_codec.py", line 286, in train
+[rank0]:     out = codec(ids, pad_mask)
+[rank0]:           ^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/parallel/distributed.py", line 1666, in forward
+[rank0]:     else self._run_ddp_forward(*inputs, **kwargs)
+[rank0]:          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/parallel/distributed.py", line 1492, in _run_ddp_forward
+[rank0]:     return self.module(*inputs, **kwargs)  # type: ignore[index]
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 465, in __call__
+[rank0]:     return super().__call__(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 953, in compile_wrapper
+[rank0]:     return fn(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/base-model-2/exp-jamo-codec/codec/xattn_codec.py", line 230, in forward
+[rank0]:     def forward(self, ids: torch.Tensor, pad_mask: torch.Tensor = None) -> dict:
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 465, in __call__
+[rank0]:     return super().__call__(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1181, in _fn
+[rank0]:     return fn(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/fx/graph_module.py", line 936, in call_wrapped
+[rank0]:     return self._wrapped_call(self, *args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/fx/graph_module.py", line 455, in __call__
+[rank0]:     raise e
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/fx/graph_module.py", line 442, in __call__
+[rank0]:     return super(self.cls, obj).__call__(*args, **kwargs)  # type: ignore[misc]
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "<eval_with_key>.41", line 148, in forward
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_dynamo/backends/distributed.py", line 214, in forward
+[rank0]:     x = self.submod(*args)
+[rank0]:         ^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1181, in _fn
+[rank0]:     return fn(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/aot_autograd.py", line 1148, in forward
+[rank0]:     return compiled_fn(full_args)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 343, in runtime_wrapper
+[rank0]:     all_outs = call_func_at_runtime_with_args(
+[rank0]:                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+[rank0]:     out = normalize_as_list(f(args))
+[rank0]:                             ^^^^^^^
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 108, in g
+[rank0]:     return f(*args)
+[rank0]:            ^^^^^^^^
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/autograd/function.py", line 583, in apply
+[rank0]:     return super().apply(*args, **kwargs)  # type: ignore[misc]
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2152, in forward
+[rank0]:     fw_outs = call_func_at_runtime_with_args(
+[rank0]:               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+[rank0]:     out = normalize_as_list(f(args))
+[rank0]:                             ^^^^^^^
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 634, in wrapper
+[rank0]:     return compiled_fn(runtime_args)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 531, in wrapper
+[rank0]:     return compiled_fn(runtime_args)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 729, in inner_fn
+[rank0]:     outs = compiled_fn(args)
+[rank0]:            ^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_inductor/output_code.py", line 638, in __call__
+[rank0]:     return self.current_callable(inputs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_inductor/utils.py", line 3220, in run
+[rank0]:     out = model(new_inputs)
+[rank0]:           ^^^^^^^^^^^^^^^^^
+[rank0]:   File "/tmp/torchinductor_root/oh/coh2g6zzowoqdmhkdnlrqpjgwo74ci4trqrb2i2gkafzlymag7uy.py", line 2968, in call
+[rank0]:     buf255 = empty_strided_cuda((1024, 512, 512), (262144, 512, 1), torch.bfloat16)
+[rank0]:              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 512.00 MiB. GPU 0 has a total capacity of 31.36 GiB of which 131.94 MiB is free. Including non-PyTorch memory, this process has 31.22 GiB memory in use. Of the allocated memory 30.32 GiB is allocated by PyTorch, and 126.01 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+[rank2]: Traceback (most recent call last):
+[rank2]:   File "/workspace/base-model-2/exp-jamo-codec/train_codec.py", line 406, in <module>
+[rank2]:     main()
+[rank2]:   File "/workspace/base-model-2/exp-jamo-codec/train_codec.py", line 402, in main
+[rank2]:     train(args)
+[rank2]:   File "/workspace/base-model-2/exp-jamo-codec/train_codec.py", line 286, in train
+[rank2]:     out = codec(ids, pad_mask)
+[rank2]:           ^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank2]:     return self._call_impl(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank2]:     return forward_call(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/parallel/distributed.py", line 1666, in forward
+[rank2]:     else self._run_ddp_forward(*inputs, **kwargs)
+[rank2]:          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/parallel/distributed.py", line 1492, in _run_ddp_forward
+[rank2]:     return self.module(*inputs, **kwargs)  # type: ignore[index]
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 465, in __call__
+[rank2]:     return super().__call__(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank2]:     return self._call_impl(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank2]:     return forward_call(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 953, in compile_wrapper
+[rank2]:     return fn(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank2]:     return self._call_impl(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank2]:     return forward_call(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/workspace/base-model-2/exp-jamo-codec/codec/xattn_codec.py", line 230, in forward
+[rank2]:     def forward(self, ids: torch.Tensor, pad_mask: torch.Tensor = None) -> dict:
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 465, in __call__
+[rank2]:     return super().__call__(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank2]:     return self._call_impl(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank2]:     return forward_call(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1181, in _fn
+[rank2]:     return fn(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/fx/graph_module.py", line 936, in call_wrapped
+[rank2]:     return self._wrapped_call(self, *args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/fx/graph_module.py", line 455, in __call__
+[rank2]:     raise e
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/fx/graph_module.py", line 442, in __call__
+[rank2]:     return super(self.cls, obj).__call__(*args, **kwargs)  # type: ignore[misc]
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank2]:     return self._call_impl(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank2]:     return forward_call(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "<eval_with_key>.41", line 148, in forward
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank2]:     return self._call_impl(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank2]:     return forward_call(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_dynamo/backends/distributed.py", line 214, in forward
+[rank2]:     x = self.submod(*args)
+[rank2]:         ^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_dynamo/eval_frame.py", line 1181, in _fn
+[rank2]:     return fn(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/aot_autograd.py", line 1148, in forward
+[rank2]:     return compiled_fn(full_args)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 343, in runtime_wrapper
+[rank2]:     all_outs = call_func_at_runtime_with_args(
+[rank2]:                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+[rank2]:     out = normalize_as_list(f(args))
+[rank2]:                             ^^^^^^^
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 108, in g
+[rank2]:     return f(*args)
+[rank2]:            ^^^^^^^^
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/autograd/function.py", line 583, in apply
+[rank2]:     return super().apply(*args, **kwargs)  # type: ignore[misc]
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2152, in forward
+[rank2]:     fw_outs = call_func_at_runtime_with_args(
+[rank2]:               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+[rank2]:     out = normalize_as_list(f(args))
+[rank2]:                             ^^^^^^^
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 634, in wrapper
+[rank2]:     return compiled_fn(runtime_args)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 531, in wrapper
+[rank2]:     return compiled_fn(runtime_args)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 729, in inner_fn
+[rank2]:     outs = compiled_fn(args)
+[rank2]:            ^^^^^^^^^^^^^^^^^
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_inductor/output_code.py", line 638, in __call__
+[rank2]:     return self.current_callable(inputs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/_inductor/utils.py", line 3220, in run
+[rank2]:     out = model(new_inputs)
+[rank2]:           ^^^^^^^^^^^^^^^^^
+[rank2]:   File "/tmp/torchinductor_root/xk/cxk77mpv5afateuwxto7yy2xi3x4yiopbev5vxbqpyk5xaq62gfu.py", line 2968, in call
+[rank2]:     buf255 = empty_strided_cuda((1024, 512, 512), (262144, 512, 1), torch.bfloat16)
+[rank2]:              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 512.00 MiB. GPU 2 has a total capacity of 31.36 GiB of which 131.94 MiB is free. Including non-PyTorch memory, this process has 31.22 GiB memory in use. Of the allocated memory 30.32 GiB is allocated by PyTorch, and 126.01 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+[rank0]:[W405 11:02:56.697075652 ProcessGroupNCCL.cpp:1553] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+W0405 11:02:56.439000 36584 torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 36606 closing signal SIGTERM
+W0405 11:02:56.441000 36584 torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 36608 closing signal SIGTERM
+W0405 11:02:56.442000 36584 torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 36609 closing signal SIGTERM
+E0405 11:02:57.122000 36584 torch/distributed/elastic/multiprocessing/api.py:984] failed (exitcode: 1) local_rank: 1 (pid: 36607) of binary: /workspace/base-model-2/.venv/bin/python3.12
+Traceback (most recent call last):
+  File "/workspace/base-model-2/.venv/bin/torchrun", line 8, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 362, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/distributed/run.py", line 991, in main
+    run(args)
+  File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/distributed/run.py", line 982, in run
+    elastic_launch(
+  File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/distributed/launcher/api.py", line 170, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/workspace/base-model-2/.venv/lib/python3.12/site-packages/torch/distributed/launcher/api.py", line 317, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+exp-jamo-codec/train_codec.py FAILED
+------------------------------------------------------------
+Failures:
+[1]:
+  time      : 2026-04-05_11:02:57
+  host      : baae874a957a
+  rank      : 0 (local_rank: 0)
+  exitcode  : -15 (pid: 36606)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 36606
+[2]:
+  time      : 2026-04-05_11:02:57
+  host      : baae874a957a
+  rank      : 2 (local_rank: 2)
+  exitcode  : -15 (pid: 36608)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 36608
+[3]:
+  time      : 2026-04-05_11:02:57
+  host      : baae874a957a
+  rank      : 3 (local_rank: 3)
+  exitcode  : -15 (pid: 36609)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 36609
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-04-05_11:02:56
+  host      : baae874a957a
+  rank      : 1 (local_rank: 1)
+  exitcode  : 1 (pid: 36607)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================
