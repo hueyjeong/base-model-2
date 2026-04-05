@@ -128,6 +128,18 @@ def load_tokenizer(name: str):
         raise ValueError(f"알 수 없는 토크나이저: {name}")
 
 
+def _unwrap_state_dict(model):
+    """DDP/compile 래핑을 벗긴 state_dict 반환"""
+    m = model
+    # DDP → .module
+    if hasattr(m, "module"):
+        m = m.module
+    # torch.compile → _orig_mod
+    if hasattr(m, "_orig_mod"):
+        m = m._orig_mod
+    return m.state_dict()
+
+
 # ── 학습 루프 ──────────────────────────────────────────────────────────
 
 def train(args):
@@ -315,7 +327,7 @@ def train(args):
 
         # 체크포인트
         if args.save_every > 0 and global_step % args.save_every == 0 and rank == 0:
-            model_sd = codec.module.state_dict() if is_distributed else codec.state_dict()
+            model_sd = _unwrap_state_dict(codec)
             save_path = os.path.join(
                 args.out_dir, f"{args.codec}_{args.tokenizer}_s{args.stride}_step{global_step}.pt"
             )

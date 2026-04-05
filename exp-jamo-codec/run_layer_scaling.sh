@@ -27,7 +27,7 @@ echo "Steps: ${MAX_STEPS}, GPUs: ${NGPU}"
 echo ""
 
 # ── XAttn 레이어 스케일링 ──
-for NLAYER in 2 4 6 8; do
+for NLAYER in 4 6 8; do
     TAG="xattn_${NLAYER}L_s${STRIDE}"
     CKPT="${OUT_BASE}/${TAG}_final.pt"
 
