@@ -24,8 +24,23 @@ class RMSNorm(nn.Module):
         return (x.float() * rms).to(x.dtype) * self.weight
 
 
+class SwiGLUFFN(nn.Module):
+    """SwiGLU FFN: gate_proj * silu(up_proj) → down_proj"""
+
+    def __init__(self, d_model: int, d_ff: int = None, dropout: float = 0.1):
+        super().__init__()
+        d_ff = d_ff or d_model * 3
+        self.gate_proj = nn.Linear(d_model, d_ff, bias=False)
+        self.up_proj = nn.Linear(d_model, d_ff, bias=False)
+        self.down_proj = nn.Linear(d_ff, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        return self.dropout(self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x)))
+
+
 class LocalTransformerLayer(nn.Module):
-    """경량 로컬 트랜스포머 레이어 (self-attention + FFN)"""
+    """경량 로컬 트랜스포머 레이어 (self-attention + SwiGLU FFN)"""
 
     def __init__(self, d_model: int, n_heads: int = 4, dropout: float = 0.1):
         super().__init__()
@@ -34,13 +49,7 @@ class LocalTransformerLayer(nn.Module):
             d_model, n_heads, dropout=dropout, batch_first=True,
         )
         self.norm2 = RMSNorm(d_model)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_model * 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model * 4, d_model),
-            nn.Dropout(dropout),
-        )
+        self.ffn = SwiGLUFFN(d_model, dropout=dropout)
 
     def forward(self, x, key_padding_mask=None):
         h = self.norm1(x)
@@ -61,13 +70,7 @@ class CrossAttentionLayer(nn.Module):
             d_model, n_heads, dropout=dropout, batch_first=True,
         )
         self.norm2 = RMSNorm(d_model)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, d_model * 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model * 4, d_model),
-            nn.Dropout(dropout),
-        )
+        self.ffn = SwiGLUFFN(d_model, dropout=dropout)
 
     def forward(self, query, kv, kv_padding_mask=None):
         q = self.norm_q(query)
