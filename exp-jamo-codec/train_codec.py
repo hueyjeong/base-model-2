@@ -131,13 +131,13 @@ def load_tokenizer(name: str):
 def _unwrap_state_dict(model):
     """DDP/compile 래핑을 벗긴 state_dict 반환"""
     m = model
-    # DDP → .module
     if hasattr(m, "module"):
         m = m.module
-    # torch.compile → _orig_mod
-    if hasattr(m, "_orig_mod"):
-        m = m._orig_mod
-    return m.state_dict()
+    sd = m.state_dict()
+    # torch.compile이 붙이는 _orig_mod. 접두사 제거
+    prefix = "_orig_mod."
+    cleaned = {k[len(prefix):] if k.startswith(prefix) else k: v for k, v in sd.items()}
+    return cleaned
 
 
 # ── 학습 루프 ──────────────────────────────────────────────────────────
