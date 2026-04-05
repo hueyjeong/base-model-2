@@ -9,8 +9,8 @@ export PYTHONUNBUFFERED=1
 CORPUS="corpus/val.parquet"
 EVAL_CORPUS="corpus/test.parquet"
 TEXT_KEY="text"
-MAX_STEPS=50000
-BATCH_SIZE=128
+MAX_STEPS=25000
+BATCH_SIZE=256
 SEQ_LEN=512
 D_MODEL=256
 LOG_EVERY=2000
@@ -42,7 +42,7 @@ for NLAYER in 2 4 6 8; do
       --corpus ${CORPUS} --text_key ${TEXT_KEY} \
       --max_seq_len ${SEQ_LEN} \
       --batch_size ${BATCH_SIZE} --max_steps ${MAX_STEPS} \
-      --lr 1.2e-3 --warmup_steps 500 \
+      --lr 2.4e-3 --warmup_steps 250 \
       --bf16 --compile --num_workers 2 \
       --log_every ${LOG_EVERY} --save_every ${SAVE_EVERY} \
       --out_dir ${OUT_BASE}
@@ -86,7 +86,7 @@ for NLAYER in 3 6 9; do
       --corpus ${CORPUS} --text_key ${TEXT_KEY} \
       --max_seq_len ${SEQ_LEN} \
       --batch_size ${BATCH_SIZE} --max_steps ${MAX_STEPS} \
-      --lr 1.2e-3 --warmup_steps 500 \
+      --lr 2.4e-3 --warmup_steps 250 \
       --bf16 --compile --num_workers 2 \
       --log_every ${LOG_EVERY} --save_every ${SAVE_EVERY} \
       --out_dir ${OUT_BASE}
