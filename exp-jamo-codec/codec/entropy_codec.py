@@ -40,27 +40,79 @@ class SwiGLUFFN(nn.Module):
         return self.dropout(self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x)))
 
 
+def _precompute_rope(dim: int, max_len: int = 4096, theta: float = 10000.0):
+    """RoPE 주파수 사전 계산"""
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+    t = torch.arange(max_len).float()
+    angles = torch.outer(t, freqs)  # [max_len, dim//2]
+    cos = angles.cos()  # [max_len, dim//2]
+    sin = angles.sin()  # [max_len, dim//2]
+    return cos, sin
+
+
+def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    """x: [B, n_heads, L, head_dim] → RoPE 적용"""
+    L = x.size(2)
+    cos = cos[:L].unsqueeze(0).unsqueeze(0)  # [1, 1, L, head_dim//2]
+    sin = sin[:L].unsqueeze(0).unsqueeze(0)
+    # x를 반으로 나눠서 회전
+    x1 = x[..., : x.size(-1) // 2]
+    x2 = x[..., x.size(-1) // 2 :]
+    rotated = torch.cat([-x2, x1], dim=-1)
+    cos = cos.expand_as(x1).repeat(1, 1, 1, 2)
+    sin = sin.expand_as(x1).repeat(1, 1, 1, 2)
+    return x * cos + rotated * sin
+
+
+class CausalSelfAttention(nn.Module):
+    """RoPE + Causal Self-Attention (SDPA 사용)"""
+
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.n_heads = n_heads
+        self.head_dim = d_model // n_heads
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        self.dropout = dropout
+        # RoPE 사전 계산 (버퍼로 등록)
+        cos, sin = _precompute_rope(self.head_dim)
+        self.register_buffer("rope_cos", cos, persistent=False)
+        self.register_buffer("rope_sin", sin, persistent=False)
+
+    def forward(self, x: torch.Tensor, is_causal: bool = False) -> torch.Tensor:
+        B, L, D = x.shape
+        qkv = self.qkv_proj(x)  # [B, L, 3*D]
+        qkv = qkv.reshape(B, L, 3, self.n_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, B, H, L, head_dim]
+        q, k, v = qkv.unbind(0)
+
+        # RoPE 적용
+        q = _apply_rope(q, self.rope_cos, self.rope_sin)
+        k = _apply_rope(k, self.rope_cos, self.rope_sin)
+
+        # Scaled dot-product attention (PyTorch 2.0+)
+        drop_p = self.dropout if self.training else 0.0
+        attn_out = F.scaled_dot_product_attention(
+            q, k, v, is_causal=is_causal, dropout_p=drop_p,
+        )  # [B, H, L, head_dim]
+
+        attn_out = attn_out.transpose(1, 2).reshape(B, L, D)
+        return self.out_proj(attn_out)
+
+
 class SmallLMLayer(nn.Module):
-    """Transformer 레이어: RMSNorm + MHA + RMSNorm + SwiGLU"""
+    """Transformer 레이어: RMSNorm + RoPE Causal Attention + RMSNorm + SwiGLU"""
 
     def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
         super().__init__()
         self.attn_norm = RMSNorm(d_model)
-        self.attn = nn.MultiheadAttention(
-            d_model, n_heads, dropout=dropout, batch_first=True, bias=False,
-        )
+        self.attn = CausalSelfAttention(d_model, n_heads, dropout)
         self.ffn_norm = RMSNorm(d_model)
         self.ffn = SwiGLUFFN(d_model, dropout=dropout)
 
     def forward(self, x: torch.Tensor, is_causal: bool = False) -> torch.Tensor:
-        h = self.attn_norm(x)
-        if is_causal:
-            L = x.size(1)
-            mask = torch.triu(torch.ones(L, L, device=x.device), diagonal=1).bool()
-            h, _ = self.attn(h, h, h, attn_mask=mask, is_causal=True)
-        else:
-            h, _ = self.attn(h, h, h)
-        x = x + h
+        x = x + self.attn(self.attn_norm(x), is_causal=is_causal)
         x = x + self.ffn(self.ffn_norm(x))
         return x
 
@@ -68,7 +120,7 @@ class SmallLMLayer(nn.Module):
 class SmallLM(nn.Module):
     """소형 Causal LM — 엔트로피 계산용
 
-    RMSNorm + SwiGLU (d_ff = d_model × 3) Transformer.
+    RMSNorm + SwiGLU (d_ff = d_model × 3) + RoPE Transformer.
     per-token cross-entropy를 계산하여 패치 경계 결정에 사용.
     """
 

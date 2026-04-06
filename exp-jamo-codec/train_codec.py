@@ -39,12 +39,16 @@ class CodecDataset(IterableDataset):
         max_seq_len: int = 512,
         text_key: str = None,
         min_length: int = 10,
+        rank: int = 0,
+        world_size: int = 1,
     ):
         self.file_paths = [file_paths] if isinstance(file_paths, str) else list(file_paths)
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
         self.text_key = text_key
         self.min_length = min_length
+        self.rank = rank
+        self.world_size = world_size
 
     def _iter_texts(self):
         """파일에서 텍스트 스트리밍"""
@@ -79,11 +83,13 @@ class CodecDataset(IterableDataset):
                         yield text
 
     def __iter__(self):
-        """패킹: 여러 텍스트를 BOS...EOS 단위로 연결"""
+        """패킹: 여러 텍스트를 BOS...EOS 단위로 연결 (DDP: rank별 interleaving)"""
         pad_id = self.tokenizer.pad_id
         buf = []
 
-        for text in self._iter_texts():
+        for i, text in enumerate(self._iter_texts()):
+            if self.world_size > 1 and i % self.world_size != self.rank:
+                continue
             ids = self.tokenizer.encode(text, add_special=True)
             if not ids:
                 continue
@@ -233,6 +239,8 @@ def train(args):
         tokenizer=tokenizer,
         max_seq_len=args.max_seq_len,
         text_key=args.text_key,
+        rank=rank,
+        world_size=world_size,
     )
     loader = DataLoader(
         dataset,

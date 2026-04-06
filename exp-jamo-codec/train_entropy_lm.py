@@ -74,6 +74,8 @@ def train(args):
         tokenizer=tokenizer,
         max_seq_len=args.max_seq_len,
         text_key=args.text_key,
+        rank=rank,
+        world_size=world_size,
     )
     loader = DataLoader(
         dataset,
