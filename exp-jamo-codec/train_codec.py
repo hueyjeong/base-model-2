@@ -70,19 +70,26 @@ class CodecDataset(IterableDataset):
                     raise
 
     def _iter_remote_parquet(self, url, text_col):
-        """HTTP parquet row group 단위 스트리밍 (연결 끊김 시 재시도)"""
+        """HTTP parquet row group 단위 스트리밍 (DDP row group 샤딩 + 재시도)
+
+        각 rank가 자기 몫의 row group만 읽어 HTTP 트래픽 1/world_size로 감소.
+        """
         import pyarrow.parquet as pq
         f, pf = self._open_remote_parquet(url)
         n_row_groups = pf.metadata.num_row_groups
-        rg_idx = 0
 
-        while rg_idx < n_row_groups:
+        # rank별 row group 할당 (interleaving)
+        my_rg_indices = list(range(self.rank, n_row_groups, self.world_size))
+        pos = 0
+
+        while pos < len(my_rg_indices):
+            rg_idx = my_rg_indices[pos]
             try:
                 table = pf.read_row_group(rg_idx, columns=[text_col])
                 for text in table[text_col].to_pylist():
                     if text and len(text) >= self.min_length:
                         yield text
-                rg_idx += 1
+                pos += 1
             except Exception as e:
                 print(f"[rank {self.rank}] row_group {rg_idx}/{n_row_groups} 읽기 실패 ({e}), 재연결...")
                 try:
@@ -98,49 +105,57 @@ class CodecDataset(IterableDataset):
         except Exception:
             pass
 
-    def _iter_texts(self):
-        """파일에서 텍스트 스트리밍 (HTTP URL 지원, 재시도)"""
-        for fpath in self.file_paths:
-            is_jsonl = fpath.endswith(".jsonl") or fpath.endswith(".json")
-            is_parquet = fpath.endswith(".parquet")
-            is_remote = fpath.startswith("http://") or fpath.startswith("https://")
+    def _iter_local_texts(self, fpath):
+        """로컬 파일에서 텍스트 스트리밍"""
+        is_jsonl = fpath.endswith(".jsonl") or fpath.endswith(".json")
+        is_parquet = fpath.endswith(".parquet")
 
-            if is_parquet:
-                if is_remote:
-                    text_col = self.text_key or "text"
-                    yield from self._iter_remote_parquet(fpath, text_col)
-                    continue
-                import pyarrow.parquet as pq
-                pf = pq.ParquetFile(fpath)
-                text_col = self.text_key or "text"
-                for batch in pf.iter_batches(batch_size=65536, columns=[text_col]):
-                    for text in batch[text_col].to_pylist():
-                        if text and len(text) >= self.min_length:
-                            yield text
-                continue
-
-            with open(fpath, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if len(line) < self.min_length:
-                        continue
-                    if is_jsonl:
-                        try:
-                            obj = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        text = obj.get(self.text_key, line) if self.text_key else line
-                    else:
-                        text = line
-                    if len(text) >= self.min_length:
+        if is_parquet:
+            import pyarrow.parquet as pq
+            pf = pq.ParquetFile(fpath)
+            text_col = self.text_key or "text"
+            for batch in pf.iter_batches(batch_size=65536, columns=[text_col]):
+                for text in batch[text_col].to_pylist():
+                    if text and len(text) >= self.min_length:
                         yield text
+            return
+
+        with open(fpath, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if len(line) < self.min_length:
+                    continue
+                if is_jsonl:
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    text = obj.get(self.text_key, line) if self.text_key else line
+                else:
+                    text = line
+                if len(text) >= self.min_length:
+                    yield text
 
     def _iter_sharded_texts(self):
-        """DDP rank별 interleaving으로 텍스트 스트리밍"""
-        for i, text in enumerate(self._iter_texts()):
-            if self.world_size > 1 and i % self.world_size != self.rank:
-                continue
-            yield text
+        """DDP rank별 샤딩 텍스트 스트리밍
+
+        remote parquet: row group 레벨 샤딩 (이미 _iter_remote_parquet에서 처리)
+        로컬 파일: 텍스트 레벨 interleaving
+        """
+        for fpath in self.file_paths:
+            is_remote = fpath.startswith("http://") or fpath.startswith("https://")
+            is_parquet = fpath.endswith(".parquet")
+
+            if is_remote and is_parquet:
+                # row group 샤딩 — 각 rank가 자기 몫만 HTTP로 읽음
+                text_col = self.text_key or "text"
+                yield from self._iter_remote_parquet(fpath, text_col)
+            else:
+                # 로컬 파일 — 전체 읽고 텍스트 interleaving
+                for i, text in enumerate(self._iter_local_texts(fpath)):
+                    if self.world_size > 1 and i % self.world_size != self.rank:
+                        continue
+                    yield text
 
     def __iter__(self):
         """패킹: 여러 텍스트를 BOS...EOS 단위로 연결 (무한 순환)"""
