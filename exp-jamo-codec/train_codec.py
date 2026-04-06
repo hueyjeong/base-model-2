@@ -82,29 +82,35 @@ class CodecDataset(IterableDataset):
                     if len(text) >= self.min_length:
                         yield text
 
-    def __iter__(self):
-        """패킹: 여러 텍스트를 BOS...EOS 단위로 연결 (DDP: rank별 interleaving)"""
-        pad_id = self.tokenizer.pad_id
-        buf = []
-
+    def _iter_sharded_texts(self):
+        """DDP rank별 interleaving으로 텍스트 스트리밍"""
         for i, text in enumerate(self._iter_texts()):
             if self.world_size > 1 and i % self.world_size != self.rank:
                 continue
-            ids = self.tokenizer.encode(text, add_special=True)
-            if not ids:
-                continue
+            yield text
 
-            remaining = self.max_seq_len - len(buf)
-            if len(ids) > remaining:
-                if buf:
-                    yield self._make_sample(buf, pad_id)
-                buf = []
+    def __iter__(self):
+        """패킹: 여러 텍스트를 BOS...EOS 단위로 연결 (무한 순환)"""
+        pad_id = self.tokenizer.pad_id
 
-            remaining = self.max_seq_len - len(buf)
-            buf.extend(ids[:remaining])
+        while True:
+            buf = []
+            for text in self._iter_sharded_texts():
+                ids = self.tokenizer.encode(text, add_special=True)
+                if not ids:
+                    continue
 
-        if buf:
-            yield self._make_sample(buf, pad_id)
+                remaining = self.max_seq_len - len(buf)
+                if len(ids) > remaining:
+                    if buf:
+                        yield self._make_sample(buf, pad_id)
+                    buf = []
+
+                remaining = self.max_seq_len - len(buf)
+                buf.extend(ids[:remaining])
+
+            if buf:
+                yield self._make_sample(buf, pad_id)
 
     def _make_sample(self, buf, pad_id):
         seq_len = len(buf)
