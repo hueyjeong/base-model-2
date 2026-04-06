@@ -271,11 +271,17 @@ def train(args):
 
     grad_accum = args.grad_accum_steps
     if rank == 0:
-        eff_batch = args.batch_size * grad_accum
-        print(f"\n학습 시작: max_steps={args.max_steps}, batch={args.batch_size}"
-              + (f"×{grad_accum}={eff_batch}" if grad_accum > 1 else "")
-              + f", seq_len={args.max_seq_len}"
-              + (f", DDP {world_size} GPUs" if is_distributed else ""))
+        eff_batch = args.batch_size * grad_accum * world_size
+        batch_desc = f"batch={args.batch_size}"
+        if grad_accum > 1 or world_size > 1:
+            parts = [str(args.batch_size)]
+            if grad_accum > 1:
+                parts.append(f"accum{grad_accum}")
+            if world_size > 1:
+                parts.append(f"{world_size}gpu")
+            batch_desc = f"batch={'×'.join(parts)}={eff_batch}"
+        print(f"\n학습 시작: max_steps={args.max_steps}, {batch_desc}"
+              + f", seq_len={args.max_seq_len}")
         print(f"{'step':>8} {'loss':>8} {'bpb':>7} {'acc':>8} {'lr':>10} {'tok/s':>8}")
         print("-" * 58)
 
