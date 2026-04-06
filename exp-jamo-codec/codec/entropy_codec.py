@@ -12,10 +12,63 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization"""
+
+    def __init__(self, d_model: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(d_model))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x * rms * self.weight
+
+
+class SwiGLUFFN(nn.Module):
+    """SwiGLU Feed-Forward Network (d_ff = d_model × 3)"""
+
+    def __init__(self, d_model: int, d_ff: int = None, dropout: float = 0.1):
+        super().__init__()
+        d_ff = d_ff or d_model * 3
+        self.gate_proj = nn.Linear(d_model, d_ff, bias=False)
+        self.up_proj = nn.Linear(d_model, d_ff, bias=False)
+        self.down_proj = nn.Linear(d_ff, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.dropout(self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x)))
+
+
+class SmallLMLayer(nn.Module):
+    """Transformer 레이어: RMSNorm + MHA + RMSNorm + SwiGLU"""
+
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.1):
+        super().__init__()
+        self.attn_norm = RMSNorm(d_model)
+        self.attn = nn.MultiheadAttention(
+            d_model, n_heads, dropout=dropout, batch_first=True, bias=False,
+        )
+        self.ffn_norm = RMSNorm(d_model)
+        self.ffn = SwiGLUFFN(d_model, dropout=dropout)
+
+    def forward(self, x: torch.Tensor, is_causal: bool = False) -> torch.Tensor:
+        h = self.attn_norm(x)
+        if is_causal:
+            L = x.size(1)
+            mask = torch.triu(torch.ones(L, L, device=x.device), diagonal=1).bool()
+            h, _ = self.attn(h, h, h, attn_mask=mask, is_causal=True)
+        else:
+            h, _ = self.attn(h, h, h)
+        x = x + h
+        x = x + self.ffn(self.ffn_norm(x))
+        return x
+
+
 class SmallLM(nn.Module):
     """소형 Causal LM — 엔트로피 계산용
 
-    2-layer transformer, ~0.5M params.
+    RMSNorm + SwiGLU (d_ff = d_model × 3) Transformer.
     per-token cross-entropy를 계산하여 패치 경계 결정에 사용.
     """
 
@@ -24,21 +77,18 @@ class SmallLM(nn.Module):
         super().__init__()
         self.d_model = d_model
         self.embedding = nn.Embedding(vocab_size, d_model, padding_idx=0)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=n_heads, dim_feedforward=d_model * 4,
-            dropout=dropout, batch_first=True, norm_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.layers = nn.ModuleList([
+            SmallLMLayer(d_model, n_heads, dropout) for _ in range(n_layers)
+        ])
+        self.final_norm = RMSNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size)
 
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
         """[B, L] → [B, L, vocab_size] causal logits"""
-        B, L = ids.shape
         x = self.embedding(ids) * math.sqrt(self.d_model)
-        # causal mask
-        mask = torch.triu(torch.ones(L, L, device=ids.device), diagonal=1).bool()
-        x = self.transformer(x, mask=mask, is_causal=True)
-        return self.head(x)
+        for layer in self.layers:
+            x = layer(x, is_causal=True)
+        return self.head(self.final_norm(x))
 
     @torch.no_grad()
     def compute_entropy(self, ids: torch.Tensor) -> torch.Tensor:
@@ -224,6 +274,8 @@ class EntropyPatchCodec(nn.Module):
         kernel_size: int = 5,
         dropout: float = 0.1,
         entropy_d_model: int = 128,
+        entropy_n_layers: int = 2,
+        entropy_n_heads: int = 4,
         min_patch: int = 2,
         max_patch: int = 32,
     ):
@@ -237,7 +289,8 @@ class EntropyPatchCodec(nn.Module):
 
         # 엔트로피 모델 (frozen after pre-training)
         self.entropy_model = SmallLM(
-            vocab_size, d_model=entropy_d_model, n_layers=2, n_heads=4,
+            vocab_size, d_model=entropy_d_model,
+            n_layers=entropy_n_layers, n_heads=entropy_n_heads,
         )
 
         # 토큰 임베딩
