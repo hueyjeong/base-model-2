@@ -8,7 +8,7 @@ export PYTHONUNBUFFERED=1
 CORPUS="corpus/val.parquet"
 EVAL_CORPUS="corpus/test.parquet"
 TEXT_KEY="text"
-MAX_STEPS=10000
+MAX_STEPS=25000
 BATCH_SIZE=128
 GRAD_ACCUM=2
 SEQ_LEN=512
@@ -48,7 +48,7 @@ for CFG in "${CONFIGS[@]}"; do
       --corpus ${CORPUS} --text_key ${TEXT_KEY} \
       --max_seq_len ${SEQ_LEN} \
       --batch_size ${BS} --grad_accum_steps 1 --max_steps ${MAX_STEPS} \
-      --lr 2.4e-3 --warmup_steps 250 \
+      --lr 2.4e-3 --warmup_steps 1000 \
       --bf16 --compile --num_workers 2 \
       --log_every ${LOG_EVERY} --save_every ${SAVE_EVERY} \
       --out_dir ${OUT_BASE}
