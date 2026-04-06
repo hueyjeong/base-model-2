@@ -50,28 +50,73 @@ class CodecDataset(IterableDataset):
         self.rank = rank
         self.world_size = world_size
 
+    def _open_remote_parquet(self, url):
+        """HTTP parquet 파일 열기 (재시도 포함)"""
+        import fsspec
+        import pyarrow.parquet as pq
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                f = fsspec.open(url, "rb").open()
+                pf = pq.ParquetFile(f)
+                return f, pf
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    wait = 2 ** attempt
+                    print(f"[rank {self.rank}] HTTP open 실패 ({e}), {wait}s 후 재시도...")
+                    import time
+                    time.sleep(wait)
+                else:
+                    raise
+
+    def _iter_remote_parquet(self, url, text_col):
+        """HTTP parquet row group 단위 스트리밍 (연결 끊김 시 재시도)"""
+        import pyarrow.parquet as pq
+        f, pf = self._open_remote_parquet(url)
+        n_row_groups = pf.metadata.num_row_groups
+        rg_idx = 0
+
+        while rg_idx < n_row_groups:
+            try:
+                table = pf.read_row_group(rg_idx, columns=[text_col])
+                for text in table[text_col].to_pylist():
+                    if text and len(text) >= self.min_length:
+                        yield text
+                rg_idx += 1
+            except Exception as e:
+                print(f"[rank {self.rank}] row_group {rg_idx}/{n_row_groups} 읽기 실패 ({e}), 재연결...")
+                try:
+                    f.close()
+                except Exception:
+                    pass
+                import time
+                time.sleep(2)
+                f, pf = self._open_remote_parquet(url)
+
+        try:
+            f.close()
+        except Exception:
+            pass
+
     def _iter_texts(self):
-        """파일에서 텍스트 스트리밍 (HTTP URL 지원)"""
+        """파일에서 텍스트 스트리밍 (HTTP URL 지원, 재시도)"""
         for fpath in self.file_paths:
             is_jsonl = fpath.endswith(".jsonl") or fpath.endswith(".json")
             is_parquet = fpath.endswith(".parquet")
             is_remote = fpath.startswith("http://") or fpath.startswith("https://")
 
             if is_parquet:
-                import pyarrow.parquet as pq
                 if is_remote:
-                    import fsspec
-                    f = fsspec.open(fpath, "rb").open()
-                    pf = pq.ParquetFile(f)
-                else:
-                    pf = pq.ParquetFile(fpath)
+                    text_col = self.text_key or "text"
+                    yield from self._iter_remote_parquet(fpath, text_col)
+                    continue
+                import pyarrow.parquet as pq
+                pf = pq.ParquetFile(fpath)
                 text_col = self.text_key or "text"
                 for batch in pf.iter_batches(batch_size=65536, columns=[text_col]):
                     for text in batch[text_col].to_pylist():
                         if text and len(text) >= self.min_length:
                             yield text
-                if is_remote:
-                    f.close()
                 continue
 
             with open(fpath, "r", encoding="utf-8") as f:
