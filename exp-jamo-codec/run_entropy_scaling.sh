@@ -5,7 +5,7 @@
 set -e
 export PYTHONUNBUFFERED=1
 
-CORPUS="corpus/val.parquet"
+CORPUS="${CORPUS:?CORPUS 환경변수를 설정하세요 (예: CORPUS=corpus/val.parquet 또는 CORPUS=http://...)}"
 EVAL_CORPUS="corpus/test.parquet"
 TEXT_KEY="text"
 MAX_STEPS=50000

@@ -51,19 +51,27 @@ class CodecDataset(IterableDataset):
         self.world_size = world_size
 
     def _iter_texts(self):
-        """파일에서 텍스트 스트리밍"""
+        """파일에서 텍스트 스트리밍 (HTTP URL 지원)"""
         for fpath in self.file_paths:
             is_jsonl = fpath.endswith(".jsonl") or fpath.endswith(".json")
             is_parquet = fpath.endswith(".parquet")
+            is_remote = fpath.startswith("http://") or fpath.startswith("https://")
 
             if is_parquet:
                 import pyarrow.parquet as pq
-                pf = pq.ParquetFile(fpath)
+                if is_remote:
+                    import fsspec
+                    f = fsspec.open(fpath, "rb").open()
+                    pf = pq.ParquetFile(f)
+                else:
+                    pf = pq.ParquetFile(fpath)
                 text_col = self.text_key or "text"
                 for batch in pf.iter_batches(batch_size=65536, columns=[text_col]):
                     for text in batch[text_col].to_pylist():
                         if text and len(text) >= self.min_length:
                             yield text
+                if is_remote:
+                    f.close()
                 continue
 
             with open(fpath, "r", encoding="utf-8") as f:
