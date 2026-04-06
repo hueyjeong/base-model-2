@@ -23,22 +23,23 @@ echo "RMSNorm + SwiGLU, d_ff = d×3"
 echo "Steps: ${MAX_STEPS}, GPUs: ${NGPU}"
 echo ""
 
-# (d_model, n_layers, n_heads, label)
+# (d_model, n_layers, n_heads, label, batch_size)
+# 효과 배치 = batch × NGPU(4), grad_accum=1
 CONFIGS=(
-    "384 5 6 10M"
-    "512 6 8 20M"
-    "576 7 9 30M"
-    "576 9 9 40M"
-    "640 9 10 50M"
+    "384 5 6 10M 64"
+    "512 6 8 20M 64"
+    "576 7 9 30M 64"
+    "576 9 9 40M 64"
+    "640 9 10 50M 64"
 )
 
 for CFG in "${CONFIGS[@]}"; do
-    read -r D NL NH LABEL <<< "${CFG}"
+    read -r D NL NH LABEL BS <<< "${CFG}"
 
     TAG="entropy_lm_${D}d_${NL}L"
 
     echo "══════════════════════════════════════════"
-    echo "[${LABEL}] SmallLM d=${D}, L=${NL}, H=${NH}"
+    echo "[${LABEL}] SmallLM d=${D}, L=${NL}, H=${NH}, batch=${BS}×${NGPU}gpu"
     echo "══════════════════════════════════════════"
 
     torchrun --nproc_per_node=${NGPU} exp-jamo-codec/train_entropy_lm.py \
@@ -46,7 +47,7 @@ for CFG in "${CONFIGS[@]}"; do
       --entropy_d_model ${D} --entropy_n_layers ${NL} --entropy_n_heads ${NH} \
       --corpus ${CORPUS} --text_key ${TEXT_KEY} \
       --max_seq_len ${SEQ_LEN} \
-      --batch_size ${BATCH_SIZE} --grad_accum_steps ${GRAD_ACCUM} --max_steps ${MAX_STEPS} \
+      --batch_size ${BS} --grad_accum_steps 1 --max_steps ${MAX_STEPS} \
       --lr 2.4e-3 --warmup_steps 250 \
       --bf16 --compile --num_workers 2 \
       --log_every ${LOG_EVERY} --save_every ${SAVE_EVERY} \
