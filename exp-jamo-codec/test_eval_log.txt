@@ -1,0 +1,291 @@
+=== Codec Test Evaluation (s16 only) ===
+Corpus: corpus/test.parquet
+Max samples: 200000, Seq len: 512
+
+══════════════════════════════════════════
+[xattn_2L_s16] tokenizer=byte
+══════════════════════════════════════════
+체크포인트 로드: exp-jamo-codec/checkpoints/xattn_2L_s16_final.pt (step 25000)
+모델: d=256, stride=16, params=5.32M
+토크나이저: byte (vocab=263)
+
+=== 복원 정확도 ===
+  토큰 정확도:   99.99%
+  문자 정확도:   99.84%
+  시퀀스 EM:     96.97%
+  평균 loss:     0.0004
+  BPB:           0.0006
+  평가 시퀀스:   200000
+  평가 토큰:     82183993
+
+=== 레이턴시 (GPU) ===
+  seq=256: encode 1.59ms, decode 1.34ms, total 2.93ms (256→16)
+  seq=512: encode 1.59ms, decode 1.36ms, total 2.96ms (512→32)
+  seq=1024: encode 1.56ms, decode 1.31ms, total 2.87ms (1024→64)
+  seq=2048: encode 4.74ms, decode 3.46ms, total 8.20ms (2048→128)
+
+══════════════════════════════════════════
+[xattn_4L_s16] tokenizer=byte
+══════════════════════════════════════════
+체크포인트 로드: exp-jamo-codec/checkpoints/xattn_4L_s16_final.pt (step 25000)
+모델: d=256, stride=16, params=8.74M
+토크나이저: byte (vocab=263)
+
+=== 복원 정확도 ===
+  토큰 정확도:   100.00%
+  문자 정확도:   99.93%
+  시퀀스 EM:     98.84%
+  평균 loss:     0.0001
+  BPB:           0.0002
+  평가 시퀀스:   200000
+  평가 토큰:     82183993
+
+=== 레이턴시 (GPU) ===
+  seq=256: encode 2.45ms, decode 2.04ms, total 4.49ms (256→16)
+  seq=512: encode 2.49ms, decode 2.18ms, total 4.67ms (512→32)
+  seq=1024: encode 2.42ms, decode 2.12ms, total 4.54ms (1024→64)
+  seq=2048: encode 8.98ms, decode 6.20ms, total 15.18ms (2048→128)
+
+══════════════════════════════════════════
+[xattn_6L_s16] tokenizer=byte
+══════════════════════════════════════════
+체크포인트 로드: exp-jamo-codec/checkpoints/xattn_6L_s16_final.pt (step 25000)
+모델: d=256, stride=16, params=12.15M
+토크나이저: byte (vocab=263)
+
+=== 복원 정확도 ===
+  토큰 정확도:   99.99%
+  문자 정확도:   99.92%
+  시퀀스 EM:     97.59%
+  평균 loss:     0.0003
+  BPB:           0.0005
+  평가 시퀀스:   200000
+  평가 토큰:     82183993
+
+=== 레이턴시 (GPU) ===
+  seq=256: encode 3.17ms, decode 2.67ms, total 5.84ms (256→16)
+  seq=512: encode 3.11ms, decode 2.75ms, total 5.86ms (512→32)
+  seq=1024: encode 3.18ms, decode 3.01ms, total 6.19ms (1024→64)
+  seq=2048: encode 13.32ms, decode 8.99ms, total 22.32ms (2048→128)
+
+══════════════════════════════════════════
+[xattn_8L_s16] tokenizer=byte
+══════════════════════════════════════════
+체크포인트 로드: exp-jamo-codec/checkpoints/xattn_8L_s16_final.pt (step 25000)
+모델: d=256, stride=16, params=15.56M
+토크나이저: byte (vocab=263)
+
+=== 복원 정확도 ===
+  토큰 정확도:   100.00%
+  문자 정확도:   99.97%
+  시퀀스 EM:     99.32%
+  평균 loss:     0.0001
+  BPB:           0.0001
+  평가 시퀀스:   200000
+  평가 토큰:     82183993
+
+=== 레이턴시 (GPU) ===
+  seq=256: encode 4.15ms, decode 3.65ms, total 7.80ms (256→16)
+  seq=512: encode 4.12ms, decode 3.63ms, total 7.75ms (512→32)
+  seq=1024: encode 4.13ms, decode 3.88ms, total 8.01ms (1024→64)
+  seq=2048: encode 17.24ms, decode 11.73ms, total 28.97ms (2048→128)
+
+══════════════════════════════════════════
+[conv_3L_s16] tokenizer=byte
+══════════════════════════════════════════
+체크포인트 로드: exp-jamo-codec/checkpoints/conv_3L_s16_final.pt (step 25000)
+모델: d=256, stride=16, params=6.23M
+토크나이저: byte (vocab=263)
+
+=== 복원 정확도 ===
+  토큰 정확도:   100.00%
+  문자 정확도:   100.00%
+  시퀀스 EM:     99.99%
+  평균 loss:     0.0000
+  BPB:           0.0000
+  평가 시퀀스:   200000
+  평가 토큰:     82183993
+
+=== 레이턴시 (GPU) ===
+  seq=256: encode 0.37ms, decode 0.39ms, total 0.76ms (256→16)
+  seq=512: encode 0.39ms, decode 0.36ms, total 0.75ms (512→32)
+  seq=1024: encode 0.42ms, decode 0.37ms, total 0.78ms (1024→64)
+  seq=2048: encode 0.59ms, decode 0.54ms, total 1.14ms (2048→128)
+
+══════════════════════════════════════════
+[conv_6L_s16] tokenizer=byte
+══════════════════════════════════════════
+체크포인트 로드: exp-jamo-codec/checkpoints/conv_6L_s16_final.pt (step 25000)
+모델: d=256, stride=16, params=8.20M
+토크나이저: byte (vocab=263)
+
+=== 복원 정확도 ===
+  토큰 정확도:   100.00%
+  문자 정확도:   100.00%
+  시퀀스 EM:     100.00%
+  평균 loss:     0.0000
+  BPB:           0.0000
+  평가 시퀀스:   200000
+  평가 토큰:     82183993
+
+=== 레이턴시 (GPU) ===
+  seq=256: encode 0.70ms, decode 0.63ms, total 1.33ms (256→16)
+  seq=512: encode 0.65ms, decode 0.74ms, total 1.39ms (512→32)
+  seq=1024: encode 0.67ms, decode 0.66ms, total 1.33ms (1024→64)
+  seq=2048: encode 1.00ms, decode 1.00ms, total 2.00ms (2048→128)
+
+══════════════════════════════════════════
+[conv_9L_s16] tokenizer=byte
+══════════════════════════════════════════
+체크포인트 로드: exp-jamo-codec/checkpoints/conv_9L_s16_final.pt (step 25000)
+모델: d=256, stride=16, params=10.17M
+토크나이저: byte (vocab=263)
+
+=== 복원 정확도 ===
+  토큰 정확도:   100.00%
+  문자 정확도:   100.00%
+  시퀀스 EM:     100.00%
+  평균 loss:     0.0000
+  BPB:           0.0000
+  평가 시퀀스:   200000
+  평가 토큰:     82183993
+
+=== 레이턴시 (GPU) ===
+  seq=256: encode 0.93ms, decode 0.90ms, total 1.83ms (256→16)
+  seq=512: encode 0.94ms, decode 0.99ms, total 1.92ms (512→32)
+  seq=1024: encode 0.95ms, decode 0.93ms, total 1.88ms (1024→64)
+  seq=2048: encode 1.42ms, decode 1.38ms, total 2.79ms (2048→128)
+
+══════════════════════════════════════════
+[conv_1L_nohash_s16] tokenizer=byte
+══════════════════════════════════════════
+체크포인트 로드: exp-jamo-codec/checkpoints/conv_1L_nohash_s16_final.pt (step 25000)
+모델: d=256, stride=16, params=4.92M
+토크나이저: byte (vocab=263)
+
+=== 복원 정확도 ===
+  토큰 정확도:   100.00%
+  문자 정확도:   100.00%
+  시퀀스 EM:     100.00%
+  평균 loss:     0.0000
+  BPB:           0.0000
+  평가 시퀀스:   200000
+  평가 토큰:     82183993
+
+=== 레이턴시 (GPU) ===
+  seq=256: encode 0.22ms, decode 0.19ms, total 0.40ms (256→16)
+  seq=512: encode 0.23ms, decode 0.18ms, total 0.42ms (512→32)
+  seq=1024: encode 0.23ms, decode 0.18ms, total 0.41ms (1024→64)
+  seq=2048: encode 0.29ms, decode 0.28ms, total 0.57ms (2048→128)
+
+══════════════════════════════════════════
+[conv_1L_hash_s16] tokenizer=byte
+══════════════════════════════════════════
+체크포인트 로드: exp-jamo-codec/checkpoints/conv_1L_hash_s16_final.pt (step 25000)
+모델: d=256, stride=16, params=8.78M
+토크나이저: byte (vocab=263)
+
+=== 복원 정확도 ===
+  토큰 정확도:   100.00%
+  문자 정확도:   100.00%
+  시퀀스 EM:     99.99%
+  평균 loss:     0.0000
+  BPB:           0.0000
+  평가 시퀀스:   200000
+  평가 토큰:     82183993
+
+=== 레이턴시 (GPU) ===
+  seq=256: encode 1.80ms, decode 0.17ms, total 1.97ms (256→16)
+  seq=512: encode 1.74ms, decode 0.18ms, total 1.92ms (512→32)
+  seq=1024: encode 1.73ms, decode 0.17ms, total 1.91ms (1024→64)
+  seq=2048: encode 1.75ms, decode 0.26ms, total 2.01ms (2048→128)
+
+══════════════════════════════════════════
+[conv_2L_nohash_s16] tokenizer=byte
+══════════════════════════════════════════
+체크포인트 로드: exp-jamo-codec/checkpoints/conv_2L_nohash_s16_final.pt (step 25000)
+모델: d=256, stride=16, params=5.58M
+토크나이저: byte (vocab=263)
+
+=== 복원 정확도 ===
+  토큰 정확도:   100.00%
+  문자 정확도:   100.00%
+  시퀀스 EM:     99.99%
+  평균 loss:     0.0000
+  BPB:           0.0000
+  평가 시퀀스:   200000
+  평가 토큰:     82183993
+
+=== 레이턴시 (GPU) ===
+  seq=256: encode 0.29ms, decode 0.30ms, total 0.59ms (256→16)
+  seq=512: encode 0.30ms, decode 0.30ms, total 0.60ms (512→32)
+  seq=1024: encode 0.33ms, decode 0.28ms, total 0.61ms (1024→64)
+  seq=2048: encode 0.44ms, decode 0.40ms, total 0.84ms (2048→128)
+
+══════════════════════════════════════════
+[conv_2L_hash_s16] tokenizer=byte
+══════════════════════════════════════════
+체크포인트 로드: exp-jamo-codec/checkpoints/conv_2L_hash_s16_final.pt (step 25000)
+모델: d=256, stride=16, params=9.43M
+토크나이저: byte (vocab=263)
+
+=== 복원 정확도 ===
+  토큰 정확도:   100.00%
+  문자 정확도:   100.00%
+  시퀀스 EM:     100.00%
+  평균 loss:     0.0000
+  BPB:           0.0000
+  평가 시퀀스:   200000
+  평가 토큰:     82183993
+
+=== 레이턴시 (GPU) ===
+  seq=256: encode 1.87ms, decode 0.26ms, total 2.13ms (256→16)
+  seq=512: encode 1.85ms, decode 0.27ms, total 2.12ms (512→32)
+  seq=1024: encode 1.87ms, decode 0.26ms, total 2.13ms (1024→64)
+  seq=2048: encode 1.79ms, decode 0.40ms, total 2.19ms (2048→128)
+
+══════════════════════════════════════════
+[conv_3L_nohash_s16] tokenizer=byte
+══════════════════════════════════════════
+체크포인트 로드: exp-jamo-codec/checkpoints/conv_3L_nohash_s16_final.pt (step 25000)
+모델: d=256, stride=16, params=6.23M
+토크나이저: byte (vocab=263)
+
+=== 복원 정확도 ===
+  토큰 정확도:   100.00%
+  문자 정확도:   100.00%
+  시퀀스 EM:     100.00%
+  평균 loss:     0.0000
+  BPB:           0.0000
+  평가 시퀀스:   200000
+  평가 토큰:     82183993
+
+=== 레이턴시 (GPU) ===
+  seq=256: encode 0.57ms, decode 0.47ms, total 1.04ms (256→16)
+  seq=512: encode 0.37ms, decode 0.41ms, total 0.78ms (512→32)
+  seq=1024: encode 0.40ms, decode 0.38ms, total 0.78ms (1024→64)
+  seq=2048: encode 0.59ms, decode 0.54ms, total 1.13ms (2048→128)
+
+══════════════════════════════════════════
+[conv_3L_hash_s16] tokenizer=byte
+══════════════════════════════════════════
+체크포인트 로드: exp-jamo-codec/checkpoints/conv_3L_hash_s16_final.pt (step 25000)
+모델: d=256, stride=16, params=10.09M
+토크나이저: byte (vocab=263)
+
+=== 복원 정확도 ===
+  토큰 정확도:   100.00%
+  문자 정확도:   100.00%
+  시퀀스 EM:     99.99%
+  평균 loss:     0.0000
+  BPB:           0.0000
+  평가 시퀀스:   200000
+  평가 토큰:     82183993
+
+=== 레이턴시 (GPU) ===
+  seq=256: encode 2.00ms, decode 0.35ms, total 2.35ms (256→16)
+  seq=512: encode 1.95ms, decode 0.35ms, total 2.31ms (512→32)
+  seq=1024: encode 1.94ms, decode 0.36ms, total 2.30ms (1024→64)
+  seq=2048: encode 1.95ms, decode 0.54ms, total 2.49ms (2048→128)
+
+=== 전체 평가 완료 ===
