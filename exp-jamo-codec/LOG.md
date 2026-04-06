@@ -505,6 +505,68 @@ s16 체크포인트만 (byte 토크나이저):
 
 ---
 
+### 열린 질문들 — 엔트로피 모델 & 코덱 설계
+
+엔트로피 스케일링 실험 진행 중 떠오른 고민들. 답은 e2e 실험에서 나올 것.
+
+**1. Causal 엔트로피가 bidirectional encoder에 유효한가?**
+- BLT의 전제: causal LM의 "놀라움"으로 패치 경계 결정
+- 우리 태스크: bidirectional encoder-only (RTD pretrain → GEC)
+- causal entropy가 높은 위치가 bidirectional에서는 오른쪽 문맥으로 쉽게 해결될 수 있음
+- 반론: causal entropy는 단어 경계, 희귀어, 문장 시작 등 자연어 구조적 경계와 상관 → 방향 무관
+- 반론: 오타 위치에서 entropy 폭발 → GEC에서 오류 부근 해상도 자동 증가, 오히려 유리할 수 있음
+
+**2. 양방향 엔트로피 모델은 가능한가?**
+- 양방향이면 대부분의 토큰이 예측 가능 → entropy가 전반적으로 낮아짐 → "놀라움 신호" 소실
+- MLM 마스킹으로 대체 가능하나, 마스킹 위치 의존적이라 패치 경계로 불안정
+- BLT가 causal을 선택한 이유가 있음: 한쪽 방향의 불확실성이 경계 신호로 더 자연스러움
+
+**3. 동적 패칭이 고정 stride보다 정말 나은가?**
+- Conv 1L이 stride=16 고정으로 200K에서 100% 복원 — 복원은 문제 없음
+- 고정 stride 문제: 같은 단어도 경계 위치에 따라 다른 z → backbone이 불일관한 입력을 받음
+- 동적 패칭 이점: 의미 경계에서 자르면 일관된 z → backbone에 더 좋을 수 있음
+- 동적 패칭 비용: 엔트로피 모델이 파라미터 예산을 먹음 (10M~50M)
+- 판단 기준: RTD pretrain에서 "같은 스텝에서 더 높은 accuracy"를 달성하는가
+
+**4. 코덱 레이어 수가 z 품질에 영향을 주는가?**
+- 1L/2L/3L 모두 복원 100% — 복원 관점에서는 동일
+- 1L: receptive field 5 byte → 좁은 시야, backbone이 z를 조합해서 문맥 구성해야 함
+- 3L: receptive field 13 byte → 패치 경계 너머까지 봄, z에 문맥이 이미 포함
+- backbone이 충분히 크면 1L로도 충분, 작으면 3L이 유리할 수 있음
+- e2e에서 1L vs 2L vs 3L 비교 필요
+
+**5. 256차원 z의 표현력은 충분한가?**
+- BERT-small, KoELECTRA-small이 256차원으로 실용적 성능
+- 바이트 16개 요약 용도로는 충분할 것으로 판단
+- backbone d_model과 다르면 projection 필요 → 정보 병목 가능성
+
+**6. 엔트로피 모델 = 동적 토크나이저**
+- BPE 하나가 하던 일을 10M~50M 모델이 대체하는 구조
+- 비용 정당화: 고정 stride/BPE보다 확실히 나아야 함
+- 바이트 코덱의 근본적 장점: 유사한 입력 → 유사한 z (BPE에서는 보장 안 됨)
+- "맞춤법" vs "맞춤뻡": BPE는 완전히 다른 토큰, 바이트 코덱은 유사한 z
+
+**7. UTF-8 바이트 중간 절단 문제**
+- 엔트로피 모델이 한글 3바이트(0xED 0x95 0x9C) 중간에서 자를 수 있음
+- Conv의 receptive field(kernel=5)가 경계 너머를 보기 때문에 복원은 가능 (100% 증명됨)
+- min_patch=2 제약으로 1바이트 패치 방지
+- backbone에서 잘린 z의 의미 일관성은 e2e에서 확인 필요
+
+**8. Conv z vs 임베딩 lookup — 표현력 차이**
+- BPE 임베딩 lookup: "안녕하세요" = 1벡터, 학습된 의미가 직접 담김
+- Conv z: 바이트 패턴의 로컬 특징 추출, 의미는 backbone 레이어를 거치며 조합
+- Conv z가 "구리다"기보다 "출발점이 다르다" — backbone이 레이어를 거치며 보완
+- BPE는 OOV/오타에 취약, Conv는 강건 → 트레이드오프
+
+**9. Backbone 설계 시사점: 레이어 깊이 > hidden size**
+- BPE 임베딩은 이미 의미 덩어리 → shallow backbone으로도 가능
+- Conv z는 로컬 특징 조각 → 여러 레이어를 거쳐 문맥을 조합해야 의미 완성
+- hidden size 증가 = 패치당 표현력 증가, 레이어 증가 = 문맥 조합 깊이 증가
+- Conv z 기반 backbone은 레이어를 깊게 가는 게 유리할 것으로 판단
+- ModernBERT도 같은 방향 (hidden size 적당히, 레이어 깊게)
+
+---
+
 ### 메모: KoELECTRA baseline이 필요한 이유
 
 - KoELECTRA-base = WordPiece + RTD pretrain 완료 모델 → GEC fine-tune만 하면 baseline 수치 확보
