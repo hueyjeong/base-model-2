@@ -706,6 +706,71 @@ NFD 분해 (초/중/종성, ㅄ→ㅄ 유지), byte fallback. 깊이 학습 불�
 
 ---
 
+### 아이디어: 거대 Vocab + Conv Composition (임베딩 테이블 제거)
+
+엔트로피 스케일링 실험 후 논의에서 나온 대안 경로.
+
+**핵심 발상:** vocab을 100K~1M+ 로 키우되 임베딩 테이블을 없애고, Conv가 토큰의 구성 자모/바이트에서 벡터를 직접 생성.
+
+**기존 방식의 제약:**
+- BPE vocab 30K × d768 = 23M (BERT)
+- vocab 100K × d768 = 77M (예산의 60%)
+- vocab 1M × d768 = 768M (불가능)
+- vocab이 클수록 성능이 좋다는 건 검증됨 (GPT-4: 100K vocab)
+- 하지만 임베딩 테이블이 모델보다 커지는 문제
+
+**제안 구조:**
+```
+텍스트 → BBPE 대형 vocab 토크나이저 (경계 결정, 파라미터 0)
+       → 각 토큰을 자모/byte로 분해
+       → Conv 인코더 (토큰별 벡터 생성, ~5M)
+       → projection (256→backbone d_model)
+       → backbone (Transformer)
+       → task head (편집 태그 608개 or 자모 330개)
+```
+
+**장점:**
+1. **vocab 크기에 따른 파라미터 비용 = 0** — vocab 10M이든 Conv는 5M 고정
+2. **엔트로피 모델 불필요** — BBPE가 의미 단위 경계를 공짜로 제공 (10M 절약)
+3. **오타 강건** — "맞춤법"과 "맞춤뻡"의 자모가 유사 → Conv z도 유사 (이미 검증)
+4. **OOV 없음** — BBPE byte fallback + Conv composition
+5. **출력 vocab 문제 없음** — 인코더-only 편집 태깅이라 softmax 대상은 태그 수(608) 고정. 생성형 LM이면 출력 쪽 `Linear(d, vocab)` + softmax가 문제지만 우리 태스크에서는 해당 없음
+6. **검증된 조각들의 조합** — 큰 vocab(✅), BBPE OOV 없음(✅), Conv 오타 강건(✅), 임베딩 절약(ALBERT✅)
+
+**파라미터 비교 (128M 예산):**
+| 구조 | 토크나이저 | 임베딩 | 코덱/엔트로피 | backbone |
+|------|-----------|--------|-------------|----------|
+| BPE 기존 | BPE 30K | 23M | - | 105M |
+| BLT 경로 | 엔트로피 10M | 0.25M | Conv 5M | 113M |
+| **대형 vocab + Conv** | BBPE 100K+ | **0** | Conv 5M | **123M** |
+
+backbone에 가장 많은 파라미터를 쓸 수 있음.
+
+**열린 질문:**
+- 토큰당 자모 수가 길어지면 Conv receptive field가 부족할 수 있음 → 레이어 추가로 해결?
+- BBPE 대형 vocab 토크나이저 학습 자체의 시간/비용
+- Conv가 긴 토큰(예: "프로그래밍을")의 의미를 잘 포착하는가
+- BLT 엔트로피 경로와 병렬로 실험 가능
+
+**실용적 장점:**
+- **토크나이저는 주워오면 됨** — SentencePiece, HuggingFace tokenizers 등 기성품 사용 가능. 직접 학습해도 CPU 몇 시간. 엔트로피 모델(10M, GPU 수시간)과 비교하면 비용 0에 수렴
+- **엔트로피 모델의 baseline 역할** — BBPE+Conv vs 엔트로피+Conv를 동일 backbone으로 비교하면, 엔트로피 모델 10M 투자 가치를 직접 측정 가능. BBPE baseline을 먼저 만들고 엔트로피가 이기는지 확인하는 게 효율적
+
+**생성 LM 출력 문제 해결:**
+- 입력: 거대 vocab BBPE가 경계 결정 → Conv 인코더가 벡터 생성
+- 출력: backbone → Conv 디코더 → 자모/byte 단위 복원 (softmax 대상 = 330)
+- 거대 vocab은 입력 경계에만 사용, 출력은 항상 소형 vocab → softmax 비용 무관
+- BLT가 정확히 이 비대칭 구조 (입력 패치 단위, 출력 바이트 단위)
+
+**현재 경로와의 관계:**
+- BLT 엔트로피 경로를 포기하는 것이 아님
+- 기존 Conv 코덱 자산을 그대로 활용하면서 경계 결정 방식만 다름
+  - 엔트로피 경로: 엔트로피 모델(10M)이 경계 결정
+  - 대형 vocab 경로: BBPE 토크나이저(0M)가 경계 결정
+- BBPE baseline을 먼저 확보 → 엔트로피 모델의 가치 판단 → 투자 여부 결정
+
+---
+
 ### 메모: KoELECTRA baseline이 필요한 이유
 
 - KoELECTRA-base = WordPiece + RTD pretrain 완료 모델 → GEC fine-tune만 하면 baseline 수치 확보
