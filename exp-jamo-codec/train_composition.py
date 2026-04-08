@@ -216,7 +216,11 @@ def train(args):
                 tok_s *= world_size
             lr = scheduler.get_last_lr()[0]
 
-            print(f"{global_step:8d} {avg_loss:8.4f} {avg_acc:7.2f}% {lr:10.2e} {tok_s:8.0f}")
+            # 진행률: step 기반 추정
+            eff_batch = args.batch_size * grad_accum * world_size
+            samples_done = global_step * eff_batch
+            progress = global_step / args.max_steps * 100
+            print(f"{global_step:8d} {avg_loss:8.4f} {avg_acc:7.2f}% {lr:10.2e} {tok_s:8.0f}  {progress:.1f}% ({samples_done:,}samples)")
 
             accum_loss = 0.0
             accum_correct = 0
