@@ -16,7 +16,7 @@ WARMUP=2000
 LOG_EVERY=5000
 SAVE_EVERY=100000
 OUT="exp-jamo-codec/checkpoints"
-GDRIVE="${GDRIVE:-}"  # 구글 드라이브 마운트 경로 (예: /gdrive/MyDrive/codec)
+GDRIVE="${GDRIVE:-}"  # rclone 원격지 (예: gdrive:base-model-2-ckpts/composition)
 
 echo "=== CompositionCodec 본학습 ==="
 echo "d=${D_MODEL}, L=${N_LAYERS}, k=${KERNEL}"
@@ -36,17 +36,11 @@ torchrun --nproc_per_node=${NGPU:-4} exp-jamo-codec/train_composition.py \
   --out_dir ${OUT} \
   2>&1 | tee exp-jamo-codec/composition_train_log.txt
 
-# 구글 드라이브 업로드 (경로가 설정된 경우)
+# rclone 업로드는 train_composition.py에서 GDRIVE 환경변수로 자동 처리
+# (체크포인트 저장 시마다 백그라운드 스레드로 업로드)
+# 최종 로그 업로드
 if [ -n "${GDRIVE}" ]; then
-    echo ""
-    echo "=== 구글 드라이브 업로드 ==="
-    mkdir -p "${GDRIVE}"
-    cp exp-jamo-codec/composition_train_log.txt "${GDRIVE}/"
-    for f in ${OUT}/composition_${N_LAYERS}L_*.pt; do
-        if [ -f "$f" ]; then
-            echo "  업로드: $(basename $f)"
-            cp "$f" "${GDRIVE}/"
-        fi
-    done
-    echo "업로드 완료: ${GDRIVE}"
+    echo "=== 최종 로그 업로드 ==="
+    rclone copy exp-jamo-codec/composition_train_log.txt "${GDRIVE}/" 2>/dev/null && \
+        echo "로그 업로드 완료" || echo "로그 업로드 실패"
 fi
