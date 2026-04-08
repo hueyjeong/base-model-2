@@ -13,8 +13,8 @@ N_LAYERS=6
 KERNEL=7
 LR=3e-4
 WARMUP=2000
-LOG_EVERY=5000
-SAVE_EVERY=100000
+LOG_EVERY=1000
+SAVE_EVERY=10000
 OUT="exp-jamo-codec/checkpoints"
 GDRIVE="${GDRIVE:-}"  # rclone 원격지 (예: gdrive:base-model-2-ckpts/composition)
 
@@ -25,6 +25,10 @@ echo "Steps: ${MAX_STEPS}, Batch: ${BATCH_SIZE}×${NGPU:-4}gpu=$((BATCH_SIZE * $
 echo "Save every: ${SAVE_EVERY}, GDrive: ${GDRIVE:-none}"
 echo ""
 
+VAL_CORPUS="${VAL_CORPUS:-corpus/val.parquet}"
+VAL_EVERY=5000
+VAL_SAMPLES=10000
+
 torchrun --nproc_per_node=${NGPU:-4} exp-jamo-codec/train_composition.py \
   --corpus ${CORPUS} --text_key ${TEXT_KEY} \
   --d_model ${D_MODEL} --n_layers ${N_LAYERS} --kernel_size ${KERNEL} \
@@ -33,6 +37,7 @@ torchrun --nproc_per_node=${NGPU:-4} exp-jamo-codec/train_composition.py \
   --lr ${LR} --warmup_steps ${WARMUP} \
   --bf16 --compile --num_workers 16 \
   --log_every ${LOG_EVERY} --save_every ${SAVE_EVERY} \
+  --val_corpus ${VAL_CORPUS} --val_every ${VAL_EVERY} --val_samples ${VAL_SAMPLES} \
   --out_dir ${OUT} \
   2>&1 | tee exp-jamo-codec/composition_train_log.txt
 

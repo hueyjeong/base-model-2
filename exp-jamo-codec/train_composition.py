@@ -32,6 +32,41 @@ def _unwrap_state_dict(model):
     return {k[len(prefix):] if k.startswith(prefix) else k: v for k, v in sd.items()}
 
 
+@torch.no_grad()
+def validate(codec, val_loader, device, max_samples=1000):
+    """검증 세트 복원 정확도 측정"""
+    codec.eval()
+    total_correct = 0
+    total_jamo = 0
+    total_loss = 0.0
+    n_batches = 0
+    n_samples = 0
+
+    for batch in val_loader:
+        jamo_ids = batch["jamo_ids"].to(device)
+        jamo_mask = batch["jamo_mask"].to(device)
+        segment_ids = batch["segment_ids"].to(device)
+        n_segments = batch["n_segments"].to(device)
+
+        out = codec(jamo_ids, jamo_mask, segment_ids, n_segments)
+        pred = out["logits"].argmax(dim=-1)
+
+        valid = jamo_mask
+        total_correct += ((pred == jamo_ids) & valid).sum().item()
+        total_jamo += valid.sum().item()
+        total_loss += out["loss"].item()
+        n_batches += 1
+        n_samples += jamo_ids.size(0)
+
+        if n_samples >= max_samples:
+            break
+
+    codec.train()
+    acc = total_correct / max(total_jamo, 1) * 100
+    avg_loss = total_loss / max(n_batches, 1)
+    return {"val_loss": avg_loss, "val_acc": acc, "val_samples": n_samples}
+
+
 def train(args):
     # DDP 초기화
     is_distributed = "RANK" in os.environ
@@ -96,6 +131,18 @@ def train(args):
         num_workers=args.num_workers,
         pin_memory=True,
     )
+
+    # Validation 데이터
+    val_loader = None
+    if args.val_corpus and rank == 0:
+        val_dataset = BBPEJamoDataset(
+            file_paths=args.val_corpus,
+            bbpe_tokenizer=bbpe,
+            jamo_tokenizer=jamo,
+            max_seq_len=args.max_seq_len,
+            text_key=args.text_key,
+        )
+        val_loader = DataLoader(val_dataset, batch_size=args.batch_size, num_workers=0)
 
     # Optimizer
     optimizer = torch.optim.AdamW(
@@ -233,6 +280,13 @@ def train(args):
             accum_total = 0
             t_start = time.time()
 
+        # Validation
+        if val_loader is not None and args.val_every > 0 and global_step % args.val_every == 0 and rank == 0:
+            val_metrics = validate(codec, val_loader, device, args.val_samples)
+            print(f"  [VAL] loss={val_metrics['val_loss']:.4f}, "
+                  f"acc={val_metrics['val_acc']:.4f}%, "
+                  f"samples={val_metrics['val_samples']}")
+
         # 체크포인트
         if args.save_every > 0 and global_step % args.save_every == 0 and rank == 0:
             model_sd = _unwrap_state_dict(codec)
@@ -327,6 +381,9 @@ def main():
     # 로깅/저장/재개
     parser.add_argument("--log_every", type=int, default=100)
     parser.add_argument("--save_every", type=int, default=0)
+    parser.add_argument("--val_corpus", nargs="+", default=None, help="검증 코퍼스")
+    parser.add_argument("--val_every", type=int, default=5000, help="검증 주기 (steps)")
+    parser.add_argument("--val_samples", type=int, default=1000, help="검증 샘플 수")
     parser.add_argument("--out_dir", default="exp-jamo-codec/checkpoints")
     parser.add_argument("--resume", default=None, help="체크포인트에서 재개")
 
