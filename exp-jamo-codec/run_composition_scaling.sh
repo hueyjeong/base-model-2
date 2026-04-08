@@ -8,31 +8,29 @@ TEXT_KEY="text"
 MAX_STEPS=50000
 BATCH_SIZE=64
 SEQ_LEN=512
-D_MODEL=256
+D_MODEL=384
 KERNEL=7
-LOG_EVERY=1000
+LOG_EVERY=2000
 OUT="exp-jamo-codec/checkpoints"
 
-echo "=== CompositionCodec (concat) Layer Scaling ==="
+echo "=== CompositionCodec d=384 5L ==="
 echo "Corpus: ${CORPUS}, Steps: ${MAX_STEPS}, Batch: ${BATCH_SIZE}, SeqLen: ${SEQ_LEN}"
 echo ""
 
-for NL in 3 4 5; do
-    echo "══════════════════════════════════════════"
-    echo "[${NL}L k=${KERNEL}] CompositionCodec d=${D_MODEL}"
-    echo "══════════════════════════════════════════"
+NL=5
 
-    torchrun --nproc_per_node=${NGPU:-4} exp-jamo-codec/train_composition.py \
-      --corpus ${CORPUS} --text_key ${TEXT_KEY} \
-      --d_model ${D_MODEL} --n_layers ${NL} --kernel_size ${KERNEL} \
-      --max_seq_len ${SEQ_LEN} \
-      --batch_size ${BATCH_SIZE} --max_steps ${MAX_STEPS} \
-      --lr 3e-4 --warmup_steps 500 \
-      --bf16 --compile --num_workers 2 \
-      --log_every ${LOG_EVERY} --save_every 0 \
-      --out_dir ${OUT}
+echo "══════════════════════════════════════════"
+echo "[${NL}L k=${KERNEL}] CompositionCodec d=${D_MODEL}"
+echo "══════════════════════════════════════════"
 
-    echo ""
-done
+torchrun --nproc_per_node=${NGPU:-4} exp-jamo-codec/train_composition.py \
+  --corpus ${CORPUS} --text_key ${TEXT_KEY} \
+  --d_model ${D_MODEL} --n_layers ${NL} --kernel_size ${KERNEL} \
+  --max_seq_len ${SEQ_LEN} \
+  --batch_size ${BATCH_SIZE} --max_steps ${MAX_STEPS} \
+  --lr 3e-4 --warmup_steps 500 \
+  --bf16 --compile --num_workers 2 \
+  --log_every ${LOG_EVERY} --save_every 0 \
+  --out_dir ${OUT}
 
 echo "=== 레이어 스케일링 완료 ==="
