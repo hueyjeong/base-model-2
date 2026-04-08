@@ -264,12 +264,24 @@ def train(args):
         print(f"최종 저장: {save_path}")
         gdrive = os.environ.get("GDRIVE")
         if gdrive:
-            from training.upload_gdrive import upload_and_cleanup
+            import subprocess, shlex
             log_path = os.path.join(
                 os.path.dirname(args.out_dir), "composition_train_log.txt",
             )
-            upload_and_cleanup(save_path, log_path, gdrive)
-            print(f"  → GDrive 업로드 시작 (백그라운드): {gdrive}")
+            print(f"  → GDrive 최종 업로드 중... ({gdrive})")
+            try:
+                subprocess.run(
+                    f"rclone copy {shlex.quote(save_path)} {shlex.quote(gdrive)}",
+                    shell=True, check=True,
+                )
+                if os.path.exists(log_path):
+                    subprocess.run(
+                        f"rclone copy {shlex.quote(log_path)} {shlex.quote(gdrive)}",
+                        shell=True, check=True,
+                    )
+                print(f"  → GDrive 업로드 완료")
+            except Exception as e:
+                print(f"  → GDrive 업로드 실패: {e}")
 
     if is_distributed:
         dist.destroy_process_group()
