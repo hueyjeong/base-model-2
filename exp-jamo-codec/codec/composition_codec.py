@@ -57,7 +57,8 @@ class CompositionEncoder(nn.Module):
             x = layer(x)  # [B, L, D]
 
         # Segment Avg Pool (scatter_add)
-        max_seg = n_segments.max().item()
+        # segment_ids의 max로 대체 (.item() 없이 compile 호환)
+        max_seg = segment_ids.max() + 1
         token_vecs = torch.zeros(B, max_seg, D, device=x.device, dtype=x.dtype)
         counts = torch.zeros(B, max_seg, 1, device=x.device, dtype=x.dtype)
 
