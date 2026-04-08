@@ -171,11 +171,16 @@ def train(args):
         if any(k.startswith(prefix) for k in sd):
             sd = {k[len(prefix):] if k.startswith(prefix) else k: v for k, v in sd.items()}
         # DDP/compile 래핑 전 모델에 로드
+        # strict=False: 새 파라미터(intra_pos_emb 등) 추가 시에도 resume 가능
         raw = codec.module if hasattr(codec, "module") else codec
         if hasattr(raw, "_orig_mod"):
-            raw._orig_mod.load_state_dict(sd)
+            missing, unexpected = raw._orig_mod.load_state_dict(sd, strict=False)
         else:
-            raw.load_state_dict(sd)
+            missing, unexpected = raw.load_state_dict(sd, strict=False)
+        if rank == 0 and missing:
+            print(f"  [resume] 새로 초기화된 파라미터: {missing}")
+        if rank == 0 and unexpected:
+            print(f"  [resume] 무시된 파라미터: {unexpected}")
         if "optimizer" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer"])
         if "scheduler" in ckpt:

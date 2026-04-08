@@ -80,36 +80,66 @@ class CompositionDecoder(nn.Module):
 
     토큰 벡터를 segment_ids로 원래 자모 길이로 확장 후
     Conv로 처리하여 자모 logits 출력.
+
+    개선:
+    - intra_pos_emb: 세그먼트 내 0-based position embedding → '울'→'ㅜㅜ' 류 오류 해결
+    - jamo_mask 적용: 패딩 위치가 Conv를 통해 유효 위치에 오염되는 것 방지
     """
 
     def __init__(self, jamo_vocab: int = 330, d_model: int = 256,
-                 n_layers: int = 5, kernel_size: int = 7, dropout: float = 0.1):
+                 n_layers: int = 5, kernel_size: int = 7, dropout: float = 0.1,
+                 max_jamo_per_token: int = 32):
         super().__init__()
+        self.max_jamo_per_token = max_jamo_per_token
         self.upsample_proj = nn.Linear(d_model, d_model)
+        # 세그먼트 내 위치 임베딩 (intra-segment position)
+        self.intra_pos_emb = nn.Embedding(max_jamo_per_token, d_model)
         self.layers = nn.ModuleList([
             ConvBlock(d_model, kernel_size, dropout) for _ in range(n_layers)
         ])
         self.head = nn.Linear(d_model, jamo_vocab)
 
     def forward(self, token_vecs: torch.Tensor, segment_ids: torch.Tensor,
-                target_len: int) -> torch.Tensor:
+                target_len: int, jamo_mask: torch.Tensor = None) -> torch.Tensor:
         """
         Args:
             token_vecs: [B, max_segments, d_model]
             segment_ids: [B, L] 각 자모의 토큰 ID
             target_len: 출력 자모 길이 L
+            jamo_mask: [B, L] bool, 유효 위치 (선택)
 
         Returns:
             logits: [B, L, jamo_vocab]
         """
+        B, L = segment_ids.shape
+        D = token_vecs.size(-1)
+
+        # within_pos 계산: 각 자모의 세그먼트 내 0-based index
+        # segment_ids가 단조 비감소이므로, within_pos = l - seg_start[segment_ids[l]]
+        arange_pos = torch.arange(L, device=segment_ids.device).unsqueeze(0).expand(B, -1)
+        max_seg = int(segment_ids.max().item()) + 1
+        seg_start = torch.full((B, max_seg), L, dtype=torch.long, device=segment_ids.device)
+        seg_start.scatter_reduce_(1, segment_ids, arange_pos, reduce='amin', include_self=True)
+        seg_start_per_pos = seg_start.gather(1, segment_ids)  # [B, L]
+        within_pos = (arange_pos - seg_start_per_pos).clamp(0, self.max_jamo_per_token - 1)
+
         # Upsample: 각 자모 위치에 해당 토큰 벡터 배치
-        seg_exp = segment_ids.unsqueeze(-1).expand(-1, -1, token_vecs.size(-1))
+        seg_exp = segment_ids.unsqueeze(-1).expand(-1, -1, D)
         x = token_vecs.gather(1, seg_exp)  # [B, L, D]
         x = self.upsample_proj(x)
 
-        # Conv 레이어
+        # 세그먼트 내 위치 정보 주입
+        x = x + self.intra_pos_emb(within_pos)
+
+        # 패딩 위치 0화 (Conv를 통한 오염 방지)
+        if jamo_mask is not None:
+            x = x * jamo_mask.unsqueeze(-1).float()
+
+        # Conv 레이어 (각 레이어 후 패딩 재적용)
         for layer in self.layers:
             x = layer(x)
+            if jamo_mask is not None:
+                x = x * jamo_mask.unsqueeze(-1).float()
 
         return self.head(x)  # [B, L, V]
 
@@ -125,7 +155,8 @@ class CompositionCodec(nn.Module):
     """
 
     def __init__(self, jamo_vocab: int = 330, d_model: int = 256,
-                 n_layers: int = 5, kernel_size: int = 7, dropout: float = 0.1):
+                 n_layers: int = 5, kernel_size: int = 7, dropout: float = 0.1,
+                 max_jamo_per_token: int = 32):
         super().__init__()
         self.jamo_vocab = jamo_vocab
         self.d_model = d_model
@@ -135,6 +166,7 @@ class CompositionCodec(nn.Module):
         )
         self.decoder = CompositionDecoder(
             jamo_vocab, d_model, n_layers, kernel_size, dropout,
+            max_jamo_per_token=max_jamo_per_token,
         )
 
     def forward(self, jamo_ids: torch.Tensor, jamo_mask: torch.Tensor,
@@ -156,7 +188,7 @@ class CompositionCodec(nn.Module):
         z = self.encoder(jamo_ids, jamo_mask, segment_ids, n_segments)
 
         # Decode
-        logits = self.decoder(z, segment_ids, L)  # [B, L, V]
+        logits = self.decoder(z, segment_ids, L, jamo_mask)  # [B, L, V]
 
         # Loss
         flat_logits = logits.reshape(-1, self.jamo_vocab)
@@ -178,7 +210,7 @@ class CompositionCodec(nn.Module):
         """복원 (평가용)"""
         with torch.no_grad():
             z = self.encoder(jamo_ids, jamo_mask, segment_ids, n_segments)
-            logits = self.decoder(z, segment_ids, jamo_ids.size(1))
+            logits = self.decoder(z, segment_ids, jamo_ids.size(1), jamo_mask)
             return logits.argmax(dim=-1)
 
 
