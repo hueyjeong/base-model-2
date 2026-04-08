@@ -771,6 +771,46 @@ backbone에 가장 많은 파라미터를 쓸 수 있음.
 
 ---
 
+### 토크나이저 대규모 비교 (val.parquet 100만 문장)
+
+대형 Vocab + Conv Composition 방향에서 경계 결정용 토크나이저 선정을 위한 비교.
+
+**대상:**
+- K-EXAONE 236B (153K vocab, SuperBPE, 한국어 특화)
+- Solar Pro3/Open 100B (196K vocab, BBPE, 한국어 오버샘플링)
+- KoELECTRA-base (35K vocab, WordPiece)
+- KLUE-BERT (32K vocab, WordPiece)
+
+**결과 (100만 문장, 평균 371자):**
+
+| 토크나이저 | Vocab | 토큰/문장 | 압축률 (글자/tok) | UNK/깨짐 |
+|-----------|-------|----------|-----------------|---------|
+| **K-EXAONE 236B** | 153K | **153.2** | **2.42** | **0.000%** |
+| Solar Pro3 | 196K | 155.5 | 2.39 | 0.000% |
+| KoELECTRA | 35K | 193.7 | 1.92 | 0.109% |
+| KLUE-BERT | 32K | 191.5 | 1.94 | 0.302% |
+
+**토큰 분절 예시:**
+```
+"김철수 씨가 프로그래밍을 배우기 시작했습니다."
+  K-EXAONE (7tok): [김, 철수, 씨가, 프로그래밍, 을 배우, 기 시작했습니다, .]
+  Solar    (9tok): [김, 철수, 씨가, 프로그래밍, 을, 배우, 기, 시작했습니다, .]
+  KoELECTRA(12tok): 개별 형태소 단위 분리
+```
+
+**분석:**
+1. K-EXAONE이 vocab 43K 작은데도 Solar보다 압축률 높음 → SuperBPE 효과
+2. 대형 vocab (150K+) vs 기존 BERT (30~35K): **20% 토큰 절감**
+3. BBPE 모델은 UNK/깨짐 0% (byte fallback), WordPiece 모델은 UNK 발생
+4. 100만 문장에서도 10만과 동일 패턴 — 결과 안정적
+
+**선정: K-EXAONE 236B (153K) 토크나이저**
+- 한국어 압축 효율 최고, SuperBPE, BBPE (OOV 없음)
+- 라이선스: K-EXAONE AI Model License (파생물에 K-EXAONE 명칭 포함 필요, 상업 배포 시 별도 계약)
+- 연구/실험 용도로는 문제 없음
+
+---
+
 ### 메모: KoELECTRA baseline이 필요한 이유
 
 - KoELECTRA-base = WordPiece + RTD pretrain 완료 모델 → GEC fine-tune만 하면 baseline 수치 확보
