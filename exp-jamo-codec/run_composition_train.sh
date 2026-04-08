@@ -31,7 +31,7 @@ torchrun --nproc_per_node=${NGPU:-4} exp-jamo-codec/train_composition.py \
   --max_seq_len ${SEQ_LEN} \
   --batch_size ${BATCH_SIZE} --max_steps ${MAX_STEPS} \
   --lr ${LR} --warmup_steps ${WARMUP} \
-  --bf16 --compile --num_workers 2 \
+  --bf16 --compile --num_workers 16 \
   --log_every ${LOG_EVERY} --save_every ${SAVE_EVERY} \
   --out_dir ${OUT} \
   2>&1 | tee exp-jamo-codec/composition_train_log.txt
