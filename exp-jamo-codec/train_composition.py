@@ -113,12 +113,39 @@ def train(args):
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
+    # Resume from checkpoint
+    global_step = 0
+    if args.resume:
+        if rank == 0:
+            print(f"체크포인트 복원: {args.resume}")
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        sd = ckpt["model"]
+        prefix = "_orig_mod."
+        if any(k.startswith(prefix) for k in sd):
+            sd = {k[len(prefix):] if k.startswith(prefix) else k: v for k, v in sd.items()}
+        # DDP/compile 래핑 전 모델에 로드
+        raw = codec.module if hasattr(codec, "module") else codec
+        if hasattr(raw, "_orig_mod"):
+            raw._orig_mod.load_state_dict(sd)
+        else:
+            raw.load_state_dict(sd)
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
+        global_step = ckpt.get("step", 0)
+        # scheduler를 복원된 step까지 진행
+        if "scheduler" not in ckpt:
+            for _ in range(global_step):
+                scheduler.step()
+        if rank == 0:
+            print(f"  step {global_step}부터 재개")
+
     # BF16
     use_amp = args.bf16 and device.type == "cuda"
 
     # 학습
     codec.train()
-    global_step = 0
     accum_loss = 0.0
     accum_correct = 0
     accum_total = 0
@@ -205,6 +232,7 @@ def train(args):
             torch.save({
                 "model": model_sd,
                 "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
                 "step": global_step,
                 "args": vars(args),
             }, save_path)
@@ -276,10 +304,11 @@ def main():
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--num_workers", type=int, default=2)
 
-    # 로깅/저장
+    # 로깅/저장/재개
     parser.add_argument("--log_every", type=int, default=100)
     parser.add_argument("--save_every", type=int, default=0)
     parser.add_argument("--out_dir", default="exp-jamo-codec/checkpoints")
+    parser.add_argument("--resume", default=None, help="체크포인트에서 재개")
 
     args = parser.parse_args()
     train(args)
