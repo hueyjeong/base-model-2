@@ -9,7 +9,7 @@ MAX_STEPS=50000
 BATCH_SIZE=64
 SEQ_LEN=32
 D_MODEL=256
-KERNEL=7
+KERNEL=13
 MAX_JAMO=32
 LOG_EVERY=1000
 OUT="exp-jamo-codec/checkpoints"
@@ -20,7 +20,7 @@ echo ""
 
 for NL in 3 4 5; do
     echo "══════════════════════════════════════════"
-    echo "[${NL}L] CompositionCodec d=${D_MODEL}, k=${KERNEL}"
+    echo "[${NL}L k=${KERNEL}] CompositionCodec d=${D_MODEL}"
     echo "══════════════════════════════════════════"
 
     torchrun --nproc_per_node=${NGPU:-4} exp-jamo-codec/train_composition.py \
