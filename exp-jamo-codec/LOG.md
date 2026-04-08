@@ -902,6 +902,66 @@ K-EXAONE 153K vocab 전체를 자모 분해한 결과:
 
 ---
 
+## 2026-04-08 — CompositionCodec concat 방식 전환 + 레이어 스케일링
+
+### 구조 변경: 패딩 → concat
+
+초기 구현은 토큰별 [max_tokens, max_jamo_len=32] 패딩 방식.
+활용률 측정 결과 **8.3%** (91.7% 패딩 낭비).
+
+**concat 방식으로 전환:**
+- 전체 자모를 1열로 concat → Conv → segment_ids로 토큰 경계에서 Avg Pool
+- AdaptivePool(scatter_add) 패턴 재사용
+- 활용률 ~100%, 연산 12배 절감
+- 토큰 간 문맥 정보 활용 (contextual embedding)
+
+**파라미터 비교:**
+| 방식 | 3L | 5L |
+|------|-----|-----|
+| 패딩 (이전) | 5.03M | 6.87M |
+| concat (현재) | 3.06M | 4.89M |
+
+decoder의 expand Linear(256→32×256=2.1M) 제거로 약 2M 절감.
+
+### 레이어 스케일링 결과 (d=256, k=7, 50K steps, DDP 4GPU)
+
+| Config | Params | 최종 Acc | 최종 Loss | tok/s |
+|--------|--------|---------|----------|-------|
+| 3L | 3.06M | 99.92% | 0.0022 | 2.0M |
+| 4L | 3.97M | 99.98% | 0.0006 | 1.8M |
+| 5L | 4.89M | 99.99% | 0.0003 | 1.5M |
+
+### test.parquet 평가 (5L, 50K 샘플)
+
+- 자모 정확도: 99.9916%
+- 토큰 EM: 99.9817%
+
+**오류 패턴:**
+1. **"부스타빗"** — 희귀 토큰, 학습 데이터 노출 부족
+2. **" ○" (동그라미)** — byte fallback 영역 특수 유니코드, 학습 부족
+3. **영어 긴 단어** — "microenvironment" 등 내부 미세 오류
+4. **32자모 초과 재분절 토큰** — "신종 코로나바이러스 감염증"
+
+→ 레이어보다 **차원(저장 공간) 부족 + 희귀 토큰 노출 부족**이 주 원인
+
+### 다음 실험: d=384 5L (10.88M)
+
+- 차원 256→384 확대로 저장 공간 증가
+- 레이어 유지 (5L), 테스트 후 안전빵으로 6L(12.94M) 검토
+- 150K 임베딩 테이블(57.6M) 대비 5배 저렴
+- 코퍼스: train_ko_shuffled.jsonl (40GB)
+
+### 학습 순서 확정
+
+1. **코덱 pretrain**: 복원 학습 (현재 진행 중)
+2. **코덱 freeze → backbone RTD pretrain**: z 분포 안정적 상태에서 backbone 학습
+3. **(선택) 코덱 unfreeze fine-tune**: 성능 부족 시 end-to-end
+
+RTD/GECToR 특수 토큰([MASK], [KEEP] 등)은 코덱을 거치지 않고 별도 learnable embedding으로 처리.
+디코더는 코덱 pretrain 후 backbone 학습 시 불필요 — freeze 상태로 보관.
+
+---
+
 ### 메모: KoELECTRA baseline이 필요한 이유
 
 - KoELECTRA-base = WordPiece + RTD pretrain 완료 모델 → GEC fine-tune만 하면 baseline 수치 확보
