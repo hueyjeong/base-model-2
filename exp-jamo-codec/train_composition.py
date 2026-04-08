@@ -138,6 +138,12 @@ def train(args):
         if "scheduler" not in ckpt:
             for _ in range(global_step):
                 scheduler.step()
+        # 데이터셋 위치 복원
+        data_state = ckpt.get("data_state")
+        if isinstance(data_state, dict):
+            dataset.load_state_dict(data_state)
+            if rank == 0:
+                print(f"  데이터 복원: line {data_state.get('line_counter', 0):,}")
         if rank == 0:
             print(f"  step {global_step}부터 재개")
 
@@ -149,6 +155,7 @@ def train(args):
     accum_loss = 0.0
     accum_correct = 0
     accum_total = 0
+    max_line_counter = 0
     t_start = time.time()
 
     grad_accum = args.grad_accum_steps
@@ -176,6 +183,8 @@ def train(args):
         jamo_mask = batch["jamo_mask"].to(device)
         segment_ids = batch["segment_ids"].to(device)
         n_segments = batch["n_segments"].to(device)
+        if "_line_counter" in batch:
+            max_line_counter = max(max_line_counter, batch["_line_counter"].max().item())
 
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
             out = codec(jamo_ids, jamo_mask, segment_ids, n_segments)
@@ -216,11 +225,8 @@ def train(args):
                 tok_s *= world_size
             lr = scheduler.get_last_lr()[0]
 
-            # 진행률: step 기반 추정
-            eff_batch = args.batch_size * grad_accum * world_size
-            samples_done = global_step * eff_batch
             progress = global_step / args.max_steps * 100
-            print(f"{global_step:8d} {avg_loss:8.4f} {avg_acc:7.2f}% {lr:10.2e} {tok_s:8.0f}  {progress:.1f}% ({samples_done:,}samples)")
+            print(f"{global_step:8d} {avg_loss:8.4f} {avg_acc:7.2f}% {lr:10.2e} {tok_s:8.0f}  {progress:.1f}% L{max_line_counter:,}")
 
             accum_loss = 0.0
             accum_correct = 0
@@ -238,6 +244,7 @@ def train(args):
                 "optimizer": optimizer.state_dict(),
                 "scheduler": scheduler.state_dict(),
                 "step": global_step,
+                "data_state": {"line_counter": int(max_line_counter)},
                 "args": vars(args),
             }, save_path)
             print(f"  → 체크포인트 저장: {save_path}")

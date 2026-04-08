@@ -61,6 +61,8 @@ class BBPEJamoDataset(IterableDataset):
         self.min_length = min_length
         self.rank = rank
         self.world_size = world_size
+        self._line_counter = 0
+        self._resume_line = 0
 
     def _iter_texts(self):
         """파일에서 텍스트 스트리밍"""
@@ -150,20 +152,51 @@ class BBPEJamoDataset(IterableDataset):
             "jamo_mask": jamo_mask,       # [max_seq_len]
             "segment_ids": segment_ids,   # [max_seq_len]
             "n_segments": n_segments,
+            "_line_counter": self._line_counter,
         }
 
+    def state_dict(self) -> dict:
+        """데이터셋 진행 상태 반환 (체크포인트용)"""
+        return {
+            "line_counter": self._line_counter,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """데이터셋 진행 상태 복원 (resume용)"""
+        self._resume_line = state.get("line_counter", 0)
+        self._line_counter = self._resume_line
+
     def __iter__(self):
-        """스트리밍 + DDP 샤딩 + 무한 순환"""
+        """스트리밍 + DDP×Worker 샤딩 + 무한 순환 + resume fast-forward"""
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info else 0
+        num_workers = worker_info.num_workers if worker_info else 1
+
+        total_workers = self.world_size * num_workers
+        global_worker_id = (self.rank * num_workers) + worker_id
+
+        resume_line = self._resume_line
+        if resume_line > 0:
+            self._resume_line = 0  # 다음 순환에서는 정상 동작
+
         while True:
             for i, text in enumerate(self._iter_texts()):
-                if self.world_size > 1 and i % self.world_size != self.rank:
+                # DDP × Worker interleaving
+                if i % total_workers != global_worker_id:
                     continue
+                abs_line = i
+                self._line_counter = abs_line + 1
+
+                if abs_line < resume_line:
+                    continue  # fast-forward
+
                 jamo_seqs = self._tokenize_and_decompose(text)
                 if not jamo_seqs:
                     continue
                 sample = self._make_sample(jamo_seqs)
                 if sample is not None:
                     yield sample
+            resume_line = 0
 
 
 if __name__ == "__main__":
