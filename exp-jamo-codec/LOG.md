@@ -811,6 +811,97 @@ backbone에 가장 많은 파라미터를 쓸 수 있음.
 
 ---
 
+## 모델 구조: BBPE + Conv Composition
+
+### 동기
+
+- 엔트로피 스케일링(10M~50M)에서 패치 경계 품질이 모델 크기와 거의 무관
+- BBPE 토크나이저가 파라미터 0으로 의미 있는 경계를 제공
+- 임베딩 테이블을 제거하면 backbone에 파라미터를 최대한 투자 가능
+
+### 구조
+
+```
+텍스트
+  → K-EXAONE 153K BBPE (경계 결정, 파라미터 0)
+  → 각 토큰 → 자모/byte 분해 (JamoTokenizer, vocab=330)
+  → Conv Composition Encoder (자모 시퀀스 → 토큰 벡터, 3~5L)
+  → Projection (256 → backbone d_model)
+  → Backbone Transformer (RTD pretrain 등)
+  → Task Head (편집 태그 608 or 자모 330)
+  → Conv Composition Decoder (토큰 벡터 → 자모 복원)
+```
+
+### 파라미터 예산 (128M)
+
+| 구조 | 임베딩 | 코덱 | backbone |
+|------|--------|------|----------|
+| BPE 기존 (30K) | 23M | - | 105M |
+| BLT 엔트로피 | 0.25M | 15M | 113M |
+| **BBPE + Conv** | **0** | **~5M** | **123M** |
+
+### Conv Encoder 상세
+
+- 입력: 토큰별 자모 시퀀스 [B, n_tokens, max_jamo_len]
+- JamoEmbedding (330, d=256) → Conv1d layers → Global Avg Pool → 토큰 벡터
+- Receptive field: 3L=13, 4L=17, 5L=21 자모
+- "시작했습니다" = 15자모 → 4L+ 필요
+- **3L/4L/5L 비교 후 결정, 차이 미미하면 5L 채택**
+
+### Conv Decoder 상세
+
+- 토큰 벡터 → expand → Conv1d layers → Linear(d, jamo_vocab=330)
+- 자모 단위 복원 → NFC 조합 → 원문
+
+### 장점
+
+1. **임베딩 테이블 비용 0** — vocab 아무리 커도 Conv는 ~5M 고정
+2. **토크나이저는 주워오면 됨** — K-EXAONE 등 기성품 사용, 학습 비용 0
+3. **오타 강건** — "맞춤법"과 "맞춤뻡"의 자모가 유사 → Conv z도 유사
+4. **OOV 없음** — BBPE byte fallback + 자모 분해
+5. **출력 softmax 무부담** — 인코더-only 편집 태깅(608), 생성 LM도 자모(330)
+6. **엔트로피 모델 baseline** — 같은 Conv 인/디코더로 BBPE vs 엔트로피 직접 비교 가능
+
+### 실험 계획
+
+**Phase 1: Composition Conv Codec 구현 + 복원 실험**
+1. 데이터 파이프라인: K-EXAONE 토큰화 → 자모 분해 → 배치 구성
+2. CompositionCodec: Conv encoder + decoder
+3. 복원률 실험: 3L/4L/5L 비교, 토큰/문자/시퀀스 정확도
+4. 기존 고정 stride Conv 1L (s=16)과 비교
+
+**Phase 2: Baseline 확보**
+- Composition Conv (BBPE 경계) vs Conv 고정 stride vs EntropyPatchCodec
+- 동일 파라미터 예산에서 복원률, z 품질, 레이턴시
+
+**Phase 3: Backbone 통합**
+- Conv Composition + Transformer backbone RTD pretrain
+- KoELECTRA-base와 비교
+
+### 설계 결정 (열린 질문 해소)
+
+**1. max_jamo_len = 32 확정**
+
+K-EXAONE 153K vocab 전체를 자모 분해한 결과:
+- 평균 6.9자모, 중앙값 6, 95%ile=13, 99%ile=16
+- 30자모 이상: 대부분 구분선(`---`, `===`), 한국어는 웹 상용구 20~30개
+- 32자모면 의미 있는 토큰 99.9%+ 커버
+- 32 초과 한국어 토큰은 해시맵 직접 매핑으로 후처리 가능 (20~30개)
+
+**2. Global Average Pooling 채택**
+
+- bidirectional Conv라 마지막 hidden이 특별하지 않음
+- Avg Pool이 단순하고 안정적
+- Weighted Pool(entropy 가중치)은 나중에 실험 대상
+
+**3. 고정 길이 출력 Decoder**
+
+- 토큰 벡터 → [max_jamo_len=32, 330] 자모 logits
+- PAD 위치 loss 무시
+- 인코더-only 모델 방향이라 autoregressive 불필요 (그건 encoder-decoder)
+
+---
+
 ### 메모: KoELECTRA baseline이 필요한 이유
 
 - KoELECTRA-base = WordPiece + RTD pretrain 완료 모델 → GEC fine-tune만 하면 baseline 수치 확보
