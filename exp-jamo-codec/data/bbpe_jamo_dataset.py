@@ -25,6 +25,23 @@ def load_bbpe_tokenizer(model_id: str = "LGAI-EXAONE/K-EXAONE-236B-A23B"):
     return AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 
 
+def build_long_token_set(bbpe_tokenizer, jamo_tokenizer,
+                         max_jamo_len: int = MAX_JAMO_LEN) -> set:
+    """32자모 초과 토큰 ID 집합 생성 (초기화 시 1회)"""
+    long_ids = set()
+    for i in range(bbpe_tokenizer.vocab_size):
+        try:
+            tok_str = bbpe_tokenizer.decode([i])
+            if not tok_str:
+                continue
+            jamo_ids = jamo_tokenizer.encode(tok_str, add_special=False)
+            if len(jamo_ids) > max_jamo_len:
+                long_ids.add(i)
+        except Exception:
+            pass
+    return long_ids
+
+
 def decompose_token(tok_str: str, jamo_tokenizer) -> List[int]:
     """BBPE 토큰 문자열 → 자모/byte ID 리스트 (special 토큰 없이)"""
     return jamo_tokenizer.encode(tok_str, add_special=False)
@@ -60,6 +77,8 @@ class BBPEJamoDataset(IterableDataset):
         self.min_length = min_length
         self.rank = rank
         self.world_size = world_size
+        # 32자모 초과 토큰 집합 (이 토큰은 문자열로 풀어서 재분절)
+        self.long_token_ids = build_long_token_set(bbpe_tokenizer, jamo_tokenizer, max_jamo_len)
 
     def _iter_texts(self):
         """파일에서 텍스트 스트리밍"""
@@ -103,10 +122,11 @@ class BBPEJamoDataset(IterableDataset):
         bbpe_ids = self.bbpe.encode(text, add_special_tokens=False)
         jamo_seqs = []
         for tid in bbpe_ids:
+            if tid in self.long_token_ids:
+                continue  # 32자모 초과 토큰 스킵 (BBPE가 더 작은 단위로 분절했을 텍스트)
             tok_str = self.bbpe.decode([tid])
             jamo_ids = decompose_token(tok_str, self.jamo)
-            # max_jamo_len으로 truncate
-            jamo_seqs.append(jamo_ids[:self.max_jamo_len])
+            jamo_seqs.append(jamo_ids[:self.max_jamo_len])  # 안전하게 truncate
         return jamo_seqs
 
     def _make_sample(self, jamo_seqs: List[List[int]]):
@@ -114,7 +134,6 @@ class BBPEJamoDataset(IterableDataset):
         n_tokens = min(len(jamo_seqs), self.max_tokens)
         jamo_seqs = jamo_seqs[:n_tokens]
 
-        # [max_tokens, max_jamo_len] 텐서 구성
         jamo_ids = torch.full(
             (self.max_tokens, self.max_jamo_len), JAMO_PAD, dtype=torch.long,
         )

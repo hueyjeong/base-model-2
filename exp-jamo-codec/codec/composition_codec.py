@@ -172,7 +172,7 @@ class CompositionCodec(nn.Module):
         """학습용 forward: encode → decode → 복원 loss
 
         Args:
-            jamo_ids: [B, T, J] 자모 ID
+            jamo_ids: [B, T, J] 자모 ID (32자모 이하로 truncate 완료)
             jamo_mask: [B, T, J] 유효 자모 위치
             token_mask: [B, T] 유효 토큰 위치
 
@@ -187,13 +187,9 @@ class CompositionCodec(nn.Module):
 
         # Loss: 유효 토큰의 유효 자모 위치만
         B, T, J, V = logits.shape
-        targets = jamo_ids  # [B, T, J]
-
-        # [B*T*J, V] vs [B*T*J]
         flat_logits = logits.reshape(-1, V)
-        flat_targets = targets.reshape(-1)
+        flat_targets = jamo_ids.reshape(-1)
 
-        # 유효 위치 마스크: 유효 토큰의 유효 자모
         if token_mask is not None:
             valid = (jamo_mask & token_mask.unsqueeze(-1)).reshape(-1)
         else:
@@ -244,9 +240,9 @@ if __name__ == "__main__":
         B, T, J = 2, 16, 32
         jamo_ids = torch.randint(1, 330, (B, T, J))
         jamo_mask = torch.ones(B, T, J, dtype=torch.bool)
-        jamo_mask[:, :, 20:] = False  # 뒤쪽 패딩
+        jamo_mask[:, :, 20:] = False
         token_mask = torch.ones(B, T, dtype=torch.bool)
-        token_mask[:, 12:] = False  # 뒤쪽 패딩
+        token_mask[:, 12:] = False
 
         out = codec(jamo_ids, jamo_mask, token_mask)
         print(f"  z: {out['z'].shape}, logits: {out['logits'].shape}, loss: {out['loss'].item():.4f}")
