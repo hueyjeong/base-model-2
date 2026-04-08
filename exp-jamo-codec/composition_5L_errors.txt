@@ -1,0 +1,360 @@
+# CompositionCodec d=256 5L errors (50K samples)
+# unique: 357, total: 592
+# count	gt	pred
+50	 신종 코로나바이러스 감염증	 신종 코로나ㅂㅇ이러스 감염증
+41	�	���
+38	 흑인	
+22	 ○	����
+18	 신종 코로나바이러스 감염증	 신종 코로나바ㅏ리서ㅡ 감염증
+13	········	����������������
+12	﻿	���
+8	 ,	,,
+6	_NETWORK	_WETTORK
+4	 반드시 보장되지는 않습니다	 반드시 보장되ㅚ니ㅡ 않습니다
+4	eyer	yyer
+4	■■	■⠠
+4	■■	⠠���
+3	�	ｽ
+3	········	······����
+3	········	��·······
+3	localhost	localhosl
+3	■■	���⠠
+3	■■	������
+2	부스타빗	ㅂㅂㅂㅂㅂㅂㅂㅂㅂ
+2	BOO	OOO
+2	 misrepresentation	 misrepensentation
+2	    	   ��
+2	 chúng ta	 chúnn ta
+2	デザイン	デイイン
+2	너무너무	ㅁㅁㅁㅁㅁㅁㅁㅁ
+2	 ᆞ	    
+2	﻿	￿
+2	ey	yy
+2	 Libya	 Libba
+2	■■	⠠■
+1	 like it	 like te
+1	부스타빗	부ㅅㅅㅅㅂㅂㅂㅂ
+1	부스타빗	ㅂㅂ비시빗
+1	,''	'''
+1	 convenient	 convenienn
+1	 microenvironment	 microonvironment
+1	 propagates	 proparates
+1	 ○	 ���
+1	名字	名吗
+1	 Hotels	 Hotell
+1	와 함께	와 함까
+1	ors	orr
+1	 chez les	 ches les
+1	 carrière	 carrii�re
+1	若	苋
+1	 throughout the year	 throughout  he year
+1	 three different	 three iifferent
+1	 응용 프로그램	 응용 프로그랭
+1	Caesar	Ceasar
+1	 itself is	 itsilt is
+1	 effect on the	 effect of the
+1	 are typically	 ary typically
+1	 concentrations of	 concentrattons of
+1	 one of the following	 one of toe following
+1	바로	바바
+1	바로	보로
+1	普及	普揊
+1	 people who	 people hhe
+1	oe	ee
+1	 Architecture	 Architectuce
+1	 cigarettes	 cigareetes
+1	 referred to as	 refersed do as
+1	重新	閍新
+1	 scenario	 scenarro
+1	□	⡡
+1	 workplace	 workplack
+1	 unparalleled	 unparelllled
+1	 as soon as possible	 as soon  s possible
+1	 고양이	 ㅑ이ㅑㅣㅣㅣ
+1	 고양이	 ㄱㅇ양이
+1	 입력받습니다	 입력밨습니다
+1	 Netanyahu	 Netannahu
+1	Reference	Referenee
+1	trucción	crucción
+1	 Hương	 Hư��ng
+1	Flexible	FFexible
+1	 meteorological	 meteolological
+1	o para	oppara
+1	a y	ayy
+1	 seems to have	 seemss o have
+1	 that occur	 that ocuur
+1	 inspired by	 in pired by
+1	七	丸
+1	麻	麺
+1	 엉덩이	 어더엉ㅣ
+1	htein	ttein
+1	 Sie können	 Sinn �innen
+1	 verschiedene	 verschredene
+1	 at some point	 at soie point
+1	ลอง	งุง
+1	ล็อต	ลลอต
+1	นัน	นนน
+1	อนไลน์	อนนนา์
+1	special	ppecial
+1	 덤프공부자료	 덤프공부주료
+1	設定	設宮
+1	ガイド	イイド
+1	ではありません	で゛ああゾせん
+1	はありません	はおりません
+1	調査	說査
+1	sylvania	sylvavia
+1	ção de	ção�de
+1	 sécurité	 sécéité
+1	 LP	 PP
+1	½	��
+1	 흑인	 ㅎ익
+1	 흑인	ㅇ
+1	 흑인	ㅇㅇ
+1	 흑인	힉익
+1	 time series	 timeeseries
+1	 bioavailability	 bioabialability
+1	 believe that the	 believe tiat the
+1	學生	常生
+1	glm	gmm
+1	가 바로	바 바로
+1	 bidirectional	 bidiroctional
+1	 power supply	 poper supply
+1	·C	C�C
+1	 재난지원금	 재난지원근
+1	 is used for	 is fsed for
+1	 bao giờ	 baa  o�i
+1	 xã hội	 ��  h � h
+1	 những điều	 nhu�������iỻi
+1	 tốt đẹp	 tᑑttt�ẹp
+1	 tác phẩm	 tác�gphám
+1	 thuyết	 thuyy��t
+1	 của ông	 cc ��  �ng
+1	 cũng có	 c���c c��
+1	 cảm xúc	 cảc Ẻm
+1	 như	 �hư
+1	 Chúng ta	 Chöng ta
+1	 đều có	 F�ỻ��ó
+1	 cha mẹ	 ch� ic��
+1	 cũng sẽ	 c��sgg��n
+1	 thuyết	 thuypt�t
+1	 bệnh	 b��nh
+1	 amounts of	 amounos of
+1	 in the long run	 in the lo l run
+1	상품	상풍
+1	하기위한	하기아한
+1	 Christ	 ChritC
+1	 and output	 and outuut
+1	 and industrial	 and induutrial
+1	 intéress	 intr�ress
+1	————————	———└������������
+1	————————	���������������———
+1	 的	 焄
+1	机构	朜构
+1	包括	包拋
+1	 CONTENT	 CONTETT
+1	 psychiatrist	 psychiacrist
+1	 commentaires	 commenaaires
+1	 commentaires	 commeniaires
+1	너무너무	너무머머
+1	너무너무	머머머무
+1	 против	 прорив
+1	ключ	ккюч
+1	орми	орри
+1	рует	реет
+1	анный	ан��Ћй
+1	циаль	цлаль
+1	итель	ителт
+1	 whether it is	 whetheriet is
+1	 아내와	 아내ㅇㅇ
+1	 아내와	 아내애
+1	 which makes it	 which mamim it
+1	 and healthy	 and heapthy
+1	itoneal	atoneal
+1	 microenvironment	 microonnironment
+1	에 대한 이해	 에핸ㅇ 이해
+1	 common sense	 commonssense
+1	 the relationship between	 the relatiinphip between
+1	 the relationship between	 the relationphip between
+1	#For	-For
+1	라고	라로
+1	战争	昘争
+1	悪い	悪な
+1	播放	歭放
+1	atisf	atiff
+1	 idiomatic	 iddomatic
+1	 near future	 netu ftture
+1	 tell you	 yell you
+1	られている	られれいる
+1	かもしれない	かれがれない
+1	 vulnerable to	 bulnerable to
+1	filtered	fileered
+1	 may also be	 may olso be
+1	 ᆞ	 � �
+1	 ᆞ	 �  
+1	 arrogant	 arronant
+1	 시스템을 구축	 시스템을 구출
+1	 binary options	 bicaryoyptions
+1	e d	edd
+1	 you really	 yourreally
+1	 presidential	 presideetial
+1	 RMSE	 RRSE
+1	 have the same	 have ahe same
+1	 claims	 clamms
+1	 expenditures	 expentitures
+1	ità di	it�idii
+1	 without being	 withoutibeing
+1	 so that the	 to that the
+1	 length and	 len th and
+1	 and enjoy	 and enjyl
+1	 You must	 You mutt
+1	,Y	,,
+1	 everywhere	 everywwere
+1	 incorporating	 incorponating
+1	質問	說問
+1	」という	きという
+1	使い	使㿄
+1	 soprattutto	 soprtttttto
+1	 expérience	 expér�ence
+1	ست	��ت
+1	ید	ی��
+1	ログイン	キキイン
+1	タイム	タタム
+1	 Fourier transform	 Foursirr inirsorr
+1	⠀⠀⠀⠀	⠀���������
+1	⠀⠀⠀⠀	���⠀⠀⠀
+1	OP	PP
+1	 prosthesis	 prostresis
+1	Variables	Varrables
+1	 and video	 and viveo
+1	 instead	 insteas
+1	을 치료	을 치요
+1	wm	ww
+1	 맞춤형	 맞춤혖
+1	 pharmacological	 pharmolological
+1	u de	uude
+1	Interdisciplinary	Interdicciplinary
+1	骨	骪
+1	 almost all	 allost all
+1	求め	求も
+1	てください	てだださい
+1	 and without	 and wit out
+1	 meteorological	 metoorological
+1	 critical thinking	 crinical thinking
+1	ッション	ッェョン
+1	 antidepress	 antipeeress
+1	 좋아하	 좋아라
+1	 anything else	 anything eese
+1	 supervisory	 suversisory
+1	 physicists	 phisicists
+1	క	���
+1	్ట	్���
+1	్ట	������
+1	్ప	౱ઍ
+1	్ప	్్
+1	్స	్ఌ
+1	ి	࿿
+1	 Malaysia	 Malaysaa
+1	],[	]][
+1	调查	谰查
+1	教授	教掎
+1	 cyan	 ccan
+1	ikelihood	ikedihood
+1	哪个	霪个
+1	_DISPLAY	 DIPPLAY
+1	Servlet	Serllet
+1	 into three	 into toree
+1	 atherosclerosis	 atherostherosis
+1	 interruption	 interpuption
+1	 중 한	 중 항
+1	 end of the	 and of the
+1	 no doubt	 no doust
+1	 sovereignty	 sovereienty
+1	 asking for the	 asking fog the
+1	 변호사는	 변호시는
+1	 electrolyte	 electrolite
+1	 dissatisfaction	 dissacisfaation
+1	 intelligence	 intelligenle
+1	 remember that	 rememmer that
+1	 października	 patkd iernika
+1	 At this point	 it this point
+1	)=\	)=)
+1	 Highlighting	 Highligiting
+1	romagnetic	romagnttic
+1	 atau	 atuu
+1	 tahu	 thhu
+1	 kemungkinan	 kemunkkinen
+1	 memerlukan	 memerkukan
+1	 화물차	 화물촤
+1	 estará	 estar�s
+1	EY	YY
+1	EY	EE
+1	Ⅰ	ⅅ
+1	map	mam
+1	","	"""
+1	gd	dd
+1	 Angebote	 Aggebote
+1	 about how to	 about tot to
+1	 does it	 does io
+1	hz	zz
+1	 [√	 �√
+1	 Hall of Fame	 Hall af Fame
+1	制限	刈限
+1	 premières	 premii�res
+1	 ra mắt	 ra m�tt
+1	 sản phẩm	 s���n  sẩm
+1	 bình	 bìn�
+1	 thông minh	 thông mghh
+1	 lần đầu tiên	 nần   ���  ti��n
+1	 trên thị trường	 trð�c��hh�htt���ing
+1	 thừa	 th�at
+1	 tính năng	 t�nn   n�ng
+1	 ưu	 �ou
+1	 tích hợp	 t� �h�ợc
+1	 chế độ	 chố ��ộ
+1	 an toàn	 ao thàn
+1	 nhập khẩu	 hh�hnh�hẩu
+1	 từ	 �ừ
+1	 chính xác	 ch� � ��ác
+1	 bền	 bồn
+1	 lên đến	 lên ��ến
+1	 gia tăng	 gig gting
+1	 tối ưu	 t�uuu ��n
+1	 concentrations of	 concentratrast on
+1	ずっと	とっと
+1	んだけど	んけけど
+1	 to stay	 to sttt
+1	 Atlantic	 Allantic
+1	 one hundred	 ohe hundred
+1	 politicians	 polititians
+1	 for three	 for threr
+1	 noteworthy	 notytorthy
+1	을 높이고	을 높오고
+1	_CLIENT	_CLNENT
+1	남원	난안
+1	남원	ㅇㅇㅇㅇㅇㅇ
+1	남원	ㅇㅇ원
+1	 계기가 되	 계기가되ㅚ
+1	 to encourage	 to oncourage
+1	 attention to the	 attertion to the
+1	 encourage you to	 encour gacagu to
+1	바카라사이트	 카라사아티ㅡ
+1	■■	⠠⠠
+1	發展	癕展
+1	 Wilhelm	 Willelm
+1	 distance from	 distancs from
+1	保管	保䮡
+1	ário de	ár�o de
+1	ário de	�er�o de
+1	ário	ároo
+1	 autocomplete	 automomolete
+1	 Calendar	 Ctlendar
+1	unsafe	ansafe
+1	 hydrocarbon	 hydroccrbon
+1	 Indianapolis	 Indianapalis
+1	 drinking water	 wringingndater
+1	現場	珴場
+1	설명회	헐명회
+1	 애널리스트	 애널리르트
+1	≤n	 ��n
+1	 xv	 vv
+1	 semiconductor	 semicondctios

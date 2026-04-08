@@ -209,6 +209,17 @@ def train(args):
                 "args": vars(args),
             }, save_path)
             print(f"  → 체크포인트 저장: {save_path}")
+            # 구글 드라이브 복사 (GDRIVE 환경변수 설정 시)
+            gdrive = os.environ.get("GDRIVE")
+            if gdrive:
+                import shutil
+                os.makedirs(gdrive, exist_ok=True)
+                shutil.copy2(save_path, gdrive)
+                # 로그도 복사
+                log_path = os.path.join(os.path.dirname(args.out_dir), "composition_train_log.txt")
+                if os.path.exists(log_path):
+                    shutil.copy2(log_path, gdrive)
+                print(f"  → GDrive 업로드: {gdrive}")
 
     if rank == 0:
         print(f"\n학습 완료: {global_step} steps")
@@ -225,6 +236,15 @@ def train(args):
             "args": vars(args),
         }, save_path)
         print(f"최종 저장: {save_path}")
+        gdrive = os.environ.get("GDRIVE")
+        if gdrive:
+            import shutil
+            os.makedirs(gdrive, exist_ok=True)
+            shutil.copy2(save_path, gdrive)
+            log_path = os.path.join(os.path.dirname(args.out_dir), "composition_train_log.txt")
+            if os.path.exists(log_path):
+                shutil.copy2(log_path, gdrive)
+            print(f"  → GDrive 업로드: {gdrive}")
 
     if is_distributed:
         dist.destroy_process_group()
