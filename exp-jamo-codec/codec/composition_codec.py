@@ -115,12 +115,13 @@ class CompositionDecoder(nn.Module):
         D = token_vecs.size(-1)
 
         # within_pos 계산: 각 자모의 세그먼트 내 0-based index
-        # segment_ids가 단조 비감소이므로, within_pos = l - seg_start[segment_ids[l]]
+        # .item() 없이 torch.compile 호환: segment 경계 감지 → cummax로 시작 위치 전파
         arange_pos = torch.arange(L, device=segment_ids.device).unsqueeze(0).expand(B, -1)
-        max_seg = int(segment_ids.max().item()) + 1
-        seg_start = torch.full((B, max_seg), L, dtype=torch.long, device=segment_ids.device)
-        seg_start.scatter_reduce_(1, segment_ids, arange_pos, reduce='amin', include_self=True)
-        seg_start_per_pos = seg_start.gather(1, segment_ids)  # [B, L]
+        seg_change = torch.cat([
+            torch.ones(B, 1, dtype=torch.bool, device=segment_ids.device),
+            segment_ids[:, 1:] != segment_ids[:, :-1],
+        ], dim=1)  # [B, L]: 각 세그먼트 첫 위치에서 True
+        seg_start_per_pos = torch.cummax(seg_change * arange_pos, dim=1).values  # [B, L]
         within_pos = (arange_pos - seg_start_per_pos).clamp(0, self.max_jamo_per_token - 1)
 
         # Upsample: 각 자모 위치에 해당 토큰 벡터 배치
