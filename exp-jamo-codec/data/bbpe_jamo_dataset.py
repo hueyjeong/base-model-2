@@ -1,13 +1,13 @@
-"""BBPE + 자모 분해 데이터셋
+"""BBPE + 자모 분해 데이터셋 (concat 방식)
 
-K-EXAONE 153K BBPE로 토큰 경계 결정 → 각 토큰을 자모/byte 분해.
-CompositionCodec 학습용 데이터 파이프라인.
+K-EXAONE 153K BBPE로 토큰 경계 결정 → 각 토큰을 자모/byte 분해 → 1열 concat.
+segment_ids로 토큰 경계를 표시.
 """
 import json
 import os
 import re
 import sys
-from typing import List, Tuple
+from typing import List
 
 import torch
 from torch.utils.data import IterableDataset
@@ -16,8 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 
 # ── 상수 ──
-MAX_JAMO_LEN = 32  # 99.9%ile=26, 32면 충분
-JAMO_PAD = 0       # JamoTokenizer의 PAD ID
+JAMO_PAD = 0  # JamoTokenizer의 PAD ID
 
 
 def load_bbpe_tokenizer(model_id: str = "LGAI-EXAONE/K-EXAONE-236B-A23B"):
@@ -26,20 +25,19 @@ def load_bbpe_tokenizer(model_id: str = "LGAI-EXAONE/K-EXAONE-236B-A23B"):
     return AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 
 
-
-
 def decompose_token(tok_str: str, jamo_tokenizer) -> List[int]:
     """BBPE 토큰 문자열 → 자모/byte ID 리스트 (special 토큰 없이)"""
     return jamo_tokenizer.encode(tok_str, add_special=False)
 
 
 class BBPEJamoDataset(IterableDataset):
-    """BBPE 토큰화 → 자모 분해 스트리밍 데이터셋
+    """BBPE 토큰화 → 자모 분해 → concat 스트리밍 데이터셋
 
     각 샘플:
-        jamo_ids: [max_tokens, max_jamo_len] — 토큰별 자모 ID
-        jamo_mask: [max_tokens, max_jamo_len] — 유효 자모 위치
-        token_mask: [max_tokens] — 유효 토큰 위치
+        jamo_ids: [max_seq_len] — concat된 자모 ID
+        jamo_mask: [max_seq_len] — 유효 자모 위치
+        segment_ids: [max_seq_len] — 각 자모가 속한 토큰 ID
+        n_segments: int — 토큰 수
     """
 
     def __init__(
@@ -47,8 +45,8 @@ class BBPEJamoDataset(IterableDataset):
         file_paths,
         bbpe_tokenizer,
         jamo_tokenizer,
-        max_tokens: int = 128,
-        max_jamo_len: int = MAX_JAMO_LEN,
+        max_seq_len: int = 512,
+        max_jamo_per_token: int = 32,
         text_key: str = "text",
         min_length: int = 10,
         rank: int = 0,
@@ -57,8 +55,8 @@ class BBPEJamoDataset(IterableDataset):
         self.file_paths = [file_paths] if isinstance(file_paths, str) else list(file_paths)
         self.bbpe = bbpe_tokenizer
         self.jamo = jamo_tokenizer
-        self.max_tokens = max_tokens
-        self.max_jamo_len = max_jamo_len
+        self.max_seq_len = max_seq_len
+        self.max_jamo_per_token = max_jamo_per_token
         self.text_key = text_key
         self.min_length = min_length
         self.rank = rank
@@ -96,59 +94,62 @@ class BBPEJamoDataset(IterableDataset):
                     if len(text) >= self.min_length:
                         yield text
 
-    def _tokenize_and_decompose(self, text: str) -> Tuple[List[List[int]], List[str]]:
-        """텍스트 → BBPE 토큰화 → 각 토큰 자모 분해
-
-        Returns:
-            jamo_seqs: 토큰별 자모 ID 리스트
-            tok_strs: 토큰별 원문 문자열 (디버깅용)
-        """
+    def _tokenize_and_decompose(self, text: str) -> List[List[int]]:
+        """텍스트 → BBPE 토큰화 → 각 토큰 자모 분해"""
         bbpe_ids = self.bbpe.encode(text, add_special_tokens=False)
         jamo_seqs = []
         for tid in bbpe_ids:
             tok_str = self.bbpe.decode([tid])
             jamo_ids = decompose_token(tok_str, self.jamo)
-            if len(jamo_ids) <= self.max_jamo_len:
+            if len(jamo_ids) <= self.max_jamo_per_token:
                 jamo_seqs.append(jamo_ids)
             else:
-                # 32자모 초과 → 공백 기준 어절 분절 (공백도 유지)
+                # 32자모 초과 → 공백 기준 어절 분절
                 parts = re.split(r'( )', tok_str)
                 for part in parts:
                     if not part:
                         continue
                     pj = decompose_token(part, self.jamo)
-                    if len(pj) <= self.max_jamo_len:
+                    if len(pj) <= self.max_jamo_per_token:
                         jamo_seqs.append(pj)
                     else:
-                        # 어절이 그래도 길면 글자 단위 fallback
                         for ch in part:
                             cj = decompose_token(ch, self.jamo)
                             if cj:
-                                jamo_seqs.append(cj[:self.max_jamo_len])
+                                jamo_seqs.append(cj[:self.max_jamo_per_token])
         return jamo_seqs
 
     def _make_sample(self, jamo_seqs: List[List[int]]):
-        """자모 시퀀스 리스트 → 패딩된 텐서"""
-        n_tokens = min(len(jamo_seqs), self.max_tokens)
-        jamo_seqs = jamo_seqs[:n_tokens]
+        """자모 시퀀스 리스트 → concat 텐서 + segment_ids"""
+        # concat
+        all_jamo = []
+        seg_ids = []
+        seg_idx = 0
+        for seq in jamo_seqs:
+            if len(all_jamo) + len(seq) > self.max_seq_len:
+                break
+            all_jamo.extend(seq)
+            seg_ids.extend([seg_idx] * len(seq))
+            seg_idx += 1
 
-        jamo_ids = torch.full(
-            (self.max_tokens, self.max_jamo_len), JAMO_PAD, dtype=torch.long,
-        )
-        jamo_mask = torch.zeros(self.max_tokens, self.max_jamo_len, dtype=torch.bool)
-        token_mask = torch.zeros(self.max_tokens, dtype=torch.bool)
+        L = len(all_jamo)
+        n_segments = seg_idx
 
-        for i, seq in enumerate(jamo_seqs):
-            L = len(seq)
-            jamo_ids[i, :L] = torch.tensor(seq, dtype=torch.long)
-            jamo_mask[i, :L] = True
-            token_mask[i] = True
+        if L == 0:
+            return None
+
+        # 패딩
+        pad_len = self.max_seq_len - L
+        jamo_ids = torch.tensor(all_jamo + [JAMO_PAD] * pad_len, dtype=torch.long)
+        jamo_mask = torch.tensor([True] * L + [False] * pad_len, dtype=torch.bool)
+        # 패딩 영역의 segment_ids는 마지막 segment로 (scatter_add에서 무시됨 — mask로 처리)
+        segment_ids = torch.tensor(seg_ids + [0] * pad_len, dtype=torch.long)
 
         return {
-            "jamo_ids": jamo_ids,       # [max_tokens, max_jamo_len]
-            "jamo_mask": jamo_mask,      # [max_tokens, max_jamo_len]
-            "token_mask": token_mask,    # [max_tokens]
-            "n_tokens": n_tokens,
+            "jamo_ids": jamo_ids,         # [max_seq_len]
+            "jamo_mask": jamo_mask,       # [max_seq_len]
+            "segment_ids": segment_ids,   # [max_seq_len]
+            "n_segments": n_segments,
         }
 
     def __iter__(self):
@@ -160,56 +161,55 @@ class BBPEJamoDataset(IterableDataset):
                 jamo_seqs = self._tokenize_and_decompose(text)
                 if not jamo_seqs:
                     continue
-                yield self._make_sample(jamo_seqs)
+                sample = self._make_sample(jamo_seqs)
+                if sample is not None:
+                    yield sample
 
 
 if __name__ == "__main__":
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
     from tok.jamo_tokenizer import JamoTokenizer
 
-    print("=== BBPEJamoDataset Smoke Test ===\n")
+    print("=== BBPEJamoDataset (concat) Smoke Test ===\n")
 
     bbpe = load_bbpe_tokenizer()
     jamo = JamoTokenizer()
 
     print(f"BBPE vocab: {bbpe.vocab_size:,}")
     print(f"Jamo vocab: {jamo.vocab_size}")
-    print(f"Max jamo len: {MAX_JAMO_LEN}")
     print()
 
-    # 단일 텍스트 분해 예시
-    tests = [
+    # 단일 텍스트 예시
+    texts = [
         "맞춤법을 확인해 주세요.",
         "김철수 씨가 프로그래밍을 배우기 시작했습니다.",
-        "맞춤뻡을 확인해 주세요.",
     ]
 
-    for text in tests:
-        bbpe_ids = bbpe.encode(text, add_special_tokens=False)
-        print(f"원문: {text}")
-        print(f"BBPE ({len(bbpe_ids)}tok): ", end="")
-        for tid in bbpe_ids:
-            tok_str = bbpe.decode([tid])
-            jamo_ids = decompose_token(tok_str, jamo)
-            decoded = jamo.decode(jamo_ids, skip_special=False)
-            print(f"[{tok_str.strip()}→{len(jamo_ids)}자모]", end=" ")
-        print("\n")
-
-    # 데이터셋 테스트
-    print("--- 데이터셋 테스트 (val.parquet) ---")
     ds = BBPEJamoDataset(
         file_paths=["corpus/val.parquet"],
-        bbpe_tokenizer=bbpe,
-        jamo_tokenizer=jamo,
-        max_tokens=64,
-        text_key="text",
+        bbpe_tokenizer=bbpe, jamo_tokenizer=jamo,
+        max_seq_len=512, text_key="text",
     )
 
+    for text in texts:
+        jamo_seqs = ds._tokenize_and_decompose(text)
+        total_jamo = sum(len(s) for s in jamo_seqs)
+        print(f"원문: {text}")
+        print(f"  {len(jamo_seqs)}토큰, {total_jamo}자모 (concat)")
+        for j, seq in enumerate(jamo_seqs):
+            decoded = jamo.decode(seq, skip_special=False)
+            print(f"    seg{j}: [{decoded}] ({len(seq)}자모)")
+        print()
+
+    # 데이터셋 테스트
+    print("--- 데이터셋 테스트 ---")
     for i, sample in enumerate(ds):
         if i >= 3:
             break
+        L = sample["jamo_mask"].sum().item()
+        n_seg = sample["n_segments"]
         print(f"Sample {i}: jamo_ids={sample['jamo_ids'].shape}, "
-              f"n_tokens={sample['n_tokens']}, "
-              f"유효 자모 비율={sample['jamo_mask'].float().mean():.2f}")
+              f"유효={L}/{sample['jamo_ids'].size(0)} ({L/sample['jamo_ids'].size(0)*100:.0f}%), "
+              f"segments={n_seg}")
 
     print("\n전체 테스트 통과!")

@@ -1,6 +1,6 @@
-"""CompositionCodec 학습 — BBPE + Conv 자모 composition
+"""CompositionCodec 학습 — BBPE + Conv 자모 composition (concat 방식)
 
-K-EXAONE 153K BBPE로 경계 결정 → 자모 분해 → Conv 인코더/디코더 학습.
+K-EXAONE 153K BBPE로 경계 결정 → 자모 분해 → concat → Conv 인코더/디코더 학습.
 DDP 지원 (torchrun --nproc_per_node=N).
 """
 import argparse
@@ -59,7 +59,6 @@ def train(args):
     codec = CompositionCodec(
         jamo_vocab=jamo.vocab_size,
         d_model=args.d_model,
-        max_jamo_len=args.max_jamo_len,
         n_layers=args.n_layers,
         kernel_size=args.kernel_size,
         dropout=args.dropout,
@@ -67,8 +66,8 @@ def train(args):
 
     n_params = sum(p.numel() for p in codec.parameters())
     if rank == 0:
-        print(f"CompositionCodec: d={args.d_model}, L={args.n_layers}, "
-              f"k={args.kernel_size}, max_jamo={args.max_jamo_len}, params={n_params/1e6:.2f}M")
+        print(f"CompositionCodec (concat): d={args.d_model}, L={args.n_layers}, "
+              f"k={args.kernel_size}, params={n_params/1e6:.2f}M")
 
     # torch.compile
     if args.compile:
@@ -86,8 +85,7 @@ def train(args):
         file_paths=args.corpus,
         bbpe_tokenizer=bbpe,
         jamo_tokenizer=jamo,
-        max_tokens=args.max_tokens,
-        max_jamo_len=args.max_jamo_len,
+        max_seq_len=args.max_seq_len,
         text_key=args.text_key,
         rank=rank,
         world_size=world_size,
@@ -138,7 +136,7 @@ def train(args):
                 parts.append(f"{world_size}gpu")
             batch_desc = f"batch={'×'.join(parts)}={eff_batch}"
         print(f"\n학습 시작: max_steps={args.max_steps}, {batch_desc}"
-              + f", max_tokens={args.max_tokens}, max_jamo={args.max_jamo_len}")
+              + f", seq_len={args.max_seq_len}")
         print(f"{'step':>8} {'loss':>8} {'acc':>8} {'lr':>10} {'tok/s':>8}")
         print("-" * 50)
 
@@ -149,18 +147,19 @@ def train(args):
 
         jamo_ids = batch["jamo_ids"].to(device)
         jamo_mask = batch["jamo_mask"].to(device)
-        token_mask = batch["token_mask"].to(device)
+        segment_ids = batch["segment_ids"].to(device)
+        n_segments = batch["n_segments"].to(device)
 
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
-            out = codec(jamo_ids, jamo_mask, token_mask)
+            out = codec(jamo_ids, jamo_mask, segment_ids, n_segments)
             loss = out["loss"] / grad_accum
 
         loss.backward()
 
         # 통계
         with torch.no_grad():
-            pred = out["logits"].argmax(dim=-1)  # [B, T, J]
-            valid = jamo_mask & token_mask.unsqueeze(-1)
+            pred = out["logits"].argmax(dim=-1)  # [B, L]
+            valid = jamo_mask
             correct = ((pred == jamo_ids) & valid).sum().item()
             total = valid.sum().item()
 
@@ -232,13 +231,12 @@ def train(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="CompositionCodec 학습")
+    parser = argparse.ArgumentParser(description="CompositionCodec 학습 (concat)")
 
     # 데이터
     parser.add_argument("--corpus", nargs="+", required=True)
     parser.add_argument("--text_key", default="text")
-    parser.add_argument("--max_tokens", type=int, default=128)
-    parser.add_argument("--max_jamo_len", type=int, default=32)
+    parser.add_argument("--max_seq_len", type=int, default=512)
 
     # 모델
     parser.add_argument("--d_model", type=int, default=256)
