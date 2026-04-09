@@ -5,7 +5,7 @@ export PYTHONUNBUFFERED=1
 
 CORPUS="${CORPUS:-corpus/train.parquet}"
 TEXT_KEY="text"
-MAX_STEPS=250000
+MAX_STEPS=500000
 # 재개/초기화 옵션 (환경변수로 전달)
 # RESUME: 전체 상태 복원 (모델+옵티마이저+스케줄러+데이터)
 #   예) RESUME=exp-jamo-codec/checkpoints/composition_6L_step110000.pt bash run_composition_train.sh
