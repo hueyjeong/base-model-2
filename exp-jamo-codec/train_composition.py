@@ -160,8 +160,29 @@ def train(args):
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    # Resume from checkpoint
+    # Init from checkpoint (가중치만 로드, 옵티마이저/스케줄러/데이터 상태 초기화)
     global_step = 0
+    if args.init_from:
+        if rank == 0:
+            print(f"가중치 초기화: {args.init_from}")
+        ckpt = torch.load(args.init_from, map_location=device, weights_only=False)
+        sd = ckpt["model"]
+        prefix = "_orig_mod."
+        if any(k.startswith(prefix) for k in sd):
+            sd = {k[len(prefix):] if k.startswith(prefix) else k: v for k, v in sd.items()}
+        raw = codec.module if hasattr(codec, "module") else codec
+        if hasattr(raw, "_orig_mod"):
+            missing, unexpected = raw._orig_mod.load_state_dict(sd, strict=False)
+        else:
+            missing, unexpected = raw.load_state_dict(sd, strict=False)
+        if rank == 0 and missing:
+            print(f"  [init_from] 새로 초기화된 파라미터: {missing}")
+        if rank == 0 and unexpected:
+            print(f"  [init_from] 무시된 파라미터: {unexpected}")
+        if rank == 0:
+            print(f"  가중치 로드 완료 (step 0부터 재학습)")
+
+    # Resume from checkpoint (전체 상태 복원)
     if args.resume:
         if rank == 0:
             print(f"체크포인트 복원: {args.resume}")
@@ -390,7 +411,8 @@ def main():
     parser.add_argument("--val_every", type=int, default=5000, help="검증 주기 (steps)")
     parser.add_argument("--val_samples", type=int, default=1000, help="검증 샘플 수")
     parser.add_argument("--out_dir", default="exp-jamo-codec/checkpoints")
-    parser.add_argument("--resume", default=None, help="체크포인트에서 재개")
+    parser.add_argument("--resume", default=None, help="체크포인트에서 재개 (모델+옵티마이저+스케줄러+데이터 상태 복원)")
+    parser.add_argument("--init_from", default=None, help="체크포인트 가중치로 초기화만 (옵티마이저/스케줄러/데이터 상태는 초기화)")
 
     args = parser.parse_args()
     train(args)

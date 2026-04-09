@@ -6,6 +6,13 @@ export PYTHONUNBUFFERED=1
 CORPUS="${CORPUS:-corpus/train.parquet}"
 TEXT_KEY="text"
 MAX_STEPS=250000
+# 재개/초기화 옵션 (환경변수로 전달)
+# RESUME: 전체 상태 복원 (모델+옵티마이저+스케줄러+데이터)
+#   예) RESUME=exp-jamo-codec/checkpoints/composition_6L_step110000.pt bash run_composition_train.sh
+# INIT_FROM: 가중치만 로드, step 0부터 재학습
+#   예) INIT_FROM=exp-jamo-codec/checkpoints/composition_6L_step110000.pt bash run_composition_train.sh
+RESUME="${RESUME:-}"
+INIT_FROM="${INIT_FROM:-}"
 BATCH_SIZE=512
 SEQ_LEN=512
 D_MODEL=256
@@ -23,6 +30,8 @@ echo "d=${D_MODEL}, L=${N_LAYERS}, k=${KERNEL}"
 echo "Corpus: ${CORPUS}"
 echo "Steps: ${MAX_STEPS}, Batch: ${BATCH_SIZE}×${NGPU:-4}gpu=$((BATCH_SIZE * ${NGPU:-4}))"
 echo "Save every: ${SAVE_EVERY}, GDrive: ${GDRIVE:-none}"
+[ -n "${RESUME}" ] && echo "Resume: ${RESUME}"
+[ -n "${INIT_FROM}" ] && echo "Init from: ${INIT_FROM}"
 echo ""
 
 VAL_CORPUS="${VAL_CORPUS:-corpus/val.parquet}"
@@ -39,6 +48,8 @@ torchrun --nproc_per_node=${NGPU:-4} exp-jamo-codec/train_composition.py \
   --log_every ${LOG_EVERY} --save_every ${SAVE_EVERY} \
   --val_corpus ${VAL_CORPUS} --val_every ${VAL_EVERY} --val_samples ${VAL_SAMPLES} \
   --out_dir ${OUT} \
+  ${RESUME:+--resume ${RESUME}} \
+  ${INIT_FROM:+--init_from ${INIT_FROM}} \
   2>&1 | tee exp-jamo-codec/composition_train_log.txt
 
 # rclone 업로드는 train_composition.py에서 GDRIVE 환경변수로 자동 처리
