@@ -21,14 +21,22 @@ class CompositionEncoder(nn.Module):
 
     전체 자모 시퀀스를 한번에 Conv 처리 후,
     토큰 경계(segment_ids)에 맞춰 평균 풀링.
+
+    개선:
+    - intra_pos_emb: 임베딩 직후 세그먼트 내 위치 정보 주입 → pool 전에 각 자모가
+      "나는 이 토큰의 N번째" 임을 인코딩, token_vecs가 위치 정보를 포함
     """
 
     def __init__(self, jamo_vocab: int = 330, d_model: int = 256,
-                 n_layers: int = 5, kernel_size: int = 7, dropout: float = 0.1):
+                 n_layers: int = 5, kernel_size: int = 7, dropout: float = 0.1,
+                 max_jamo_per_token: int = 32):
         super().__init__()
         self.d_model = d_model
+        self.max_jamo_per_token = max_jamo_per_token
         self.embedding = nn.Embedding(jamo_vocab, d_model, padding_idx=0)
         self.embed_scale = math.sqrt(d_model)
+        # 세그먼트 내 위치 임베딩 (intra-segment position)
+        self.intra_pos_emb = nn.Embedding(max_jamo_per_token, d_model)
         self.layers = nn.ModuleList([
             ConvBlock(d_model, kernel_size, dropout) for _ in range(n_layers)
         ])
@@ -51,6 +59,18 @@ class CompositionEncoder(nn.Module):
 
         # 임베딩
         x = self.embedding(jamo_ids) * self.embed_scale  # [B, L, D]
+
+        # within_pos 계산: 세그먼트 내 0-based index (compile 호환)
+        arange_pos = torch.arange(L, device=segment_ids.device).unsqueeze(0).expand(B, -1)
+        seg_change = torch.cat([
+            torch.ones(B, 1, dtype=torch.bool, device=segment_ids.device),
+            segment_ids[:, 1:] != segment_ids[:, :-1],
+        ], dim=1)
+        seg_start_per_pos = torch.cummax(seg_change * arange_pos, dim=1).values
+        within_pos = (arange_pos - seg_start_per_pos).clamp(0, self.max_jamo_per_token - 1)
+
+        # 세그먼트 내 위치 정보 주입 (임베딩 직후, Conv 전)
+        x = x + self.intra_pos_emb(within_pos)
 
         # Conv 레이어
         for layer in self.layers:
@@ -164,6 +184,7 @@ class CompositionCodec(nn.Module):
 
         self.encoder = CompositionEncoder(
             jamo_vocab, d_model, n_layers, kernel_size, dropout,
+            max_jamo_per_token=max_jamo_per_token,
         )
         self.decoder = CompositionDecoder(
             jamo_vocab, d_model, n_layers, kernel_size, dropout,
