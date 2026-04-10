@@ -64,8 +64,16 @@ class BBPEJamoDataset(IterableDataset):
         self._line_counter = 0
         self._resume_line = 0
 
-    def _iter_texts(self):
-        """파일에서 텍스트 스트리밍"""
+    def _iter_texts(self, resume_row: int = 0):
+        """파일에서 텍스트 스트리밍
+
+        Args:
+            resume_row: 이 줄 번호부터 시작 (0이면 처음부터).
+                       Parquet: row group 단위 skip으로 빠른 이동.
+
+        Yields:
+            (abs_line, text) — 절대 줄 번호와 텍스트
+        """
         for fpath in self.file_paths:
             is_jsonl = fpath.endswith(".jsonl") or fpath.endswith(".json")
             is_parquet = fpath.endswith(".parquet")
@@ -74,27 +82,59 @@ class BBPEJamoDataset(IterableDataset):
                 import pyarrow.parquet as pq
                 pf = pq.ParquetFile(fpath)
                 text_col = self.text_key or "text"
-                for batch in pf.iter_batches(batch_size=65536, columns=[text_col]):
-                    for text in batch[text_col].to_pylist():
+
+                # row group 단위 skip: resume_row 이전 row group 전부 건너뜀
+                rows_skipped = 0
+                rg_start = 0
+                target_offset = 0
+
+                for rg_idx in range(pf.num_row_groups):
+                    rg_rows = pf.metadata.row_group(rg_idx).num_rows
+                    if rows_skipped + rg_rows <= resume_row:
+                        rows_skipped += rg_rows
+                        continue
+                    # 이 row group부터 읽기 시작
+                    rg_start = rg_idx
+                    target_offset = resume_row - rows_skipped
+                    break
+
+                # 지정된 row group부터 읽기
+                abs_line = rows_skipped
+                for batch in pf.iter_batches(
+                    batch_size=65536, columns=[text_col],
+                    row_groups=list(range(rg_start, pf.num_row_groups)),
+                ):
+                    texts = batch[text_col].to_pylist()
+                    start = target_offset if target_offset > 0 else 0
+                    for i, text in enumerate(texts):
+                        if i < start:
+                            continue
                         if text and len(text) >= self.min_length:
-                            yield text
+                            yield abs_line + i, text
+                    abs_line += len(texts)
+                    target_offset = 0  # 첫 배치만 offset 적용
                 continue
 
+            # JSONL/텍스트: 순차 읽기
+            abs_line = 0
             with open(fpath, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if len(line) < self.min_length:
+                        abs_line += 1
                         continue
                     if is_jsonl:
                         try:
                             obj = json.loads(line)
                         except json.JSONDecodeError:
+                            abs_line += 1
                             continue
                         text = obj.get(self.text_key, line) if self.text_key else line
                     else:
                         text = line
                     if len(text) >= self.min_length:
-                        yield text
+                        yield abs_line, text
+                    abs_line += 1
 
     def _tokenize_and_decompose(self, text: str) -> List[List[int]]:
         """텍스트 → BBPE 토큰화 → 각 토큰 자모 분해"""
@@ -179,16 +219,19 @@ class BBPEJamoDataset(IterableDataset):
         if resume_line > 0:
             self._resume_line = 0  # 다음 순환에서는 정상 동작
 
-        while True:
-            for i, text in enumerate(self._iter_texts()):
-                # DDP × Worker interleaving
-                if i % total_workers != global_worker_id:
-                    continue
-                abs_line = i
-                self._line_counter = abs_line + 1
+        first_epoch = True
 
+        while True:
+            resume_row = resume_line if first_epoch and resume_line > 0 else 0
+
+            for abs_line, text in self._iter_texts(resume_row=resume_row):
+                # DDP × Worker interleaving
+                if abs_line % total_workers != global_worker_id:
+                    continue
                 if abs_line < resume_line:
-                    continue  # fast-forward
+                    continue
+
+                self._line_counter = abs_line + 1
 
                 jamo_seqs = self._tokenize_and_decompose(text)
                 if not jamo_seqs:
@@ -196,7 +239,9 @@ class BBPEJamoDataset(IterableDataset):
                 sample = self._make_sample(jamo_seqs)
                 if sample is not None:
                     yield sample
+
             resume_line = 0
+            first_epoch = False
 
 
 if __name__ == "__main__":

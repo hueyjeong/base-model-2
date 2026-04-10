@@ -233,7 +233,8 @@ def main():
     parser.add_argument("--max_samples", type=int, default=100000)
     parser.add_argument("--show_errors", type=int, default=30)
     parser.add_argument("--n_workers", type=int, default=4, help="토큰화 워커 수")
-    parser.add_argument("--chunk_size", type=int, default=256, help="워커당 청크 크기")
+    parser.add_argument("--chunk_size", type=int, default=100000,
+                        help="청크 크기 (한 번에 토큰화+추론할 샘플 수, 메모리 절약용)")
     parser.add_argument("--compile", action="store_true", help="torch.compile 적용")
     args = parser.parse_args()
 
@@ -272,18 +273,10 @@ def main():
     texts = texts[:args.max_samples]
     print(f"텍스트 로드: {len(texts):,}행 ({time.time()-t_read:.1f}s)")
 
-    # 멀티프로세스 토큰화
-    t_tok = time.time()
-    tensor_ds = _pre_tokenize_mp(
-        texts, args.max_seq_len, max_jamo_per_token=32,
-        n_workers=args.n_workers, chunk_size=args.chunk_size,
-        model_id=model_id, base_path=base_path
-    )
-
     # torch.compile
     if args.compile:
         print("torch.compile 적용 중...", flush=True)
-        codec = torch.compile(codec, mode="reduce-overhead")
+        codec = torch.compile(codec)
         with torch.no_grad():
             dummy_ids = torch.zeros(2, 512, dtype=torch.long, device=device)
             dummy_msk = torch.zeros(2, 512, dtype=torch.bool, device=device)
@@ -293,30 +286,107 @@ def main():
         torch.cuda.synchronize()
         print("컴파일 완료")
 
-    # DataLoader
-    loader = DataLoader(
-        tensor_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=0,  # 이미 메모리에 있음
-        pin_memory=True,
-    )
-
     # GPU 워밍업
     print("GPU 워밍업...", flush=True)
     with torch.no_grad():
-        for i, batch in enumerate(loader):
-            if i >= 2:
-                break
-            codec(batch[0].to(device), batch[1].to(device), batch[2].to(device), batch[3].to(device))
+        dummy = torch.zeros(2, args.max_seq_len, dtype=torch.long, device=device)
+        dummy_m = torch.zeros(2, args.max_seq_len, dtype=torch.bool, device=device)
+        dummy_s = torch.zeros(2, args.max_seq_len, dtype=torch.long, device=device)
+        dummy_n = torch.tensor([10, 10], device=device)
+        codec(dummy, dummy_m, dummy_s, dummy_n)
     torch.cuda.synchronize()
 
-    # 추론
-    t_inf = time.time()
-    result = evaluate(codec, loader, device, jamo, args.show_errors)
-    elapsed = time.time() - t_inf
-    n_samples = len(tensor_ds)
-    print(f"\n토큰화: {time.time()-t_tok:.1f}s, 추론: {elapsed:.1f}s ({n_samples/elapsed:.0f} 샘플/s)")
+    # ── 청크 단위 평가 (메모리 절약, 토큰화/추론 파이프라인) ──
+    import queue as _queue
+    import threading
+
+    def _tok_worker(texts, chunk_size, tokenized_q):
+        """백그라운드 토큰화 스레드 (청크 분할도 여기서)"""
+        for i in range(0, len(texts), chunk_size):
+            chunk = texts[i:i + chunk_size]
+            t1 = time.time()
+            ds = _pre_tokenize_mp(
+                chunk, args.max_seq_len, max_jamo_per_token=32,
+                n_workers=args.n_workers, chunk_size=256,
+                model_id=model_id, base_path=base_path)
+            tokenized_q.put((ds, len(chunk), time.time() - t1))
+
+    tokenized_q = _queue.Queue(maxsize=1)
+
+    tok_thread = threading.Thread(
+        target=_tok_worker, args=(texts, args.chunk_size, tokenized_q), daemon=True)
+    tok_thread.start()
+    del texts  # 메인에서 해제 (스레드가 참조 중)
+
+    # GPU 추론 (토큰화와 파이프라인)
+    total_jamo = 0
+    total_correct = 0
+    total_errors = 0      # 전체 오류 샘플 수
+    error_examples = []   # 오류 예시 (show_errors 개까지)
+    t0 = time.time()
+    chunk_idx = 0
+
+    while tok_thread.is_alive() or not tokenized_q.empty():
+        try:
+            tensor_ds, n_chunk, tok_time = tokenized_q.get(timeout=1.0)
+        except _queue.Empty:
+            continue
+
+        chunk_idx += 1
+        chunk_errs = 0
+        chunk_examples = []
+        loader = DataLoader(tensor_ds, batch_size=args.batch_size,
+                            shuffle=False, num_workers=0, pin_memory=True)
+
+        with torch.no_grad():
+            for batch in loader:
+                jamo_ids = batch[0].to(device, non_blocking=True)
+                jamo_mask = batch[1].to(device, non_blocking=True)
+                segment_ids = batch[2].to(device, non_blocking=True)
+                n_segments = batch[3].to(device, non_blocking=True)
+
+                out = codec(jamo_ids, jamo_mask, segment_ids, n_segments)
+                pred = out["logits"].argmax(dim=-1)
+
+                correct_mask = (pred == jamo_ids) & jamo_mask
+                total_correct += correct_mask.sum().item()
+                total_jamo += jamo_mask.sum().item()
+
+                wrong = (~correct_mask) & jamo_mask
+                for b in range(jamo_ids.shape[0]):
+                    if wrong[b].any():
+                        chunk_errs += 1
+                        if len(error_examples) + len(chunk_examples) < args.show_errors:
+                            g = jamo_ids[b][wrong[b]].cpu().tolist()
+                            p = pred[b][wrong[b]].cpu().tolist()
+                            gt_str = jamo.decode(g, skip_special=False)
+                            pr_str = jamo.decode(p, skip_special=False)
+                            if gt_str != pr_str:
+                                chunk_examples.append((gt_str, pr_str))
+
+        total_errors += chunk_errs
+        error_examples.extend(chunk_examples)
+
+        acc = total_correct / max(total_jamo, 1) * 100
+        preview = ""
+        if chunk_examples:
+            preview = " | " + "; ".join(f"'{g}'→'{p}'" for g, p in chunk_examples[:3])
+        print(f"  청크 {chunk_idx}: {n_chunk}샘플, "
+              f"토큰화 {tok_time:.1f}s ({n_chunk/max(tok_time,0.01):.0f}/s), "
+              f"정확도 {acc:.2f}%, 오류 {chunk_errs}/{n_chunk}{preview}", flush=True)
+
+        del tensor_ds, loader
+
+    jamo_acc = total_correct / max(total_jamo, 1) * 100
+    print(f"\n=== 복원 정확도 ===")
+    print(f"  자모 정확도:    {jamo_acc:.4f}%")
+    print(f"  총 자모:        {total_jamo:,}")
+    print(f"  오류 샘플:      {total_errors:,}")
+    if error_examples:
+        print(f"\n=== 오류 샘플 (최대 {args.show_errors}개) ===")
+        for i, (gt, pr) in enumerate(error_examples):
+            print(f"  [{i+1}] 정답: '{gt}' → 예측: '{pr}'")
+    print(f"\n총 소요: {time.time()-t0:.1f}s")
 
 
 if __name__ == "__main__":
