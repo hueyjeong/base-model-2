@@ -12,6 +12,7 @@ import time
 from concurrent.futures import ProcessPoolExecutor
 from typing import List
 
+import numpy as np
 import torch
 from torch.utils.data import TensorDataset, DataLoader
 
@@ -19,6 +20,109 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 
 from codec.composition_codec import CompositionCodec
+
+# ── BBPE 토큰별 통계 유틸 ──
+
+def _build_bbpe_token_names(bbpe_tok):
+    """BBPE 토큰 ID → 표시 이름 + 카테고리 매핑
+
+    K-EXAONE 등 GPT-2 스타일 BPE는 UTF-8 바이트를 자체 문자로 매핑하므로,
+    실제 디코딩 결과로 카테고리를 판정한다.
+    """
+    vocab_size = len(bbpe_tok)
+    names = {}
+    cats = {}
+    special_ids = set(bbpe_tok.all_special_ids)
+
+    # 배치로 디코딩 (개별 decode보다 빠름)
+    decoded = {}
+    for tid in range(vocab_size):
+        try:
+            decoded[tid] = bbpe_tok.decode([tid])
+        except Exception:
+            decoded[tid] = ""
+
+    for tid in range(vocab_size):
+        tok_str = bbpe_tok.convert_ids_to_tokens(tid)
+        if tok_str is None:
+            tok_str = f"<id:{tid}>"
+        names[tid] = tok_str
+        dec = decoded[tid]
+
+        if tid in special_ids:
+            cats[tid] = "special"
+            # 특수 토큰은 내부 표현 그대로 표시
+        elif tok_str.startswith("<0x") and tok_str.endswith(">"):
+            cats[tid] = "byte"
+            # 바이트 토큰은 내부 표현 그대로 표시
+        elif any('\uAC00' <= c <= '\uD7A3' or
+                 '\u1100' <= c <= '\u11FF' or
+                 '\u3130' <= c <= '\u318F' for c in dec):
+            cats[tid] = "hangul"
+            names[tid] = dec  # 한글 등 non-ASCII는 디코딩 결과로 표시
+        elif dec.strip() and all(c.isascii() for c in dec):
+            cats[tid] = "ascii"
+            names[tid] = dec  # ASCII도 디코딩 결과로 표시 (앞 공백 등 포함)
+        else:
+            cats[tid] = "other"
+            names[tid] = dec  # 기타도 디코딩 결과로 표시
+
+    return names, cats, vocab_size
+
+
+def _print_token_stats(token_ok: np.ndarray, token_fail: np.ndarray,
+                       names: dict, cats: dict, vocab_size: int):
+    """BBPE 토큰별 오류 분포를 실패율 내림차순으로 출력"""
+    total = token_ok + token_fail
+    fail_rate = np.zeros(vocab_size, dtype=np.float64)
+    nonzero = total > 0
+    fail_rate[nonzero] = token_fail[nonzero] / total[nonzero]
+
+    # 정렬: 실패율 내림차순, 동률이면 출현 횟수 내림차순
+    order = np.lexsort((-total, -fail_rate))
+
+    # 카테고리별 집계
+    cat_ok = {}
+    cat_fail = {}
+    for i in range(vocab_size):
+        c = cats.get(i, "unknown")
+        cat_ok[c] = cat_ok.get(c, 0) + int(token_ok[i])
+        cat_fail[c] = cat_fail.get(c, 0) + int(token_fail[i])
+
+    n_appeared = int(np.sum(total > 0))
+    n_zero = vocab_size - n_appeared
+
+    print(f"\n{'='*80}")
+    print(f"=== 카테고리별 복원 정확도 (BBPE 토큰 단위) ===")
+    print(f"{'카테고리':<12} {'성공':<12} {'실패':<12} {'정확도':>8}")
+    print(f"{'-'*12} {'-'*12} {'-'*12} {'-'*8}")
+    for c in ["hangul", "ascii", "byte", "special", "other"]:
+        ok = cat_ok.get(c, 0)
+        fl = cat_fail.get(c, 0)
+        t = ok + fl
+        acc = ok / max(t, 1) * 100
+        print(f"{c:<12} {ok:<12,} {fl:<12,} {acc:>7.3f}%")
+
+    print(f"\n  출현 토큰: {n_appeared:,} / {vocab_size:,}  (미출현: {n_zero:,})")
+
+    print(f"\n{'='*80}")
+    print(f"=== BBPE 토큰별 오류 분포 (실패율 내림차순, 전체 {vocab_size:,}개) ===")
+    print(f"{'ID':>7}  {'토큰':<24} {'카테고리':<10} {'성공':>10} {'실패':>10} {'합계':>10} {'실패율':>8}")
+    print(f"{'-'*7}  {'-'*24} {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*8}")
+
+    for idx in order:
+        ok = int(token_ok[idx])
+        fl = int(token_fail[idx])
+        t = ok + fl
+        fr = fail_rate[idx] * 100
+        name = names.get(idx, f"?:{idx}")
+        cat = cats.get(idx, "unknown")
+        # 표시 이름 truncate (터미널 레이아웃용)
+        if len(name) > 22:
+            name = name[:20] + ".."
+        marker = " !!!" if fr > 10 and t > 0 else ""
+        print(f"{idx:>7}  {name:<24} {cat:<10} {ok:>10,} {fl:>10,} {t:>10,} {fr:>7.3f}%{marker}")
+
 
 # ── 워커 함수 (pickle 가능해야 함, 별도 정의) ──
 
@@ -51,11 +155,13 @@ def _worker_tokenize_batch(args):
     for text in texts:
         bbpe_ids = _bbpe_tok.encode(text, add_special_tokens=False)
         jamo_seqs = []
+        bbpe_for_seq = []  # 각 jamo_seq에 대응하는 BBPE 토큰 ID
         for tid in bbpe_ids:
             tok_str = _bbpe_tok.decode([tid])
             jids = _jamo_encode(tok_str, add_special=False)
             if len(jids) <= max_jamo_per_token:
                 jamo_seqs.append(jids)
+                bbpe_for_seq.append(tid)
             else:
                 parts = re.split(r'( )', tok_str)
                 for part in parts:
@@ -64,20 +170,24 @@ def _worker_tokenize_batch(args):
                     pj = _jamo_encode(part, add_special=False)
                     if len(pj) <= max_jamo_per_token:
                         jamo_seqs.append(pj)
+                        bbpe_for_seq.append(tid)
                     else:
                         for ch in part:
                             cj = _jamo_encode(ch, add_special=False)
                             if cj:
                                 jamo_seqs.append(cj[:max_jamo_per_token])
+                                bbpe_for_seq.append(tid)
 
         all_jamo = []
         seg_ids = []
+        all_bbpe = []  # 각 자모 위치의 원본 BBPE 토큰 ID
         seg_idx = 0
-        for seq in jamo_seqs:
+        for i, seq in enumerate(jamo_seqs):
             if len(all_jamo) + len(seq) > max_seq_len:
                 break
             all_jamo.extend(seq)
             seg_ids.extend([seg_idx] * len(seq))
+            all_bbpe.extend([bbpe_for_seq[i]] * len(seq))
             seg_idx += 1
 
         L = len(all_jamo)
@@ -91,6 +201,7 @@ def _worker_tokenize_batch(args):
             "mask": [True] * L + [False] * pad_len,
             "seg_ids": seg_ids + [0] * pad_len,
             "n_segments": seg_idx,
+            "bbpe_ids": all_bbpe + [0] * pad_len,
         })
     return results
 
@@ -144,6 +255,7 @@ def _pre_tokenize_mp(texts: List[str], max_seq_len: int, max_jamo_per_token: int
     all_mask = []
     all_seg_ids = []
     all_n_segments = []
+    all_bbpe_ids = []
 
     count = 0
     t0 = time.time()
@@ -159,6 +271,7 @@ def _pre_tokenize_mp(texts: List[str], max_seq_len: int, max_jamo_per_token: int
                 all_mask.append(result["mask"])
                 all_seg_ids.append(result["seg_ids"])
                 all_n_segments.append(result["n_segments"])
+                all_bbpe_ids.append(result["bbpe_ids"])
                 count += 1
 
             elapsed = time.time() - t0
@@ -174,6 +287,7 @@ def _pre_tokenize_mp(texts: List[str], max_seq_len: int, max_jamo_per_token: int
         torch.tensor(all_mask, dtype=torch.bool),
         torch.tensor(all_seg_ids, dtype=torch.long),
         torch.tensor(all_n_segments, dtype=torch.long),
+        torch.tensor(all_bbpe_ids, dtype=torch.long),
     )
 
 
@@ -245,6 +359,12 @@ def main():
     # 메인 스레드 토크나이저 (decode용)
     from tok.jamo_tokenizer import JamoTokenizer
     jamo = JamoTokenizer()
+
+    # BBPE 토크나이저 (토큰별 통계용)
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    from transformers import AutoTokenizer
+    bbpe_tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    print(f"BBPE vocab: {len(bbpe_tok):,}", flush=True)
 
     # 체크포인트 로드
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
@@ -318,6 +438,13 @@ def main():
     tok_thread.start()
     del texts  # 메인에서 해제 (스레드가 참조 중)
 
+    # BBPE 토큰별 통계 배열 초기화
+    bbpe_vocab_size = len(bbpe_tok)
+    bbpe_ok = np.zeros(bbpe_vocab_size, dtype=np.int64)
+    bbpe_fail = np.zeros(bbpe_vocab_size, dtype=np.int64)
+    print("BBPE 토큰 이름 빌드 중...", flush=True)
+    bbpe_names, bbpe_cats, _ = _build_bbpe_token_names(bbpe_tok)
+
     # GPU 추론 (토큰화와 파이프라인)
     total_jamo = 0
     total_correct = 0
@@ -351,6 +478,32 @@ def main():
                 correct_mask = (pred == jamo_ids) & jamo_mask
                 total_correct += correct_mask.sum().item()
                 total_jamo += jamo_mask.sum().item()
+
+                # BBPE 토큰별 segment-level 성공/실패 집계
+                seg_cpu = segment_ids.cpu().numpy()
+                correct_cpu = correct_mask.cpu().numpy()
+                mask_cpu = jamo_mask.cpu().numpy()
+                bbpe_cpu = batch[4].numpy()  # pinned CPU 메모리
+
+                for b in range(jamo_ids.shape[0]):
+                    m = mask_cpu[b]
+                    if not m.any():
+                        continue
+                    vs = seg_cpu[b][m]
+                    vc = correct_cpu[b][m]
+                    vb = bbpe_cpu[b][m]
+
+                    # 세그먼트 경계 검출 (연속 구간)
+                    breaks = np.where(np.diff(vs) != 0)[0] + 1
+                    starts = np.concatenate([[0], breaks])
+                    ends = np.concatenate([breaks, [len(vs)]])
+
+                    for si, ei in zip(starts, ends):
+                        bid = int(vb[si])
+                        if vc[si:ei].all():
+                            bbpe_ok[bid] += 1
+                        else:
+                            bbpe_fail[bid] += 1
 
                 wrong = (~correct_mask) & jamo_mask
                 for b in range(jamo_ids.shape[0]):
@@ -386,6 +539,10 @@ def main():
         print(f"\n=== 오류 샘플 (최대 {args.show_errors}개) ===")
         for i, (gt, pr) in enumerate(error_examples):
             print(f"  [{i+1}] 정답: '{gt}' → 예측: '{pr}'")
+
+    # BBPE 토큰별 오류 분포 출력
+    _print_token_stats(bbpe_ok, bbpe_fail, bbpe_names, bbpe_cats, bbpe_vocab_size)
+
     print(f"\n총 소요: {time.time()-t0:.1f}s")
 
 
