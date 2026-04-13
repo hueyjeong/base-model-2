@@ -82,4 +82,5 @@ error_generation/nikl_para_misspellings.json
 error_generation/nikl_para_spacing.json
 
 .env
+.tmp
 aihubshell
