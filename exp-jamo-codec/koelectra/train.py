@@ -44,10 +44,7 @@ from tok.jamo_tokenizer import JamoTokenizer  # noqa: E402
 
 from koelectra.model.electra import JamoKoElectra  # noqa: E402
 from koelectra.data.masking import make_patch_mask, apply_mask  # noqa: E402
-
-# training/upload_gdrive.py 재사용
-sys.path.insert(0, os.path.join(_PROJECT_ROOT, "training"))
-from upload_gdrive import upload_and_cleanup  # noqa: E402
+from koelectra.upload import upload_checkpoint_bundle  # noqa: E402
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -379,6 +376,9 @@ def main():
     ap.add_argument("--rclone_remote", type=str, default=None,
                     help="예: gdrive:exp-jamo-codec-koelectra/small/")
     ap.add_argument("--keep_latest_n", type=int, default=3)
+    ap.add_argument("--log_file", type=str, default=None,
+                    help="학습 로그 파일 경로 (rank0만 작성 & 업로드). "
+                         "None이면 {out_dir}/train.log 사용.")
 
     args = ap.parse_args()
 
@@ -497,8 +497,18 @@ def main():
     )
 
     # ── 학습 루프 ──
-    log_path = os.path.join(args.out_dir, f"train_rank{rank}.log") if is_rank0(rank) else None
+    # 로그 파일: rank0만 작성 (업로드도 rank0의 이 파일만)
+    if is_rank0(rank):
+        if args.log_file:
+            log_path = args.log_file
+            os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+        else:
+            log_path = os.path.join(args.out_dir, "train.log")
+    else:
+        log_path = None
     log_file = open(log_path, "a") if log_path else None
+    if is_rank0(rank):
+        print(f"[Log] writing to {log_path}")
 
     model.train()
     t0 = time.time()
@@ -513,6 +523,8 @@ def main():
 
     data_iter = iter(train_loader)
     optimizer.zero_grad(set_to_none=True)
+
+    upload_threads: list = []  # 백그라운드 업로드 스레드 추적 (main 종료 전 join)
 
     while global_step < args.max_steps:
         # grad accumulation 루프
@@ -616,23 +628,47 @@ def main():
             # 모든 rank가 save_checkpoint 호출 (본체는 rank0, RNG sidecar는 각자)
             ckpt_path = os.path.join(args.out_dir, f"electra_step_{global_step}.pt")
             save_checkpoint(ckpt_path, global_step, model, optimizer, train_ds, args, rank)
+            # 업로드 전 모든 rank의 sidecar가 디스크에 내려앉았는지 barrier로 동기화
+            if world_size > 1:
+                dist.barrier()
             if is_rank0(rank):
-                print(f"[Ckpt] saved → {ckpt_path} (+ rank RNG sidecars)", flush=True)
+                print(f"[Ckpt] saved → {ckpt_path} (+ {world_size} RNG sidecars)", flush=True)
                 if args.rclone_remote:
-                    upload_and_cleanup(
+                    t = upload_checkpoint_bundle(
                         ckpt_path=ckpt_path,
                         log_path=log_path,
+                        world_size=world_size,
                         remote_dest=args.rclone_remote,
                         keep_latest_n=args.keep_latest_n,
+                        blocking=False,
                     )
+                    if t is not None:
+                        upload_threads.append(t)
+                        # 완료된 thread는 정리 (unbounded 성장 방지)
+                        upload_threads[:] = [u for u in upload_threads if u.is_alive()]
 
     # 종료: 모든 rank가 final 체크포인트 + RNG sidecar 저장
     final_path = os.path.join(args.out_dir, f"electra_step_{global_step}_final.pt")
     save_checkpoint(final_path, global_step, model, optimizer, train_ds, args, rank)
+    if world_size > 1:
+        dist.barrier()
     if is_rank0(rank):
-        print(f"[Done] final ckpt → {final_path}")
+        print(f"[Done] final ckpt → {final_path} (+ {world_size} RNG sidecars)")
+        # 진행 중인 주기 업로드 스레드들 먼저 완료 대기
+        for t in upload_threads:
+            t.join(timeout=300)  # 5분 타임아웃
+        # Final 업로드는 blocking (daemon 강제 종료 방지)
         if args.rclone_remote:
-            upload_and_cleanup(final_path, log_path, args.rclone_remote, args.keep_latest_n)
+            if log_file:
+                log_file.flush()
+            upload_checkpoint_bundle(
+                ckpt_path=final_path,
+                log_path=log_path,
+                world_size=world_size,
+                remote_dest=args.rclone_remote,
+                keep_latest_n=args.keep_latest_n,
+                blocking=True,
+            )
         if log_file:
             log_file.close()
 
