@@ -145,7 +145,21 @@ def collate_batch(samples):
 # 체크포인트
 # ──────────────────────────────────────────────────────────────────────────
 def unwrap(model):
-    return model.module if isinstance(model, DDP) else model
+    """DDP + torch.compile 래퍼를 순차 해제해 원본 Module 반환.
+
+    래핑 순서가 DDP(model) → torch.compile(...)이면
+    `compiled._orig_mod` → DDP → `.module` → 원본 JamoKoElectra.
+    """
+    m = model
+    # 최대 두 번 풀기 (compile → DDP → base)
+    for _ in range(2):
+        if hasattr(m, "_orig_mod"):
+            m = m._orig_mod
+        elif isinstance(m, DDP):
+            m = m.module
+        else:
+            break
+    return m
 
 
 def _rng_sidecar_path(ckpt_path: str, rank: int) -> str:
@@ -265,7 +279,7 @@ def load_checkpoint(path, model, optimizer, dataset, device, rank: int):
 def run_validation(model, val_dataset, args, device, amp_dtype, rank, world_size,
                    n_batches: int = 500):
     """Val loss 집계 (all_reduce 평균)."""
-    unwrap(model).eval()
+    model.eval()
     loader = DataLoader(
         val_dataset,
         batch_size=args.val_batch_size,
@@ -308,7 +322,7 @@ def run_validation(model, val_dataset, args, device, amp_dtype, rank, world_size
         dist.all_reduce(count, op=dist.ReduceOp.SUM)
 
     count = count.clamp(min=1)
-    unwrap(model).train()
+    model.train()
     return {
         "val/gen_loss": (gen_sum / count).item(),
         "val/disc_loss": (disc_sum / count).item(),
@@ -365,6 +379,13 @@ def main():
     ap.add_argument("--max_grad_norm", type=float, default=1.0)
     ap.add_argument("--bf16", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--compile", action="store_true",
+                    help="torch.compile 적용 (DDP wrap 뒤)")
+    ap.add_argument("--compile_mode", type=str, default="default",
+                    choices=["default", "reduce-overhead", "max-autotune"])
+    ap.add_argument("--compile_dynamic", action="store_true",
+                    help="CompositionEncoder의 segment_ids.max() 등 "
+                         "data-dependent shape 재컴파일을 피하기 위해 dynamic=True")
 
     # 체크포인트 & 로깅
     ap.add_argument("--out_dir", type=str, default="exp-jamo-codec/koelectra/checkpoints")
@@ -459,9 +480,19 @@ def main():
               f"unexpected={len(load_info['encoder_unexpected'])}/"
               f"{len(load_info['decoder_unexpected'])}")
 
-    # DDP
+    # DDP (compile 전에 먼저 wrap)
     if world_size > 1:
         model = DDP(model, device_ids=[ddp["local_rank"]], find_unused_parameters=False)
+
+    # torch.compile (DDP wrap 뒤에 적용 권장 — PyTorch 2.x 공식 패턴)
+    if args.compile:
+        compile_kwargs = {"mode": args.compile_mode}
+        if args.compile_dynamic:
+            compile_kwargs["dynamic"] = True
+        model = torch.compile(model, **compile_kwargs)
+        if is_rank0(rank):
+            print(f"[Compile] torch.compile 적용 mode={args.compile_mode}"
+                  f" dynamic={args.compile_dynamic}")
 
     # ── Optimizer: codec은 lr * codec_lr_ratio ──
     codec_params_list = list(unwrap(model).codec_parameters())
