@@ -151,44 +151,54 @@ def unwrap(model):
     return model.module if isinstance(model, DDP) else model
 
 
-def save_checkpoint(path, step, model, optimizer, dataset, args, extra=None):
-    state = {
-        "step": step,
-        "model": unwrap(model).state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "data_state": dataset.state_dict() if dataset is not None else {},
-        "rng_state": {
-            "torch": torch.get_rng_state(),
-            "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-            "python": random.getstate(),
-            "numpy": np.random.get_state(),
-        },
-        "args": vars(args),
+def _rng_sidecar_path(ckpt_path: str, rank: int) -> str:
+    """체크포인트 본체와 같은 디렉터리에 rank별 RNG sidecar 파일.
+
+    예: electra_step_10000.pt → electra_step_10000.rng_rank2.pt
+    `electra_step_*` 글롭에 걸리므로 upload_and_cleanup이 함께 정리한다.
+    """
+    base, ext = os.path.splitext(ckpt_path)  # (.../electra_step_10000, .pt)
+    return f"{base}.rng_rank{rank}{ext}"
+
+
+def _snapshot_rng():
+    return {
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
     }
-    if extra:
-        state.update(extra)
-    tmp = path + ".tmp"
-    torch.save(state, tmp)
-    os.replace(tmp, path)
 
 
-def load_checkpoint(path, model, optimizer, dataset, device, rank: int):
-    # RNG state는 ByteTensor여야 하므로 CPU로 로드 (model/optimizer는 별도 map_location)
-    ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    # 모델: device로 이동 (DDP wrap 전 상태)
-    model_sd = ckpt["model"]
-    unwrap(model).load_state_dict(model_sd, strict=True)
-    if optimizer is not None and "optimizer" in ckpt:
-        optimizer.load_state_dict(ckpt["optimizer"])
-        # optimizer state의 tensor를 device로 이동
-        for state in optimizer.state.values():
-            for k, v in state.items():
-                if torch.is_tensor(v):
-                    state[k] = v.to(device)
-    if dataset is not None and "data_state" in ckpt:
-        dataset.load_state_dict(ckpt["data_state"])
-    # RNG 복원
-    rng = ckpt.get("rng_state", {})
+def save_checkpoint(path, step, model, optimizer, dataset, args, rank: int, extra=None):
+    """체크포인트 저장.
+
+    - rank0만 본체(model/optimizer/step/data_state/args)를 `path`에 저장
+    - 모든 rank가 자기 RNG를 sidecar 파일에 저장
+    """
+    if is_rank0(rank):
+        state = {
+            "step": step,
+            "model": unwrap(model).state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "data_state": dataset.state_dict() if dataset is not None else {},
+            "args": vars(args),
+        }
+        if extra:
+            state.update(extra)
+        tmp = path + ".tmp"
+        torch.save(state, tmp)
+        os.replace(tmp, path)
+
+    # 모든 rank가 자기 RNG 저장 (독립 파일)
+    rng_path = _rng_sidecar_path(path, rank)
+    tmp = rng_path + ".tmp"
+    torch.save(_snapshot_rng(), tmp)
+    os.replace(tmp, rng_path)
+
+
+def _restore_rng(rng: dict, rank: int):
+    """rank별 RNG 딕셔너리에서 torch/cuda/python/numpy RNG 복원."""
     if rng.get("torch") is not None:
         try:
             torch_state = rng["torch"]
@@ -196,16 +206,14 @@ def load_checkpoint(path, model, optimizer, dataset, device, rank: int):
                 torch_state = torch_state.cpu().to(torch.uint8)
             torch.set_rng_state(torch_state)
         except Exception as e:
-            if is_rank0(rank):
-                print(f"[Resume] torch RNG 복원 skip: {e}")
+            print(f"[Resume rank{rank}] torch RNG 복원 skip: {e}")
     if rng.get("cuda") is not None and torch.cuda.is_available():
         try:
             cuda_states = [s.cpu().to(torch.uint8) if torch.is_tensor(s) else s
                            for s in rng["cuda"]]
             torch.cuda.set_rng_state_all(cuda_states)
         except Exception as e:
-            if is_rank0(rank):
-                print(f"[Resume] cuda RNG 복원 skip: {e}")
+            print(f"[Resume rank{rank}] cuda RNG 복원 skip: {e}")
     if rng.get("python") is not None:
         try:
             random.setstate(rng["python"])
@@ -216,6 +224,40 @@ def load_checkpoint(path, model, optimizer, dataset, device, rank: int):
             np.random.set_state(rng["numpy"])
         except Exception:
             pass
+
+
+def load_checkpoint(path, model, optimizer, dataset, device, rank: int):
+    """체크포인트 본체(모든 rank) + 자기 rank의 RNG sidecar 로드."""
+    # 본체: 모든 rank가 동일하게 읽어야 model/optimizer가 동기화됨
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    unwrap(model).load_state_dict(ckpt["model"], strict=True)
+    if optimizer is not None and "optimizer" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer"])
+        # optimizer state의 tensor를 device로 이동
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if torch.is_tensor(v):
+                    state[k] = v.to(device)
+    if dataset is not None and "data_state" in ckpt:
+        dataset.load_state_dict(ckpt["data_state"])
+
+    # RNG: rank별 sidecar 파일에서 로드
+    rng_path = _rng_sidecar_path(path, rank)
+    if os.path.exists(rng_path):
+        rng = torch.load(rng_path, map_location="cpu", weights_only=False)
+        _restore_rng(rng, rank)
+        if is_rank0(rank):
+            print(f"[Resume] RNG sidecar 복원 (rank0): {rng_path}")
+    else:
+        # 구버전 체크포인트 호환: 본체에 rng_state가 있었던 경우
+        legacy = ckpt.get("rng_state")
+        if legacy is not None and is_rank0(rank):
+            _restore_rng(legacy, rank)
+            print(f"[Resume] rank0 RNG를 구버전 본체에서 복원 "
+                  f"(rank>0는 seed+rank로 재초기화)")
+        elif is_rank0(rank):
+            print(f"[Resume] RNG sidecar 없음: {rng_path} — "
+                  f"rank별 RNG는 seed+rank 초기값으로 진행")
     return ckpt.get("step", 0)
 
 
@@ -554,6 +596,8 @@ def main():
 
         # ── Validation ──
         if val_ds is not None and global_step % args.val_every == 0:
+            # 매번 동일한 처음 N 배치를 평가 (val loss 비교 가능성 확보)
+            val_ds.load_state_dict({"line_counter": 0})
             val_metrics = run_validation(
                 model, val_ds, args, device, amp_dtype, rank, world_size,
                 n_batches=args.val_batches,
@@ -568,22 +612,24 @@ def main():
                     log_file.flush()
 
         # ── 체크포인트 ──
-        if is_rank0(rank) and global_step % args.save_every == 0:
+        if global_step % args.save_every == 0:
+            # 모든 rank가 save_checkpoint 호출 (본체는 rank0, RNG sidecar는 각자)
             ckpt_path = os.path.join(args.out_dir, f"electra_step_{global_step}.pt")
-            save_checkpoint(ckpt_path, global_step, model, optimizer, train_ds, args)
-            print(f"[Ckpt] saved → {ckpt_path}", flush=True)
-            if args.rclone_remote:
-                upload_and_cleanup(
-                    ckpt_path=ckpt_path,
-                    log_path=log_path,
-                    remote_dest=args.rclone_remote,
-                    keep_latest_n=args.keep_latest_n,
-                )
+            save_checkpoint(ckpt_path, global_step, model, optimizer, train_ds, args, rank)
+            if is_rank0(rank):
+                print(f"[Ckpt] saved → {ckpt_path} (+ rank RNG sidecars)", flush=True)
+                if args.rclone_remote:
+                    upload_and_cleanup(
+                        ckpt_path=ckpt_path,
+                        log_path=log_path,
+                        remote_dest=args.rclone_remote,
+                        keep_latest_n=args.keep_latest_n,
+                    )
 
-    # 종료
+    # 종료: 모든 rank가 final 체크포인트 + RNG sidecar 저장
+    final_path = os.path.join(args.out_dir, f"electra_step_{global_step}_final.pt")
+    save_checkpoint(final_path, global_step, model, optimizer, train_ds, args, rank)
     if is_rank0(rank):
-        final_path = os.path.join(args.out_dir, f"electra_step_{global_step}_final.pt")
-        save_checkpoint(final_path, global_step, model, optimizer, train_ds, args)
         print(f"[Done] final ckpt → {final_path}")
         if args.rclone_remote:
             upload_and_cleanup(final_path, log_path, args.rclone_remote, args.keep_latest_n)
