@@ -51,6 +51,7 @@ class BBPEJamoDataset(IterableDataset):
         min_length: int = 10,
         rank: int = 0,
         world_size: int = 1,
+        max_patches: int = None,
     ):
         self.file_paths = [file_paths] if isinstance(file_paths, str) else list(file_paths)
         self.bbpe = bbpe_tokenizer
@@ -61,6 +62,7 @@ class BBPEJamoDataset(IterableDataset):
         self.min_length = min_length
         self.rank = rank
         self.world_size = world_size
+        self.max_patches = max_patches  # BBPE 토큰(패치) 수 상한 — None이면 자모 길이만 제한
         self._line_counter = 0
         self._resume_line = 0
 
@@ -169,6 +171,8 @@ class BBPEJamoDataset(IterableDataset):
         seg_idx = 0
         for seq in jamo_seqs:
             if len(all_jamo) + len(seq) > self.max_seq_len:
+                break
+            if self.max_patches is not None and seg_idx >= self.max_patches:
                 break
             all_jamo.extend(seq)
             seg_ids.extend([seg_idx] * len(seq))
