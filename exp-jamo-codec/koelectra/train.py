@@ -486,13 +486,22 @@ def main():
 
     # torch.compile (DDP wrap 뒤에 적용 권장 — PyTorch 2.x 공식 패턴)
     if args.compile:
+        # Dynamo 안전장치:
+        # (1) compile 실패 시 조용히 eager로 fallback (학습 중단 방지)
+        # (2) 재컴파일 한도 상향 — DDP + dynamic shape 조합에서 쉽게 8을 초과
+        import torch._dynamo as _dynamo  # 함수 스코프 충돌 방지용 별칭
+        _dynamo.config.suppress_errors = True
+        _dynamo.config.cache_size_limit = 64
+        _dynamo.config.accumulated_cache_size_limit = 256
+
         compile_kwargs = {"mode": args.compile_mode}
         if args.compile_dynamic:
             compile_kwargs["dynamic"] = True
         model = torch.compile(model, **compile_kwargs)
         if is_rank0(rank):
             print(f"[Compile] torch.compile 적용 mode={args.compile_mode}"
-                  f" dynamic={args.compile_dynamic}")
+                  f" dynamic={args.compile_dynamic}"
+                  f" | suppress_errors=True, cache_size_limit=64")
 
     # ── Optimizer: codec은 lr * codec_lr_ratio ──
     codec_params_list = list(unwrap(model).codec_parameters())
