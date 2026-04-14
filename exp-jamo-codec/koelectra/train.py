@@ -393,6 +393,10 @@ def main():
                          "이제 codec이 fixed_output_len 사용하므로 보통 불필요.")
     ap.add_argument("--no_tf32", action="store_true",
                     help="TF32 자동 활성화를 끈다 (기본 ON)")
+    ap.add_argument("--disable_ddp_optimizer", action="store_true",
+                    help="torch._dynamo.config.optimize_ddp=False로 강제. "
+                         "보통은 compile_dynamic 사용 시에만 자동 OFF되지만 "
+                         "inductor 버그 재발 시 수동으로 끌 때 사용.")
 
     # 체크포인트 & 로깅
     ap.add_argument("--out_dir", type=str, default="exp-jamo-codec/koelectra/checkpoints")
@@ -506,15 +510,17 @@ def main():
         # Dynamo 안전장치:
         # (1) compile 실패 시 조용히 eager로 fallback (학습 중단 방지)
         # (2) 재컴파일 한도 상향 — DDP + dynamic shape 조합에서 쉽게 8을 초과
-        # (3) DDPOptimizer 비활성화 — DDP + dynamic shape 조합에서 inductor가
-        #     서브모듈 경계의 symbolic shape 처리 실패 (PyTorch 알려진 버그):
-        #     `InductorError: AssertionError: For s67 + 1, expected [s67] to have been codegen-ed`
-        #     DDPOptimizer를 끄면 모델을 쪼개지 않고 통째 컴파일 → 회피
+        # (3) DDPOptimizer는 기본 ON (DDP bucket 경계로 서브모듈 쪼개서
+        #     communication overlap 극대화). 단 dynamic shape와 조합 시
+        #     inductor `s67+1` codegen 버그가 알려짐 → compile_dynamic 또는
+        #     명시적 --disable_ddp_optimizer 시에만 OFF.
         import torch._dynamo as _dynamo  # 함수 스코프 충돌 방지용 별칭
         _dynamo.config.suppress_errors = True
         _dynamo.config.cache_size_limit = 64
         _dynamo.config.accumulated_cache_size_limit = 256
-        if world_size > 1:
+        ddp_opt_off = (world_size > 1 and
+                       (args.compile_dynamic or args.disable_ddp_optimizer))
+        if ddp_opt_off:
             _dynamo.config.optimize_ddp = False
 
         compile_kwargs = {"mode": args.compile_mode}
@@ -522,7 +528,12 @@ def main():
             compile_kwargs["dynamic"] = True
         model = torch.compile(model, **compile_kwargs)
         if is_rank0(rank):
-            ddp_opt = "OFF" if world_size > 1 else "N/A"
+            if world_size <= 1:
+                ddp_opt = "N/A"
+            elif ddp_opt_off:
+                ddp_opt = "OFF"
+            else:
+                ddp_opt = "ON (default)"
             print(f"[Compile] torch.compile 적용 mode={args.compile_mode}"
                   f" dynamic={args.compile_dynamic}"
                   f" | suppress_errors=True, cache_size_limit=64,"
