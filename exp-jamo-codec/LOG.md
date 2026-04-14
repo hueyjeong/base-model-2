@@ -1410,15 +1410,21 @@ head fine-tune.
 
 이후 50k, 100k, 200k 체크포인트에서 재측정해 학습 경과 추적 예정.
 
-### 40k 체크포인트 NSMC (pooling=bos, 2 epoch)
+### 초기 체크포인트 NSMC 추이 (pooling=bos, 2 epoch)
 
-- Best Test Acc: **81.56%** (epoch 1: 81.56, epoch 2: 81.45)
-- 30k(83.05%) 대비 **-1.49pp 하락**
+| Step | LR (peak 대비) | Best Test Acc |
+|---|---|---|
+| 30k | ~95% | **83.05%** |
+| 40k | ~92% | 81.56% |
+| 50k | ~90% | 81.95% |
 
-**원인 추정**:
-- 40k도 여전히 LR peak 근처 (step 10k 이후 linear decay 구간: 40k에서 peak의 92%)
-- Pretraining 초기에는 downstream transfer가 단조 증가하지 않음 — representation이 흔들리는 시기
-- Codec이 `gen_loss × 50` gradient 받으며 Gen 방향으로 튜닝 중 → Disc 표현력과 일시적 트레이드오프 가능
+**해석**:
+- 30k → 40k 하락은 단발성, 40k → 50k는 소폭 회복 → **82% ± 1% 진동 중**
+- 30k가 일시적 lucky 체크포인트였을 가능성 높음 (3점 중 유일 상단)
+- LR이 아직 peak 근처(90%+)라 Disc representation이 흔들리는 시기
+- Codec이 `gen_loss × 50` gradient 받으며 Gen 방향으로 튜닝 중 → Disc 표현력과 트레이드오프
 
-30k/40k 모두 **"예열 구간"**이고 실제 수렴 판단은 100k+ (LR 20% decay) 이후에 해야 함.
+**실제 수렴 판단은 100k+ (LR 20% decay 진입) 이후**. 100k에서도 82% 정체면 pretraining 방식 재검토 필요.
+
+코드 검증: bos pooling 정상 작동 확인 (BOS 자모 교체 시 logit diff 2.6 → BOS hidden 의존). 40k/50k 하락은 pooling 버그 아니라 진짜 pretraining 상태 변동.
 
