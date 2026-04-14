@@ -16,14 +16,16 @@ JAMO_PAD_ID = 0
 def make_patch_mask(n_segments: torch.Tensor, max_patches: int,
                     mask_ratio: float = 0.20,
                     min_masked: int = 1,
+                    special_patch_mask: torch.Tensor | None = None,
                     generator: torch.Generator | None = None) -> torch.Tensor:
     """배치별 유효 패치 중 mask_ratio 만큼 균등 샘플링.
 
     Args:
         n_segments: [B] 배치별 유효 패치 수
         max_patches: 시퀀스 패치 차원 크기 P
-        mask_ratio: 마스킹 비율
-        min_masked: 최소 마스크 수 (0이면 gen_loss가 NaN 가능)
+        mask_ratio: 마스킹 비율 (special 제외 후의 "유효" 패치에 대한 비율)
+        min_masked: 최소 마스크 수
+        special_patch_mask: [B, P] bool, True=special 토큰(BOS/EOS/SEP) → 마스킹 대상 제외
         generator: 재현성을 위한 torch.Generator (옵션)
 
     Returns:
@@ -34,16 +36,19 @@ def make_patch_mask(n_segments: torch.Tensor, max_patches: int,
     # 패딩 패치는 제외 → 유효 범위 내에서 상위-k 샘플링
     pos = torch.arange(max_patches, device=device).unsqueeze(0).expand(B, -1)  # [B,P]
     valid = pos < n_segments.unsqueeze(-1)  # [B,P]
+    if special_patch_mask is not None:
+        valid = valid & ~special_patch_mask  # special은 마스킹 대상 아님
 
-    # 랜덤 점수 생성, padding 위치엔 -inf → 상위-k에서 배제
+    # 랜덤 점수 생성, padding/special 위치엔 -inf → 상위-k에서 배제
     if generator is not None:
         scores = torch.rand(B, max_patches, generator=generator, device=device)
     else:
         scores = torch.rand(B, max_patches, device=device)
-    scores = scores.masked_fill(~valid, -1.0)  # valid만 [0,1)
+    scores = scores.masked_fill(~valid, -1.0)
 
-    # 배치별 마스크 개수
-    k = (n_segments.float() * mask_ratio).round().clamp(min=min_masked).long()  # [B]
+    # 배치별 마스크 개수 — 유효(non-special) 패치 수 기준
+    valid_count = valid.sum(dim=1).float()  # [B]
+    k = (valid_count * mask_ratio).round().clamp(min=min_masked).long()  # [B]
     # 모든 샘플에서 같은 수의 topk를 취하기 위해 max_k 로 뽑고, 뒤에서 자름
     max_k = int(k.max().item()) if k.numel() > 0 else 0
     if max_k == 0:

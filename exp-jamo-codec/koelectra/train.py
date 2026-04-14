@@ -131,12 +131,20 @@ def collate_batch(samples):
     jamo_mask = torch.stack([s["jamo_mask"] for s in samples])
     segment_ids = torch.stack([s["segment_ids"] for s in samples])
     n_segments = torch.tensor([s["n_segments"] for s in samples], dtype=torch.long)
+    # special_patch_mask: 구버전 BBPEJamoDataset 호환 — 없으면 전부 False
+    if "special_patch_mask" in samples[0]:
+        special_patch_mask = torch.stack([s["special_patch_mask"] for s in samples])
+    else:
+        # max_patches 정보 없으면 n_segments 길이로 기본 False
+        P = segment_ids.size(1)  # jamo 길이가 아니라 max_patches여야 하지만 호환성 fallback
+        special_patch_mask = torch.zeros(len(samples), P, dtype=torch.bool)
     line_counters = [s.get("_line_counter", 0) for s in samples]
     return {
         "jamo_ids": jamo_ids,
         "jamo_mask": jamo_mask,
         "segment_ids": segment_ids,
         "n_segments": n_segments,
+        "special_patch_mask": special_patch_mask,
         "line_counters": line_counters,
     }
 
@@ -301,8 +309,12 @@ def run_validation(model, val_dataset, args, device, amp_dtype, rank, world_size
         segment_ids = batch["segment_ids"].to(device, non_blocking=True)
         n_segments = batch["n_segments"].to(device, non_blocking=True)
 
-        masked_patch_mask = make_patch_mask(n_segments, max_patches=args.max_patches,
-                                            mask_ratio=args.mask_ratio)
+        special_patch_mask = batch["special_patch_mask"].to(device, non_blocking=True)
+        masked_patch_mask = make_patch_mask(
+            n_segments, max_patches=args.max_patches,
+            mask_ratio=args.mask_ratio,
+            special_patch_mask=special_patch_mask,
+        )
         masked_jamo_ids, per_jamo_mask = apply_mask(
             jamo_ids, segment_ids, jamo_mask, masked_patch_mask
         )

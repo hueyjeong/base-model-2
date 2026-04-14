@@ -15,8 +15,11 @@ from torch.utils.data import IterableDataset
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 
-# ── 상수 ──
-JAMO_PAD = 0  # JamoTokenizer의 PAD ID
+# ── 상수 (JamoTokenizer specials) ──
+JAMO_PAD = 0
+JAMO_BOS = 2
+JAMO_EOS = 3
+JAMO_SEP = 5
 
 
 def load_bbpe_tokenizer(model_id: str = "LGAI-EXAONE/K-EXAONE-236B-A23B"):
@@ -163,39 +166,35 @@ class BBPEJamoDataset(IterableDataset):
                                 jamo_seqs.append(cj[:self.max_jamo_per_token])
         return jamo_seqs
 
-    def _make_sample(self, jamo_seqs: List[List[int]]):
-        """자모 시퀀스 리스트 → concat 텐서 + segment_ids"""
-        # concat
-        all_jamo = []
-        seg_ids = []
-        seg_idx = 0
-        for seq in jamo_seqs:
-            if len(all_jamo) + len(seq) > self.max_seq_len:
-                break
-            if self.max_patches is not None and seg_idx >= self.max_patches:
-                break
-            all_jamo.extend(seq)
-            seg_ids.extend([seg_idx] * len(seq))
-            seg_idx += 1
+    def _build_sample(self, buffer_jamo, buffer_segs, buffer_special, n_segments):
+        """buffer 내용으로 샘플 텐서 구축 (multi-document packing 경로).
 
-        L = len(all_jamo)
-        n_segments = seg_idx
-
-        if L == 0:
+        Args:
+            buffer_jamo: 자모 ID 리스트 (연속 concat)
+            buffer_segs: 각 자모의 segment id 리스트
+            buffer_special: 각 segment가 special(BOS/EOS/SEP)인지 bool 리스트 (len=n_segments)
+            n_segments: 세그먼트(패치) 수
+        """
+        L = len(buffer_jamo)
+        if L == 0 or n_segments == 0:
             return None
 
-        # 패딩
         pad_len = self.max_seq_len - L
-        jamo_ids = torch.tensor(all_jamo + [JAMO_PAD] * pad_len, dtype=torch.long)
+        jamo_ids = torch.tensor(buffer_jamo + [JAMO_PAD] * pad_len, dtype=torch.long)
         jamo_mask = torch.tensor([True] * L + [False] * pad_len, dtype=torch.bool)
-        # 패딩 영역의 segment_ids는 마지막 segment로 (scatter_add에서 무시됨 — mask로 처리)
-        segment_ids = torch.tensor(seg_ids + [0] * pad_len, dtype=torch.long)
+        segment_ids = torch.tensor(buffer_segs + [0] * pad_len, dtype=torch.long)
+
+        # special_patch_mask: [max_patches] (또는 n_segments, max_patches None이면 후자)
+        P = self.max_patches if self.max_patches is not None else n_segments
+        spec = buffer_special + [False] * (P - n_segments)
+        special_patch_mask = torch.tensor(spec[:P], dtype=torch.bool)
 
         return {
-            "jamo_ids": jamo_ids,         # [max_seq_len]
-            "jamo_mask": jamo_mask,       # [max_seq_len]
-            "segment_ids": segment_ids,   # [max_seq_len]
+            "jamo_ids": jamo_ids,
+            "jamo_mask": jamo_mask,
+            "segment_ids": segment_ids,
             "n_segments": n_segments,
+            "special_patch_mask": special_patch_mask,
             "_line_counter": self._line_counter,
         }
 
@@ -211,7 +210,17 @@ class BBPEJamoDataset(IterableDataset):
         self._line_counter = self._resume_line
 
     def __iter__(self):
-        """스트리밍 + DDP×Worker 샤딩 + 무한 순환 + resume fast-forward"""
+        """Multi-document packing: [BOS]문서1[EOS][BOS]문서2[EOS]...를 상한까지 이어붙여 yield.
+
+        상한 도달 시점에 현재 buffer를 yield하고 새 buffer로 시작. 새 문서가
+        buffer에 통째로 안 들어가면 남은 자리에 넣을 수 있는 만큼만 넣고 flush.
+
+        BOS/EOS 패치는 special_patch_mask=True로 표시되어 Generator MLM 마스킹
+        대상에서 제외된다.
+
+        DDP×Worker 샤딩은 문서 단위(abs_line)로 interleaving. 한 샘플이 여러
+        문서를 묶을 수 있으므로 엄밀한 비트 재현성은 없지만 데이터 분포는 동일.
+        """
         worker_info = torch.utils.data.get_worker_info()
         worker_id = worker_info.id if worker_info else 0
         num_workers = worker_info.num_workers if worker_info else 1
@@ -221,15 +230,21 @@ class BBPEJamoDataset(IterableDataset):
 
         resume_line = self._resume_line
         if resume_line > 0:
-            self._resume_line = 0  # 다음 순환에서는 정상 동작
+            self._resume_line = 0
 
         first_epoch = True
+
+        # 패킹 buffer
+        buf_jamo: List[int] = []
+        buf_segs: List[int] = []
+        buf_special: List[bool] = []
+        seg_idx = 0
 
         while True:
             resume_row = resume_line if first_epoch and resume_line > 0 else 0
 
             for abs_line, text in self._iter_texts(resume_row=resume_row):
-                # DDP × Worker interleaving
+                # DDP × Worker interleaving — 문서 단위
                 if abs_line % total_workers != global_worker_id:
                     continue
                 if abs_line < resume_line:
@@ -237,15 +252,107 @@ class BBPEJamoDataset(IterableDataset):
 
                 self._line_counter = abs_line + 1
 
-                jamo_seqs = self._tokenize_and_decompose(text)
-                if not jamo_seqs:
+                doc_jamo_seqs = self._tokenize_and_decompose(text)
+                if not doc_jamo_seqs:
                     continue
-                sample = self._make_sample(jamo_seqs)
+
+                # 한 문서를 [BOS] + 토큰들 + [EOS] 로 감싸기 (atomic packing)
+                doc_segments = (
+                    [([JAMO_BOS], True)]
+                    + [(seq, False) for seq in doc_jamo_seqs]
+                    + [([JAMO_EOS], True)]
+                )
+                doc_total_jamo = sum(len(s) for s, _ in doc_segments)
+                doc_n_segs = len(doc_segments)
+
+                # 단일 문서가 상한을 초과하면 truncate해서 단독 샘플로 처리
+                # (EOS 포함 위해 뒤에서부터 자름)
+                if (doc_total_jamo > self.max_seq_len or
+                        (self.max_patches is not None and doc_n_segs > self.max_patches)):
+                    trunc = self._truncate_doc(doc_segments)
+                    if trunc is not None:
+                        # 기존 buffer 먼저 flush
+                        if seg_idx > 0:
+                            s = self._build_sample(buf_jamo, buf_segs, buf_special, seg_idx)
+                            if s is not None:
+                                yield s
+                            buf_jamo, buf_segs, buf_special, seg_idx = [], [], [], 0
+                        yield trunc
+                    continue
+
+                # 문서 전체가 현재 buffer에 안 들어가면 buffer flush
+                if seg_idx > 0:
+                    would_jamo = len(buf_jamo) + doc_total_jamo
+                    would_segs = seg_idx + doc_n_segs
+                    doesnt_fit = (
+                        would_jamo > self.max_seq_len or
+                        (self.max_patches is not None and would_segs > self.max_patches)
+                    )
+                    if doesnt_fit:
+                        s = self._build_sample(buf_jamo, buf_segs, buf_special, seg_idx)
+                        if s is not None:
+                            yield s
+                        buf_jamo, buf_segs, buf_special, seg_idx = [], [], [], 0
+
+                # 문서 통째 buffer에 추가 (BOS..EOS 정합성 유지)
+                for seq, is_special in doc_segments:
+                    buf_jamo.extend(seq)
+                    buf_segs.extend([seg_idx] * len(seq))
+                    buf_special.append(is_special)
+                    seg_idx += 1
+
+            # epoch 끝 — 남은 buffer도 yield
+            if seg_idx > 0:
+                sample = self._build_sample(buf_jamo, buf_segs, buf_special, seg_idx)
                 if sample is not None:
                     yield sample
+                buf_jamo, buf_segs, buf_special, seg_idx = [], [], [], 0
 
             resume_line = 0
             first_epoch = False
+
+    def _truncate_doc(self, doc_segments):
+        """단일 문서가 상한 초과 시 앞에서부터 잘라 BOS..일부..EOS 구조로 구성.
+
+        [BOS] + 앞 토큰들 + [EOS]로 잘라 단독 샘플 반환.
+        """
+        buf_jamo = []
+        buf_segs = []
+        buf_special = []
+        seg_idx = 0
+        max_L = self.max_seq_len
+        max_P = self.max_patches
+
+        # [BOS] 추가 (무조건)
+        bos_seq, bos_sp = doc_segments[0]
+        buf_jamo.extend(bos_seq)
+        buf_segs.extend([seg_idx] * len(bos_seq))
+        buf_special.append(bos_sp)
+        seg_idx += 1
+
+        # 중간 토큰들: [EOS] 자리 남겨두고 채움 (마지막 segment가 [EOS])
+        eos_seq, eos_sp = doc_segments[-1]
+        reserve_jamo = len(eos_seq)
+        reserve_seg = 1
+        for seq, is_sp in doc_segments[1:-1]:
+            if len(buf_jamo) + len(seq) + reserve_jamo > max_L:
+                break
+            if max_P is not None and seg_idx + reserve_seg >= max_P:
+                break
+            buf_jamo.extend(seq)
+            buf_segs.extend([seg_idx] * len(seq))
+            buf_special.append(is_sp)
+            seg_idx += 1
+
+        # [EOS] 추가
+        if len(buf_jamo) + len(eos_seq) <= max_L and \
+                (max_P is None or seg_idx < max_P):
+            buf_jamo.extend(eos_seq)
+            buf_segs.extend([seg_idx] * len(eos_seq))
+            buf_special.append(eos_sp)
+            seg_idx += 1
+
+        return self._build_sample(buf_jamo, buf_segs, buf_special, seg_idx)
 
 
 if __name__ == "__main__":
