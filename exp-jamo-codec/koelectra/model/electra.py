@@ -102,10 +102,13 @@ class JamoKoElectra(nn.Module):
         self.gen_loss_weight = gen_loss_weight
 
         # ── 공유 codec (pretrained로 초기화 예정) ──
+        # fixed_output_len=max_patches로 codec 출력이 항상 [B, P, D]로 나옴.
+        # → _pad_patches_to (torch.cat) 제거, compile dynamic 불필요.
         self.codec_encoder = CompositionEncoder(
             jamo_vocab=jamo_vocab, d_model=codec_d_model,
             n_layers=codec_n_layers, kernel_size=codec_kernel_size,
             dropout=dropout, max_jamo_per_token=max_jamo_per_token,
+            fixed_output_len=max_patches,
         )
         self.codec_decoder = CompositionDecoder(
             jamo_vocab=jamo_vocab, d_model=codec_d_model,
@@ -203,9 +206,8 @@ class JamoKoElectra(nn.Module):
         patch_pad_mask = pos < n_segments.unsqueeze(-1)  # [B, P] True=유효
 
         # ── (1) Generator: 마스킹본 인코딩 ──
+        # codec_encoder는 fixed_output_len=max_patches로 항상 [B, P, D] 반환
         z_masked = self.codec_encoder(masked_jamo_ids, jamo_mask, segment_ids, n_segments)
-        # CompositionEncoder는 max_seg = segment_ids.max()+1 크기로 반환 — P보다 작을 수 있음
-        z_masked = _pad_patches_to(z_masked, P)  # [B, P, D]
         e_masked = self._embed(z_masked, patch_pad_mask)
         h_gen = self.gen_hidden_proj(e_masked)  # [B, P, 256]
         h_gen = self.generator(h_gen, patch_pad_mask)
@@ -237,7 +239,6 @@ class JamoKoElectra(nn.Module):
 
         # ── (3) Discriminator: corrupted 자모 재인코딩 ──
         z_corrupted = self.codec_encoder(jamo_corrupted, jamo_mask, segment_ids, n_segments)
-        z_corrupted = _pad_patches_to(z_corrupted, P)
         e_corrupted = self._embed(z_corrupted, patch_pad_mask)
         h_disc = self.disc_hidden_proj(e_corrupted)
         h_disc = self.discriminator(h_disc, patch_pad_mask)
@@ -269,7 +270,9 @@ class JamoKoElectra(nn.Module):
 
 
 def _pad_patches_to(z: torch.Tensor, P: int) -> torch.Tensor:
-    """CompositionEncoder 출력 [B, max_seg, D]를 [B, P, D]로 오른쪽 패딩."""
+    """DEPRECATED — CompositionEncoder(fixed_output_len=P) 사용으로 불필요해짐.
+    profile_run.py 등 외부 임포트 호환성을 위해 유지.
+    """
     B, cur_P, D = z.shape
     if cur_P == P:
         return z

@@ -29,10 +29,20 @@ class CompositionEncoder(nn.Module):
 
     def __init__(self, jamo_vocab: int = 330, d_model: int = 256,
                  n_layers: int = 5, kernel_size: int = 7, dropout: float = 0.1,
-                 max_jamo_per_token: int = 32):
+                 max_jamo_per_token: int = 32,
+                 fixed_output_len: int | None = None):
+        """
+        Args:
+            fixed_output_len: None이면 출력 shape이 `[B, segment_ids.max()+1, D]`로
+                배치마다 가변. int이면 항상 `[B, fixed_output_len, D]` 고정 출력
+                (segment_ids 값이 fixed_output_len 이하임을 호출자가 보장해야 함).
+                compile static shape 경로에서 torch.cat/dynamic symbol을 제거하여
+                max-autotune/DDPOptimizer 호환성 및 copy 오버헤드 제거.
+        """
         super().__init__()
         self.d_model = d_model
         self.max_jamo_per_token = max_jamo_per_token
+        self.fixed_output_len = fixed_output_len
         self.embedding = nn.Embedding(jamo_vocab, d_model, padding_idx=0)
         self.embed_scale = math.sqrt(d_model)
         # 세그먼트 내 위치 임베딩 (intra-segment position)
@@ -52,7 +62,8 @@ class CompositionEncoder(nn.Module):
             n_segments: [B] 배치별 토큰 수
 
         Returns:
-            token_vecs: [B, max_segments, d_model]
+            token_vecs: [B, max_segments, d_model] (fixed_output_len None 시)
+                       또는 [B, fixed_output_len, d_model] (int 지정 시)
         """
         B, L = jamo_ids.shape
         D = self.d_model
@@ -77,8 +88,11 @@ class CompositionEncoder(nn.Module):
             x = layer(x)  # [B, L, D]
 
         # Segment Avg Pool (scatter_add)
-        # segment_ids의 max로 대체 (.item() 없이 compile 호환)
-        max_seg = segment_ids.max() + 1
+        # fixed_output_len 지정 시 고정 크기, 아니면 배치별 최대 segment로 동적 할당
+        if self.fixed_output_len is not None:
+            max_seg = self.fixed_output_len
+        else:
+            max_seg = segment_ids.max() + 1  # .item() 없이 compile 호환
         token_vecs = torch.zeros(B, max_seg, D, device=x.device, dtype=x.dtype)
         counts = torch.zeros(B, max_seg, 1, device=x.device, dtype=x.dtype)
 

@@ -385,7 +385,10 @@ def main():
                     choices=["default", "reduce-overhead", "max-autotune"])
     ap.add_argument("--compile_dynamic", action="store_true",
                     help="CompositionEncoder의 segment_ids.max() 등 "
-                         "data-dependent shape 재컴파일을 피하기 위해 dynamic=True")
+                         "data-dependent shape 재컴파일을 피하기 위해 dynamic=True. "
+                         "이제 codec이 fixed_output_len 사용하므로 보통 불필요.")
+    ap.add_argument("--no_tf32", action="store_true",
+                    help="TF32 자동 활성화를 끈다 (기본 ON)")
 
     # 체크포인트 & 로깅
     ap.add_argument("--out_dir", type=str, default="exp-jamo-codec/koelectra/checkpoints")
@@ -402,6 +405,16 @@ def main():
                          "None이면 {out_dir}/train.log 사용.")
 
     args = ap.parse_args()
+
+    # TF32 활성화 (BF16 autocast 밖의 FP32 경로 가속 — optimizer 일부, clip_grad_norm 등)
+    # 부작용 없음, 안 켜면 손해. --no_tf32로 비활성 가능.
+    if not args.no_tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except Exception:
+            pass
 
     # DDP
     ddp = setup_ddp()
