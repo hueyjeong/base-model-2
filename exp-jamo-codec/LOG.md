@@ -1251,3 +1251,125 @@ Log 6 (커버리지 특화 데이터셋) 결과가 이 전략을 재검토하게
 
 ---
 
+
+## 2026-04-14 — KoELECTRA Small v3 + Jamo-Codec 사전학습 착수
+
+### 구성
+
+`exp-jamo-codec/koelectra/` 서브프로젝트로 분리. 기존 `composition_6L_step600000.pt` 코덱을 backbone 임베딩으로 활용해 ELECTRA Small v3 스펙(Gen/Disc 각 12L·256h·4H·128emb) 사전학습.
+
+주요 설계 결정:
+- **Gen = CompositionDecoder parallel 재사용 + 자모 MLM** (진짜 AR 디코더 아님 — 코덱 pretrained 복원 능력 그대로 활용)
+- **마스킹: BBPE 패치 20%** (KoELECTRA 관행, 해당 패치의 모든 자모를 `JAMO_MASK=4`로 치환)
+- **λ = 50.0** (disc_loss + 50 × gen_loss, 원 ELECTRA 논문)
+- **Codec LR = main LR × 0.1** (급변 방지, param_group 분리)
+- **Projection: codec 256 → emb_proj 128 → hidden 256** (Base 확장 호환)
+- **Generator size = 1.0× Discriminator** (아키텍처 비교 목적이라 원 논문 권장 1/4 대신 동일 크기 유지)
+
+### Multi-document packing (v2)
+
+초기 구현은 "단일 문서 = 단일 샘플" 방식 → util 0.52. 원 프롬프트가 `[SEP] 토큰으로 다문서 packing` 요구했지만 plan에서 v1로 간소화했다가 학습 시 체감. 수정:
+
+- `BBPEJamoDataset.__iter__` 전면 개편: atomic document packing
+- `[BOS]문서[EOS]` 구조, 여러 문서를 max_seq_len/max_patches 상한까지 이어붙임
+- 문서 통째로 안 들어가면 flush 후 새 buffer
+- 단일 문서가 상한 초과면 `_truncate_doc`로 앞부분 + EOS만 유지
+- `special_patch_mask[B,P]` 반환 — BOS/EOS 위치 표시 → Gen MLM 마스킹 대상에서 자동 제외
+- `make_patch_mask`에 `special_patch_mask` 인자 추가
+
+실측 문서 분포 (`corpus/jamo-codec-v3/val.parquet` 200샘플):
+- 문서 평균 272 패치, 1293 자모
+- **자모/패치 비율 4.76** (한국어 3.0 가정보다 큼 — LLM 출력/다국어/코드 포함)
+- `max_seq_len=1536` → util 52% (한 문서도 겨우 담김)
+- `max_seq_len=3072` → util **73.4%** (atomic packing 자연스런 천장)
+- `max_seq_len≥3584` → 포화 (자모 공간 남아도 문서 단위 불연속)
+
+최종 선택: **`max_seq_len=3072, max_patches=512`**
+
+### 최적화 스택
+
+학습 중 다음 모두 활성:
+- **torch.compile (mode=default)** — 커널 fusion·SDPA flash 경로 확보 (backward가 forward의 ~1.67×라 compile 이득 큼)
+- **TF32 자동 활성화** — BF16 autocast 밖 FP32 경로(optimizer/clip_grad_norm) 가속
+- **fixed_output_len=512** — CompositionEncoder 출력 shape 고정 → `torch.cat` 제거, dynamic shape 회피, max-autotune/DDPOptimizer 버그 우회
+- **DDPOptimizer 기본 ON** (static shape라 안전)
+- Dynamo safeguards: `suppress_errors=True`, `cache_size_limit=64`
+- `max-autotune`은 Triton kernel SIGSEGV 재현 → `default`로 다운그레이드
+
+### 실측 학습 속도 (5090 × 8, batch=64, grad_accum=2, global=1024)
+
+```
+step    5600 | total 112 | gen 2.24 | disc 0.19 | disc_acc 0.936 | rep 0.161 | util 0.735 | 4.0 step/s | mem 12.7GB
+```
+
+- **4.0 step/s** → 800k step = **2.3일** (5090 × 8)
+- 메모리 12.7GB / 32GB → batch 128로 늘려 grad_accum=1 가능 (DDP 통신 절반) — 미적용
+- util 73% 일관 유지 (val/patch_util=0.7531)
+
+### Conv receptive field 리크 정량 측정 (`koelectra/leak_test.py`)
+
+`composition_6L_step600000` codec에 대해: vec_i만 남기고 decoder로 이웃 토큰 자모 복원 정확도 측정 (100 문서).
+
+```
+offset    0  : 99.80%   (self-recon 정상)
+offset ±1   : 22~29%    (이웃 자모 일부 복원 가능)
+offset ±2   : ~10.5%    (baseline 수준)
+offset ±3,4 : ~10%      (한국어 자모 sequential prior)
+```
+
+**실제 리크 = ±1에서 12~19pp** (baseline 10% 제외). 이웃 패치의 **자모 1/4~1/3 복원 가능**. 50%+ identity 유출은 아니지만 "blurry context 상단".
+
+### 수렴 관찰 (step 1k~5.6k)
+
+| step | disc_acc | gen_loss | replaced |
+|---|---|---|---|
+| 1000 | 0.903 | 3.16 | 0.185 |
+| 2000 | 0.918 | 2.79 | 0.181 |
+| 3000 | 0.928 | 2.60 | 0.177 |
+| 5000 | 0.933 | 2.30 | 0.165 |
+| 5600 | 0.936 | 2.24 | 0.161 |
+
+**완벽한 대수적 수렴**. 0.94~0.95 plateau 예상.
+
+원 ELECTRA Base는 125k step에서 disc_acc ~85%, KoELECTRA Small v3는 700k step에서 ~88%. 우리는 **5.6k step만에 93.6%** — codec pretrained + leak + jamo-level 낮은 entropy 복합 효과.
+
+### Nash equilibrium 관점: leak의 self-limiting
+
+사용자 가설: Gen이 성숙해 `bear→pear→peer` 급 natural substitution을 만들면 leak 정보가 "힌트이자 함정"으로 작동. Disc가 leak 보고 판정하려 해도 Gen이 leak-consistent한 교체를 만들기 때문에 판별 난이도 자동 증가.
+
+증거:
+- replaced_rate 0.185 → 0.161 감소 = Gen이 점점 원본과 같은 자모 선호 (leak을 복원용으로 활용)
+- gen_loss 2.79 → 2.24 계속 감소 = Gen이 실질 학습 중 (Disc가 쉽게 이기면 gradient 없음)
+- disc_acc 수렴 둔화 = **Gen이 Disc를 견제하는 equilibrium 형성**
+
+완전 leak-dominated라면 disc_acc가 0.99+로 박히고 gen_loss가 급감해야 하는데 그렇지 않음 → **건강한 adversarial 학습**.
+
+### Overfitting 체크 (step 5000)
+
+- train/disc_acc = 0.933
+- val/disc_acc = **0.9377** (train보다 약간 높음)
+- val/gen_loss = 2.16 (train 2.30보다 낮음)
+
+일반화 우려 없음.
+
+### 남은 관찰 포인트
+
+- **10k-50k step**: disc_acc가 0.95 근처 plateau인지, 0.98+ 계속 오르는지 (후자면 leak 과의존 의심)
+- **Gen_loss 수렴점**: 2.0 아래로 내려가는지 (계속 학습 중이면 Nash 성립)
+- **leak_test 재측정**: codec LR×0.1로 학습 중이라 codec 파라미터 변화 작지만 추적 필요
+- **50-100k 체크포인트**: GEC downstream fine-tune으로 실제 표현력 검증 (진짜 판별 기준)
+- **장기 대안**: token-wise independent codec (리크 0%, 사용자 원래 의도) — downstream에서 아쉬우면 codec 재설계 + 재학습 (~2-3일)
+
+### 핵심 커밋
+
+- `e1aff9a` feat: KoELECTRA 파이프라인 초기 구현
+- `c4a0572` feat: torch.compile 지원
+- `684887c` fix: Dynamo 안전장치 (suppress_errors, cache limit)
+- `da78e1c` fix: DDPOptimizer off (dynamic shape 버그 회피 — 이후 static으로 해결되어 revert)
+- `8fadcff` feat: CompositionEncoder fixed_output_len + TF32
+- `8026c9c` feat: patch_util 로깅
+- `6852740` fix: optimize_ddp 기본 ON으로 복귀 (dynamic 때만 OFF)
+- `32a2d84` feat: multi-document packing + special_patch_mask
+- `0b5eeed` feat: leak_test.py
+
+---
