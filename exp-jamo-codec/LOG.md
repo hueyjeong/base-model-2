@@ -1373,3 +1373,39 @@ offset ±3,4 : ~10%      (한국어 자모 sequential prior)
 - `0b5eeed` feat: leak_test.py
 
 ---
+
+### 30k 체크포인트 NSMC 검증 (2026-04-14 심야)
+
+800k 사전학습 중 3.75% 지점(step 30000) 체크포인트의 표현력을 빠르게
+검증. `finetune_nsmc.py`로 Discriminator transformer만 로드 + binary
+head fine-tune.
+
+| Pooling | Test Acc | 참고 |
+|---|---|---|
+| **bos** (첫 patch) | **83.05%** | ELECTRA 관행 (CLS 역할) |
+| mean (valid patch) | 81.91% | Leak 영향 완화 시도 — 오히려 약함 |
+
+비교 baseline:
+- KoELECTRA Small v3 (700k+): 89.6%
+- mBERT:                     87.0%
+- Random:                    50.0%
+
+**해석**:
+- Random(50%) 대비 +33pp → 학습 신호 존재 명확
+- KoELECTRA Small v3 대비 -6.6pp, mBERT 대비 -4.0pp
+- 30k 체크포인트(3.75% 진행)임을 고려하면 건전한 수준
+- BOS pooling이 mean pooling보다 1pp 우세 → pretraining에서 BOS hidden이
+  global context 요약하는 기능 학습됨 (CLS와 유사)
+
+**남은 800k의 학습 효과 추정**:
+- 로그 스케일 가정 시 100k에서 86%, 300k에서 88%, 800k 완료 시 89%대 기대
+- KoELECTRA Small v3 수준 도달 가능
+- Leak 영향 없다면 우리가 역전할 수도 (codec pretrained + multi-doc packing 장점)
+
+**실험 설정**:
+- 2 epoch × batch 64, lr 2e-5, warmup 5%, linear decay, BF16
+- max_patches 128 (NSMC 리뷰 짧음), max_jamo 640
+- 5060Ti에서 약 7분 소요
+
+이후 50k, 100k, 200k 체크포인트에서 재측정해 학습 경과 추적 예정.
+
