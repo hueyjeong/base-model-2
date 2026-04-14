@@ -489,19 +489,27 @@ def main():
         # Dynamo 안전장치:
         # (1) compile 실패 시 조용히 eager로 fallback (학습 중단 방지)
         # (2) 재컴파일 한도 상향 — DDP + dynamic shape 조합에서 쉽게 8을 초과
+        # (3) DDPOptimizer 비활성화 — DDP + dynamic shape 조합에서 inductor가
+        #     서브모듈 경계의 symbolic shape 처리 실패 (PyTorch 알려진 버그):
+        #     `InductorError: AssertionError: For s67 + 1, expected [s67] to have been codegen-ed`
+        #     DDPOptimizer를 끄면 모델을 쪼개지 않고 통째 컴파일 → 회피
         import torch._dynamo as _dynamo  # 함수 스코프 충돌 방지용 별칭
         _dynamo.config.suppress_errors = True
         _dynamo.config.cache_size_limit = 64
         _dynamo.config.accumulated_cache_size_limit = 256
+        if world_size > 1:
+            _dynamo.config.optimize_ddp = False
 
         compile_kwargs = {"mode": args.compile_mode}
         if args.compile_dynamic:
             compile_kwargs["dynamic"] = True
         model = torch.compile(model, **compile_kwargs)
         if is_rank0(rank):
+            ddp_opt = "OFF" if world_size > 1 else "N/A"
             print(f"[Compile] torch.compile 적용 mode={args.compile_mode}"
                   f" dynamic={args.compile_dynamic}"
-                  f" | suppress_errors=True, cache_size_limit=64")
+                  f" | suppress_errors=True, cache_size_limit=64,"
+                  f" optimize_ddp={ddp_opt}")
 
     # ── Optimizer: codec은 lr * codec_lr_ratio ──
     codec_params_list = list(unwrap(model).codec_parameters())
