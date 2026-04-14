@@ -1264,7 +1264,8 @@ Log 6 (커버리지 특화 데이터셋) 결과가 이 전략을 재검토하게
 - **λ = 50.0** (disc_loss + 50 × gen_loss, 원 ELECTRA 논문)
 - **Codec LR = main LR × 0.1** (급변 방지, param_group 분리)
 - **Projection: codec 256 → emb_proj 128 → hidden 256** (Base 확장 호환)
-- **Generator size = 1.0× Discriminator** (아키텍처 비교 목적이라 원 논문 권장 1/4 대신 동일 크기 유지)
+- **Generator size = 1.0× Discriminator** (KoELECTRA Small v3 공식 스펙과 동일 — 원 ELECTRA 논문 권장 1/4가 아닌 KoELECTRA 관행 따름)
+- **학습량·배치·LR도 KoELECTRA Small v3와 동일**: batch 512, 800k step, lr 5e-4 — 아키텍처(CNN codec vs BBPE embedding table) 외 조건이 완전히 같아 공정 비교 가능
 
 ### Multi-document packing (v2)
 
@@ -1386,7 +1387,7 @@ head fine-tune.
 | mean (valid patch) | 81.91% | Leak 영향 완화 시도 — 오히려 약함 |
 
 비교 baseline:
-- KoELECTRA Small v3 (700k+): 89.6%
+- KoELECTRA Small v3 (800k, 동일 조건): 89.6%
 - mBERT:                     87.0%
 - Random:                    50.0%
 
@@ -1408,4 +1409,16 @@ head fine-tune.
 - 5060Ti에서 약 7분 소요
 
 이후 50k, 100k, 200k 체크포인트에서 재측정해 학습 경과 추적 예정.
+
+### 40k 체크포인트 NSMC (pooling=bos, 2 epoch)
+
+- Best Test Acc: **81.56%** (epoch 1: 81.56, epoch 2: 81.45)
+- 30k(83.05%) 대비 **-1.49pp 하락**
+
+**원인 추정**:
+- 40k도 여전히 LR peak 근처 (step 10k 이후 linear decay 구간: 40k에서 peak의 92%)
+- Pretraining 초기에는 downstream transfer가 단조 증가하지 않음 — representation이 흔들리는 시기
+- Codec이 `gen_loss × 50` gradient 받으며 Gen 방향으로 튜닝 중 → Disc 표현력과 일시적 트레이드오프 가능
+
+30k/40k 모두 **"예열 구간"**이고 실제 수렴 판단은 100k+ (LR 20% decay) 이후에 해야 함.
 
