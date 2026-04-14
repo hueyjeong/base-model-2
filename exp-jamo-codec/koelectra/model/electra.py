@@ -250,13 +250,17 @@ class JamoKoElectra(nn.Module):
             disc_logits[valid], replaced[valid].float()
         )
 
-        # Disc 정확도 (로깅용)
+        # Disc 정확도 + 패치 활용률 (로깅용)
         with torch.no_grad():
             disc_pred = disc_logits > 0
             disc_correct = (disc_pred == replaced) & valid
             disc_acc = disc_correct.sum().float() / valid.sum().clamp(min=1).float()
             replaced_rate = (replaced & valid).sum().float() / valid.sum().clamp(min=1).float()
             masked_tokens = gen_target_mask.sum().float()
+            # 패치 활용률: 배치 평균 n_segments / max_patches
+            # 1.0에 가까울수록 transformer가 의미있는 위치에 계산 집중.
+            # 낮으면 (<0.8) padding 위치 계산 낭비가 커서 varlen attention 이득 큼.
+            patch_util = n_segments.float().mean() / float(self.max_patches)
 
         total_loss = disc_loss + self.gen_loss_weight * gen_loss
         return {
@@ -266,6 +270,7 @@ class JamoKoElectra(nn.Module):
             "disc_acc": disc_acc,
             "replaced_rate": replaced_rate,
             "masked_tokens": masked_tokens,
+            "patch_util": patch_util,
         }
 
 

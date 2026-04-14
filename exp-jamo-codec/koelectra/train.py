@@ -290,6 +290,7 @@ def run_validation(model, val_dataset, args, device, amp_dtype, rank, world_size
     disc_sum = torch.zeros(1, device=device)
     total_sum = torch.zeros(1, device=device)
     acc_sum = torch.zeros(1, device=device)
+    util_sum = torch.zeros(1, device=device)
     count = torch.zeros(1, device=device)
 
     for i, batch in enumerate(loader):
@@ -312,6 +313,7 @@ def run_validation(model, val_dataset, args, device, amp_dtype, rank, world_size
         disc_sum += out["disc_loss"].detach().float()
         total_sum += out["total_loss"].detach().float()
         acc_sum += out["disc_acc"].detach().float()
+        util_sum += out["patch_util"].detach().float()
         count += 1.0
 
     if world_size > 1:
@@ -319,6 +321,7 @@ def run_validation(model, val_dataset, args, device, amp_dtype, rank, world_size
         dist.all_reduce(disc_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(acc_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(util_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(count, op=dist.ReduceOp.SUM)
 
     count = count.clamp(min=1)
@@ -328,6 +331,7 @@ def run_validation(model, val_dataset, args, device, amp_dtype, rank, world_size
         "val/disc_loss": (disc_sum / count).item(),
         "val/total_loss": (total_sum / count).item(),
         "val/disc_acc": (acc_sum / count).item(),
+        "val/patch_util": (util_sum / count).item(),
     }
 
 
@@ -579,6 +583,7 @@ def main():
     acc_acc = 0.0
     acc_rep = 0.0
     acc_mask = 0.0
+    acc_util = 0.0
     acc_count = 0
     last_log_step = global_step
 
@@ -625,6 +630,7 @@ def main():
             acc_acc += out["disc_acc"].detach().float().item()
             acc_rep += out["replaced_rate"].detach().float().item()
             acc_mask += out["masked_tokens"].detach().float().item()
+            acc_util += out["patch_util"].detach().float().item()
             acc_count += 1
 
         # Optimizer step
@@ -653,6 +659,7 @@ def main():
                    f"disc_acc {acc_acc/n:.3f} | "
                    f"rep {acc_rep/n:.3f} | "
                    f"mtok {acc_mask/n:.0f} | "
+                   f"util {acc_util/n:.3f} | "
                    f"lr_m {lr_main:.2e} | lr_c {lr_codec:.2e} | "
                    f"{steps_per_s:.2f} step/s")
             if device.type == "cuda":
@@ -664,7 +671,7 @@ def main():
                 log_file.flush()
             t0 = time.time()
             last_log_step = global_step
-            acc_total = acc_gen = acc_disc = acc_acc = acc_rep = acc_mask = 0.0
+            acc_total = acc_gen = acc_disc = acc_acc = acc_rep = acc_mask = acc_util = 0.0
             acc_count = 0
 
         # ── Validation ──
