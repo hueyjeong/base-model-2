@@ -85,6 +85,9 @@ class BBPEJamoDataset(IterableDataset):
         # 첫 epoch 후 cache hit 100% 근접. DataLoader worker마다 별도 cache
         # (fork 시 copy-on-write; Python ref count로 실제 복사될 수 있지만 ~15MB).
         self._tok_cache: dict = {}
+        # encode를 문서 단위가 아닌 batch로 묶어서 Rust parallel encode 활용
+        # (측정: one-by-one 0.84ms/doc → batch 0.10ms/doc = 8.3x)
+        self.encode_batch_size = 64
 
     def _iter_texts(self, resume_row: int = 0):
         """파일에서 텍스트 스트리밍
@@ -158,13 +161,8 @@ class BBPEJamoDataset(IterableDataset):
                         yield abs_line, text
                     abs_line += 1
 
-    def _tokenize_and_decompose(self, text: str) -> List[List[int]]:
-        """텍스트 → BBPE 토큰화 → 각 토큰 자모 분해 (캐시 사용).
-
-        - encode는 문서 단위 1회 호출 (Rust 구현 그대로 빠름)
-        - decode + decompose는 토큰마다 반복되므로 token_id별 cache로 가속
-        """
-        bbpe_ids = self.bbpe.encode(text, add_special_tokens=False)
+    def _decompose_ids(self, bbpe_ids: List[int]) -> List[List[int]]:
+        """BBPE 토큰 ID 리스트 → 각 토큰 자모 분해 (cache 사용)."""
         cache = self._tok_cache
         jamo_seqs = []
         for tid in bbpe_ids:
@@ -193,6 +191,14 @@ class BBPEJamoDataset(IterableDataset):
                 cache[tid] = entry
             jamo_seqs.extend(entry)
         return jamo_seqs
+
+    def _tokenize_and_decompose(self, text: str) -> List[List[int]]:
+        """텍스트 → BBPE 토큰화 → 각 토큰 자모 분해. (단일 문서 경로, 테스트용)
+
+        본학습 loop는 encode_batch를 쓰는 __iter__ 경로로 호출.
+        """
+        bbpe_ids = self.bbpe.encode(text, add_special_tokens=False)
+        return self._decompose_ids(bbpe_ids)
 
     def _build_sample(self, buffer_jamo, buffer_segs, buffer_special, n_segments):
         """buffer 내용으로 샘플 텐서 구축 (multi-document packing 경로).
@@ -238,6 +244,35 @@ class BBPEJamoDataset(IterableDataset):
         self._resume_line = state.get("line_counter", 0)
         self._line_counter = self._resume_line
 
+    def _iter_encoded_texts(self, resume_row: int, resume_line: int,
+                             total_workers: int, global_worker_id: int):
+        """interleaved text stream을 batch로 묶어 BBPE encode(Rust parallel) 후 하나씩 yield.
+
+        worker별 interleaving 필터를 여기서 적용해 batch encode의 처리량을 극대화.
+        (문서 하나씩 encode보다 8배 빠름).
+        """
+        encode_bs = self.encode_batch_size
+        buf_abs: List[int] = []
+        buf_text: List[str] = []
+        for abs_line, text in self._iter_texts(resume_row=resume_row):
+            # DDP × Worker interleaving — 문서 단위
+            if abs_line % total_workers != global_worker_id:
+                continue
+            if abs_line < resume_line:
+                continue
+            buf_abs.append(abs_line)
+            buf_text.append(text)
+            if len(buf_text) >= encode_bs:
+                encoded = self.bbpe(buf_text, add_special_tokens=False)["input_ids"]
+                for a, ids in zip(buf_abs, encoded):
+                    yield a, ids
+                buf_abs = []
+                buf_text = []
+        if buf_text:
+            encoded = self.bbpe(buf_text, add_special_tokens=False)["input_ids"]
+            for a, ids in zip(buf_abs, encoded):
+                yield a, ids
+
     def __iter__(self):
         """Multi-document packing: [BOS]문서1[EOS][BOS]문서2[EOS]...를 상한까지 이어붙여 yield.
 
@@ -272,16 +307,12 @@ class BBPEJamoDataset(IterableDataset):
         while True:
             resume_row = resume_line if first_epoch and resume_line > 0 else 0
 
-            for abs_line, text in self._iter_texts(resume_row=resume_row):
-                # DDP × Worker interleaving — 문서 단위
-                if abs_line % total_workers != global_worker_id:
-                    continue
-                if abs_line < resume_line:
-                    continue
-
+            for abs_line, bbpe_ids in self._iter_encoded_texts(
+                resume_row, resume_line, total_workers, global_worker_id
+            ):
                 self._line_counter = abs_line + 1
 
-                doc_jamo_seqs = self._tokenize_and_decompose(text)
+                doc_jamo_seqs = self._decompose_ids(bbpe_ids)
                 if not doc_jamo_seqs:
                     continue
 
