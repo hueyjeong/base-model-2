@@ -145,11 +145,48 @@ def _worker_init(model_id: str, base_path: str):
 
 
 def _worker_tokenize_batch(args):
-    """배치 단위 토큰화 — 각 프로세스에서 실행"""
-    texts, max_seq_len, max_jamo_per_token, model_id, base_path = args
+    """배치 단위 토큰화 — 각 프로세스에서 실행.
+
+    학습 포맷과 동일:
+    - fixed_slot=True 면 각 segment 를 max_jamo_per_token 슬롯으로 padding
+    - BOS/EOS 를 segment 로 감싸기 (특수 bbpe_id 는 bbpe_pad_id)
+    - jamo_mask 는 유효 segment 가 차지하는 전체 범위(intra-PAD 포함)에서 True
+
+    fixed_slot=False and append_pad_slot=True → 각 segment 끝에 JAMO_PAD 1슬롯 추가.
+    fixed_slot=False and append_pad_slot=False → 기존(가변 길이) 동작.
+    """
+    (texts, max_seq_len, max_jamo_per_token, model_id, base_path,
+     fixed_slot, append_pad_slot, jamo_bos, jamo_eos, jamo_pad,
+     bbpe_pad_id) = args
     global _bbpe_tok, _jamo_encode
     if _bbpe_tok is None:
         _worker_init(model_id, base_path)
+
+    # fixed_slot 와 append_pad_slot 동시 True 인 경우 학습 규칙(fixed_slot 우선) 따름
+    if fixed_slot and append_pad_slot:
+        append_pad_slot = False
+
+    def _seg_cost(seq):
+        if fixed_slot:
+            return max_jamo_per_token
+        return len(seq) + (1 if append_pad_slot else 0)
+
+    def _extend_seg(all_jamo, seg_ids, all_bbpe, seq, seg_idx, bbpe_id):
+        """한 segment 를 버퍼에 추가 (fixed_slot 이면 32 슬롯으로 padding)."""
+        if fixed_slot:
+            seq_t = list(seq[:max_jamo_per_token])
+            pad_n = max_jamo_per_token - len(seq_t)
+            all_jamo.extend(seq_t + [jamo_pad] * pad_n)
+            seg_ids.extend([seg_idx] * max_jamo_per_token)
+            all_bbpe.extend([bbpe_id] * max_jamo_per_token)
+        else:
+            all_jamo.extend(seq)
+            seg_ids.extend([seg_idx] * len(seq))
+            all_bbpe.extend([bbpe_id] * len(seq))
+            if append_pad_slot:
+                all_jamo.append(jamo_pad)
+                seg_ids.append(seg_idx)
+                all_bbpe.append(bbpe_id)
 
     results = []
     for text in texts:
@@ -180,15 +217,32 @@ def _worker_tokenize_batch(args):
 
         all_jamo = []
         seg_ids = []
-        all_bbpe = []  # 각 자모 위치의 원본 BBPE 토큰 ID
+        all_bbpe = []
         seg_idx = 0
+
+        # 학습과 동일하게 [BOS] + 토큰 segments + [EOS] 로 문서 감싸기
+        # EOS 자리를 먼저 reserve 후 중간 토큰 채우고, 마지막에 EOS 추가
+        bos_cost = _seg_cost([jamo_bos])
+        eos_cost = _seg_cost([jamo_eos])
+
+        # BOS 추가 (예산 부족이면 아무것도 못 넣음)
+        if bos_cost + eos_cost > max_seq_len:
+            results.append(None)
+            continue
+
+        _extend_seg(all_jamo, seg_ids, all_bbpe, [jamo_bos], seg_idx, bbpe_pad_id)
+        seg_idx += 1
+
+        # 중간 토큰들: EOS 자리 남기고 채움
         for i, seq in enumerate(jamo_seqs):
-            if len(all_jamo) + len(seq) > max_seq_len:
+            if len(all_jamo) + _seg_cost(seq) + eos_cost > max_seq_len:
                 break
-            all_jamo.extend(seq)
-            seg_ids.extend([seg_idx] * len(seq))
-            all_bbpe.extend([bbpe_for_seq[i]] * len(seq))
+            _extend_seg(all_jamo, seg_ids, all_bbpe, seq, seg_idx, bbpe_for_seq[i])
             seg_idx += 1
+
+        # EOS 추가
+        _extend_seg(all_jamo, seg_ids, all_bbpe, [jamo_eos], seg_idx, bbpe_pad_id)
+        seg_idx += 1
 
         L = len(all_jamo)
         if L == 0:
@@ -197,11 +251,11 @@ def _worker_tokenize_batch(args):
 
         pad_len = max_seq_len - L
         results.append({
-            "jamo_ids": all_jamo + [0] * pad_len,
+            "jamo_ids": all_jamo + [jamo_pad] * pad_len,
             "mask": [True] * L + [False] * pad_len,
             "seg_ids": seg_ids + [0] * pad_len,
             "n_segments": seg_idx,
-            "bbpe_ids": all_bbpe + [0] * pad_len,
+            "bbpe_ids": all_bbpe + [bbpe_pad_id] * pad_len,
         })
     return results
 
@@ -243,11 +297,19 @@ def _read_texts(file_paths, text_key: str = "text", min_length: int = 10):
 
 
 def _pre_tokenize_mp(texts: List[str], max_seq_len: int, max_jamo_per_token: int,
-                     n_workers: int, chunk_size: int, model_id: str, base_path: str):
+                     n_workers: int, chunk_size: int, model_id: str, base_path: str,
+                     fixed_slot: bool = False, append_pad_slot: bool = False,
+                     jamo_bos: int = 2, jamo_eos: int = 3, jamo_pad: int = 0,
+                     bbpe_pad_id: int = 0):
     """멀티프로세스 토큰화"""
     batches = []
     for i in range(0, len(texts), chunk_size):
-        batches.append((texts[i:i + chunk_size], max_seq_len, max_jamo_per_token, model_id, base_path))
+        batches.append((
+            texts[i:i + chunk_size], max_seq_len, max_jamo_per_token,
+            model_id, base_path,
+            fixed_slot, append_pad_slot, jamo_bos, jamo_eos, jamo_pad,
+            bbpe_pad_id,
+        ))
 
     print(f"전처리: {len(batches)}배치 × {n_workers}워커, 청크={chunk_size}", flush=True)
 
@@ -350,6 +412,12 @@ def main():
     parser.add_argument("--chunk_size", type=int, default=100000,
                         help="청크 크기 (한 번에 토큰화+추론할 샘플 수, 메모리 절약용)")
     parser.add_argument("--compile", action="store_true", help="torch.compile 적용")
+    parser.add_argument("--force_variable", action="store_true",
+                        help="체크포인트의 fixed_slot 설정을 무시하고 가변 길이로 토큰화 "
+                             "(BOS/EOS 래핑은 유지). fixed_slot=True 로 학습된 모델에는 "
+                             "학습 분포 밖이므로 정확도 저하 예상 — 실험/진단용.")
+    parser.add_argument("--force_append_pad", action="store_true",
+                        help="가변 + 세그먼트 끝 PAD 1슬롯 모드로 강제 (append_pad_slot=True).")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -372,10 +440,42 @@ def main():
     d = saved_args.get("d_model", 256)
     nl = saved_args.get("n_layers", 5)
     k = saved_args.get("kernel_size", 7)
+    seg_masked = saved_args.get("segment_masked", False)
+    parallel_decoder = saved_args.get("parallel_decoder", False)
+    decoder_layers = saved_args.get("decoder_layers", 2)
+    decoder_heads = saved_args.get("decoder_heads", 4)
+    max_jpt = saved_args.get("max_jamo_per_token", 32)
+    fixed_slot = saved_args.get("fixed_slot", False)
+    append_pad_slot = saved_args.get("append_pad_slot", False)
+    # --force_variable: 학습 설정 무시하고 가변 길이로 실험 (BOS/EOS 는 유지)
+    if args.force_variable:
+        print("[WARNING] --force_variable: fixed_slot/append_pad_slot 을 False 로 강제. "
+              "학습 분포 밖이므로 정확도 저하 가능.")
+        fixed_slot = False
+        append_pad_slot = False
+    if args.force_append_pad:
+        print("[WARNING] --force_append_pad: fixed_slot=False, append_pad_slot=True 로 강제.")
+        fixed_slot = False
+        append_pad_slot = True
+    # fixed_output_len: 학습과 동일하게 fixed_slot=True 에서는 고정값 사용
+    fixed_output_len = None
+    if fixed_slot:
+        # 학습과 동일한 공식: max_seq_len // max_jamo_per_token
+        # 학습 시 max_seq_len 을 saved_args 에서 읽어 결정 (eval args.max_seq_len 과 다를 수 있음)
+        trained_max_seq = saved_args.get("max_seq_len", args.max_seq_len)
+        fixed_output_len = trained_max_seq // max_jpt
 
     codec = CompositionCodec(
         jamo_vocab=jamo.vocab_size, d_model=d, n_layers=nl, kernel_size=k,
+        segment_masked=seg_masked,
+        parallel_decoder=parallel_decoder,
+        decoder_layers=decoder_layers,
+        decoder_heads=decoder_heads,
+        max_jamo_per_token=max_jpt,
+        fixed_output_len=fixed_output_len,
     ).to(device)
+    print(f"fixed_slot={fixed_slot}, append_pad_slot={append_pad_slot}, "
+          f"fixed_output_len={fixed_output_len}, max_jamo_per_token={max_jpt}")
 
     sd = ckpt["model"]
     prefix = "_orig_mod."
@@ -420,15 +520,22 @@ def main():
     import queue as _queue
     import threading
 
+    # BBPE pad id (특수 segment 용 sentinel)
+    bbpe_pad_id = bbpe_tok.pad_token_id if bbpe_tok.pad_token_id is not None else 0
+
     def _tok_worker(texts, chunk_size, tokenized_q):
         """백그라운드 토큰화 스레드 (청크 분할도 여기서)"""
         for i in range(0, len(texts), chunk_size):
             chunk = texts[i:i + chunk_size]
             t1 = time.time()
             ds = _pre_tokenize_mp(
-                chunk, args.max_seq_len, max_jamo_per_token=32,
+                chunk, args.max_seq_len, max_jamo_per_token=max_jpt,
                 n_workers=args.n_workers, chunk_size=256,
-                model_id=model_id, base_path=base_path)
+                model_id=model_id, base_path=base_path,
+                fixed_slot=fixed_slot, append_pad_slot=append_pad_slot,
+                jamo_bos=2, jamo_eos=3, jamo_pad=0,
+                bbpe_pad_id=bbpe_pad_id,
+            )
             tokenized_q.put((ds, len(chunk), time.time() - t1))
 
     tokenized_q = _queue.Queue(maxsize=1)
