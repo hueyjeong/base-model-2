@@ -5,7 +5,7 @@ export PYTHONUNBUFFERED=1
 
 CORPUS="${CORPUS:-corpus/train.parquet}"
 TEXT_KEY="text"
-MAX_STEPS=600000
+MAX_STEPS="${MAX_STEPS:-600000}"
 # 재개/초기화 옵션 (환경변수로 전달)
 # RESUME: 전체 상태 복원 (모델+옵티마이저+스케줄러+데이터)
 #   예) RESUME=exp-jamo-codec/checkpoints/composition_6L_step110000.pt bash run_composition_train.sh
@@ -13,16 +13,21 @@ MAX_STEPS=600000
 #   예) INIT_FROM=exp-jamo-codec/checkpoints/composition_6L_step110000.pt bash run_composition_train.sh
 RESUME="${RESUME:-}"
 INIT_FROM="${INIT_FROM:-}"
-BATCH_SIZE=512
-SEQ_LEN=2048
-D_MODEL=256
-N_LAYERS=6
-KERNEL=7
-LR=3e-4
-WARMUP=2000
-LOG_EVERY=1000
-SAVE_EVERY=10000
-OUT="exp-jamo-codec/checkpoints"
+# SEQ_LEN을 크게 두면 "문서 경계에서 자연 flush" 동작.
+# append_pad_slot으로 자모 수가 늘어나도 억지 flush 발생 안 함.
+# 토큰 처리량 유지하려 BATCH_SIZE 절반 (256×4096 = 기존 512×2048과 동일).
+BATCH_SIZE="${BATCH_SIZE:-256}"
+SEQ_LEN="${SEQ_LEN:-4096}"
+D_MODEL="${D_MODEL:-256}"
+N_LAYERS="${N_LAYERS:-6}"
+KERNEL="${KERNEL:-7}"
+LR="${LR:-3e-4}"
+WARMUP="${WARMUP:-2000}"
+LOG_EVERY="${LOG_EVERY:-1000}"
+SAVE_EVERY="${SAVE_EVERY:-10000}"
+NUM_WORKERS="${NUM_WORKERS:-16}"
+COMPILE_FLAG="${COMPILE_FLAG:---compile}"
+OUT="${OUT:-exp-jamo-codec/checkpoints}"
 GDRIVE="${GDRIVE:-}"  # rclone 원격지 (예: gdrive:base-model-2-ckpts/composition)
 
 echo "=== CompositionCodec 본학습 ==="
@@ -35,8 +40,31 @@ echo "Save every: ${SAVE_EVERY}, GDrive: ${GDRIVE:-none}"
 echo ""
 
 VAL_CORPUS="${VAL_CORPUS:-corpus/val.parquet}"
-VAL_EVERY=5000
-VAL_SAMPLES=10000
+VAL_EVERY="${VAL_EVERY:-5000}"
+VAL_SAMPLES="${VAL_SAMPLES:-10000}"
+
+# SEG_MASKED=1 → 토큰 경계 차단 conv (리크 0)
+# PAD_SLOT=1 → 각 segment 끝에 PAD 1개 추가 (가변, 일반화 약함)
+# FIXED_SLOT=1 → 모든 segment를 MAX_JAMO_PER_TOKEN 슬롯으로 고정 (decode_from_vec 완벽)
+# MAX_JAMO_PER_TOKEN: fixed_slot 시 토큰당 슬롯 수 (기본 16)
+SEG_MASKED_FLAG=""
+[ -n "${SEG_MASKED}" ] && SEG_MASKED_FLAG="--segment_masked"
+PAD_SLOT_FLAG=""
+[ -n "${PAD_SLOT}" ] && PAD_SLOT_FLAG="--append_pad_slot"
+FIXED_SLOT_FLAG=""
+[ -n "${FIXED_SLOT}" ] && FIXED_SLOT_FLAG="--fixed_slot"
+MAX_JAMO_FLAG=""
+[ -n "${MAX_JAMO_PER_TOKEN}" ] && MAX_JAMO_FLAG="--max_jamo_per_token ${MAX_JAMO_PER_TOKEN}"
+PARALLEL_DEC_FLAG=""
+[ -n "${PARALLEL_DECODER}" ] && PARALLEL_DEC_FLAG="--parallel_decoder"
+DEC_LAYERS_FLAG=""
+[ -n "${DECODER_LAYERS}" ] && DEC_LAYERS_FLAG="--decoder_layers ${DECODER_LAYERS}"
+DEC_HEADS_FLAG=""
+[ -n "${DECODER_HEADS}" ] && DEC_HEADS_FLAG="--decoder_heads ${DECODER_HEADS}"
+[ -n "${SEG_MASKED}" ] && echo "segment_masked: ON (conv 토큰 경계 차단)"
+[ -n "${PAD_SLOT}" ] && echo "append_pad_slot: ON (segment당 PAD 1개 추가)"
+[ -n "${FIXED_SLOT}" ] && echo "fixed_slot: ON (모든 토큰 ${MAX_JAMO_PER_TOKEN:-32} 슬롯 고정)"
+[ -n "${PARALLEL_DECODER}" ] && echo "parallel_decoder: ON (self-attn ${DECODER_LAYERS:-2}L, encoder 가변 유지)"
 
 torchrun --nproc_per_node=${NGPU:-4} exp-jamo-codec/train_composition.py \
   --corpus ${CORPUS} --text_key ${TEXT_KEY} \
@@ -44,10 +72,12 @@ torchrun --nproc_per_node=${NGPU:-4} exp-jamo-codec/train_composition.py \
   --max_seq_len ${SEQ_LEN} \
   --batch_size ${BATCH_SIZE} --max_steps ${MAX_STEPS} \
   --lr ${LR} --warmup_steps ${WARMUP} \
-  --bf16 --compile --num_workers 16 \
+  --bf16 ${COMPILE_FLAG} --num_workers ${NUM_WORKERS} \
   --log_every ${LOG_EVERY} --save_every ${SAVE_EVERY} \
   --val_corpus ${VAL_CORPUS} --val_every ${VAL_EVERY} --val_samples ${VAL_SAMPLES} \
   --out_dir ${OUT} \
+  ${SEG_MASKED_FLAG} ${PAD_SLOT_FLAG} ${FIXED_SLOT_FLAG} ${MAX_JAMO_FLAG} \
+  ${PARALLEL_DEC_FLAG} ${DEC_LAYERS_FLAG} ${DEC_HEADS_FLAG} \
   ${RESUME:+--resume ${RESUME}} \
   ${INIT_FROM:+--init_from ${INIT_FROM}} \
   2>&1 | tee exp-jamo-codec/composition_train_log.txt

@@ -42,6 +42,10 @@ def validate(codec, val_loader, device, max_samples=1000):
     n_batches = 0
     n_samples = 0
 
+    raw_codec = codec.module if hasattr(codec, "module") else codec
+    raw_codec = raw_codec._orig_mod if hasattr(raw_codec, "_orig_mod") else raw_codec
+    is_parallel = getattr(raw_codec, "parallel_decoder", False)
+
     for batch in val_loader:
         jamo_ids = batch["jamo_ids"].to(device)
         jamo_mask = batch["jamo_mask"].to(device)
@@ -49,11 +53,18 @@ def validate(codec, val_loader, device, max_samples=1000):
         n_segments = batch["n_segments"].to(device)
 
         out = codec(jamo_ids, jamo_mask, segment_ids, n_segments)
-        pred = out["logits"].argmax(dim=-1)
-
-        valid = jamo_mask
-        total_correct += ((pred == jamo_ids) & valid).sum().item()
-        total_jamo += valid.sum().item()
+        if is_parallel:
+            # logits: [B, P, S, V], target_slot: [B, P, S], slot_loss_mask: [B, P, S]
+            pred = out["logits"].argmax(dim=-1)  # [B, P, S]
+            target_slot = out["target_slot"]
+            slot_mask = out["slot_loss_mask"]
+            total_correct += ((pred == target_slot) & slot_mask).sum().item()
+            total_jamo += slot_mask.sum().item()
+        else:
+            pred = out["logits"].argmax(dim=-1)
+            valid = jamo_mask
+            total_correct += ((pred == jamo_ids) & valid).sum().item()
+            total_jamo += valid.sum().item()
         total_loss += out["loss"].item()
         n_batches += 1
         n_samples += jamo_ids.size(0)
@@ -68,6 +79,11 @@ def validate(codec, val_loader, device, max_samples=1000):
 
 
 def train(args):
+    # TF32 허용 (Ampere+ GPU에서 matmul 속도 향상; bf16 autocast와 별개로 f32 경로 가속)
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
     # DDP 초기화
     is_distributed = "RANK" in os.environ
     if is_distributed:
@@ -97,6 +113,11 @@ def train(args):
         n_layers=args.n_layers,
         kernel_size=args.kernel_size,
         dropout=args.dropout,
+        segment_masked=args.segment_masked,
+        max_jamo_per_token=args.max_jamo_per_token,
+        parallel_decoder=args.parallel_decoder,
+        decoder_layers=args.decoder_layers,
+        decoder_heads=args.decoder_heads,
     ).to(device)
 
     n_params = sum(p.numel() for p in codec.parameters())
@@ -121,9 +142,12 @@ def train(args):
         bbpe_tokenizer=bbpe,
         jamo_tokenizer=jamo,
         max_seq_len=args.max_seq_len,
+        max_jamo_per_token=args.max_jamo_per_token,
         text_key=args.text_key,
         rank=rank,
         world_size=world_size,
+        append_pad_slot=args.append_pad_slot,
+        fixed_slot=args.fixed_slot,
     )
     loader = DataLoader(
         dataset,
@@ -140,7 +164,10 @@ def train(args):
             bbpe_tokenizer=bbpe,
             jamo_tokenizer=jamo,
             max_seq_len=args.max_seq_len,
+            max_jamo_per_token=args.max_jamo_per_token,
             text_key=args.text_key,
+            append_pad_slot=args.append_pad_slot,
+            fixed_slot=args.fixed_slot,
         )
         val_loader = DataLoader(val_dataset, batch_size=args.batch_size, num_workers=0)
 
@@ -267,10 +294,16 @@ def train(args):
 
         # 통계
         with torch.no_grad():
-            pred = out["logits"].argmax(dim=-1)  # [B, L]
-            valid = jamo_mask
-            correct = ((pred == jamo_ids) & valid).sum().item()
-            total = valid.sum().item()
+            pred = out["logits"].argmax(dim=-1)  # conv decoder: [B,L] / parallel: [B,P,S]
+            if "target_slot" in out:
+                target_slot = out["target_slot"]
+                slot_mask = out["slot_loss_mask"]
+                correct = ((pred == target_slot) & slot_mask).sum().item()
+                total = slot_mask.sum().item()
+            else:
+                valid = jamo_mask
+                correct = ((pred == jamo_ids) & valid).sum().item()
+                total = valid.sum().item()
 
         accum_loss += loss.item() * grad_accum
         accum_correct += correct
@@ -391,6 +424,22 @@ def main():
     parser.add_argument("--n_layers", type=int, default=5)
     parser.add_argument("--kernel_size", type=int, default=7)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--segment_masked", action="store_true",
+                        help="Conv가 토큰 경계를 못 넘도록 segment mask 적용 (리크 0)")
+    parser.add_argument("--append_pad_slot", action="store_true",
+                        help="각 segment 끝에 PAD 슬롯 1개 추가 (decoder가 PAD 출력 학습)")
+    parser.add_argument("--fixed_slot", action="store_true",
+                        help="모든 segment를 max_jamo_per_token 슬롯으로 고정 (decode_from_vec 완벽 대응)")
+    parser.add_argument("--max_jamo_per_token", type=int, default=32,
+                        help="토큰당 자모 슬롯 수 상한 (fixed_slot/parallel_decoder 시 정확히 이 값)")
+    parser.add_argument("--parallel_decoder", action="store_true",
+                        help="Decoder를 ParallelSlotDecoder(self-attention 2L)로 교체. "
+                             "Encoder는 가변 입력 유지, decoder만 max_jamo_per_token 슬롯 학습. "
+                             "Downstream encoder-only 경로 영향 없음")
+    parser.add_argument("--decoder_layers", type=int, default=2,
+                        help="ParallelSlotDecoder transformer layer 수")
+    parser.add_argument("--decoder_heads", type=int, default=4,
+                        help="ParallelSlotDecoder transformer head 수")
 
     # 학습
     parser.add_argument("--batch_size", type=int, default=32)

@@ -35,6 +35,7 @@ def run_leak_test(
     n_samples: int = 100,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     offsets: tuple = (-4, -3, -2, -1, 0, 1, 2, 3, 4),
+    segment_masked: bool = False,
 ):
     """Codec에서 이웃 토큰 리크 측정.
 
@@ -51,10 +52,12 @@ def run_leak_test(
     enc = CompositionEncoder(
         jamo_vocab=330, d_model=256, n_layers=6, kernel_size=7,
         dropout=0.0, max_jamo_per_token=32,
+        segment_masked=segment_masked,
     ).to(device)
     dec = CompositionDecoder(
         jamo_vocab=330, d_model=256, n_layers=6, kernel_size=7,
         dropout=0.0, max_jamo_per_token=32,
+        segment_masked=segment_masked,
     ).to(device)
 
     ckpt = torch.load(codec_ckpt, map_location=device, weights_only=False)
@@ -167,5 +170,8 @@ if __name__ == "__main__":
                     default="exp-jamo-codec/checkpoints/composition_6L_step600000.pt")
     ap.add_argument("--parquet", type=str, default="corpus/jamo-codec-v3/val.parquet")
     ap.add_argument("--n_samples", type=int, default=100)
+    ap.add_argument("--segment_masked", action="store_true",
+                    help="새 codec 구조 (토큰 경계 차단 conv)로 로드")
     args = ap.parse_args()
-    run_leak_test(args.codec_ckpt, args.parquet, args.n_samples)
+    run_leak_test(args.codec_ckpt, args.parquet, args.n_samples,
+                  segment_masked=args.segment_masked)

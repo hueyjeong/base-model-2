@@ -55,6 +55,8 @@ class BBPEJamoDataset(IterableDataset):
         rank: int = 0,
         world_size: int = 1,
         max_patches: int = None,
+        append_pad_slot: bool = False,
+        fixed_slot: bool = False,
     ):
         self.file_paths = [file_paths] if isinstance(file_paths, str) else list(file_paths)
         self.bbpe = bbpe_tokenizer
@@ -66,6 +68,15 @@ class BBPEJamoDataset(IterableDataset):
         self.rank = rank
         self.world_size = world_size
         self.max_patches = max_patches  # BBPE 토큰(패치) 수 상한 — None이면 자모 길이만 제한
+        # 각 세그먼트 끝에 JAMO_PAD 1개를 추가해 decoder가 "PAD 출력"을 학습하게 함
+        # (codec 단독 추론에서 PAD 조기 종료 용도)
+        # append_pad_slot=True:  seg 끝에 +1 PAD (가변 길이, decoder 일반화 약함)
+        # fixed_slot=True:       모든 seg를 max_jamo_per_token으로 padding (decode_from_vec 완벽 대응)
+        self.append_pad_slot = append_pad_slot
+        self.fixed_slot = fixed_slot
+        if fixed_slot and append_pad_slot:
+            # fixed_slot이 우선 (각 seg를 max_jamo_per_token으로 pad → +1 PAD 무의미)
+            self.append_pad_slot = False
         self._line_counter = 0
         self._resume_line = 0
 
@@ -184,8 +195,9 @@ class BBPEJamoDataset(IterableDataset):
         jamo_mask = torch.tensor([True] * L + [False] * pad_len, dtype=torch.bool)
         segment_ids = torch.tensor(buffer_segs + [0] * pad_len, dtype=torch.long)
 
-        # special_patch_mask: [max_patches] (또는 n_segments, max_patches None이면 후자)
-        P = self.max_patches if self.max_patches is not None else n_segments
+        # special_patch_mask: 고정 크기 필요 (배치 stack용).
+        # max_patches 지정 시 그 값, 아니면 max_seq_len(자모 수는 항상 패치 수 ≥)을 상한으로 사용.
+        P = self.max_patches if self.max_patches is not None else self.max_seq_len
         spec = buffer_special + [False] * (P - n_segments)
         special_patch_mask = torch.tensor(spec[:P], dtype=torch.bool)
 
@@ -262,8 +274,14 @@ class BBPEJamoDataset(IterableDataset):
                     + [(seq, False) for seq in doc_jamo_seqs]
                     + [([JAMO_EOS], True)]
                 )
-                doc_total_jamo = sum(len(s) for s, _ in doc_segments)
                 doc_n_segs = len(doc_segments)
+                if self.fixed_slot:
+                    # 모든 segment를 max_jamo_per_token 슬롯으로 고정
+                    doc_total_jamo = doc_n_segs * self.max_jamo_per_token
+                else:
+                    doc_total_jamo = sum(len(s) for s, _ in doc_segments)
+                    if self.append_pad_slot:
+                        doc_total_jamo += doc_n_segs  # 각 segment 끝에 PAD 1개 추가
 
                 # 단일 문서가 상한을 초과하면 truncate해서 단독 샘플로 처리
                 # (EOS 포함 위해 뒤에서부터 자름)
@@ -296,8 +314,19 @@ class BBPEJamoDataset(IterableDataset):
 
                 # 문서 통째 buffer에 추가 (BOS..EOS 정합성 유지)
                 for seq, is_special in doc_segments:
-                    buf_jamo.extend(seq)
-                    buf_segs.extend([seg_idx] * len(seq))
+                    if self.fixed_slot:
+                        # 각 segment를 max_jamo_per_token 슬롯으로 padding
+                        seq_t = list(seq[:self.max_jamo_per_token])
+                        pad_n = self.max_jamo_per_token - len(seq_t)
+                        seq_t = seq_t + [JAMO_PAD] * pad_n
+                        buf_jamo.extend(seq_t)
+                        buf_segs.extend([seg_idx] * self.max_jamo_per_token)
+                    else:
+                        buf_jamo.extend(seq)
+                        buf_segs.extend([seg_idx] * len(seq))
+                        if self.append_pad_slot:
+                            buf_jamo.append(JAMO_PAD)
+                            buf_segs.append(seg_idx)
                     buf_special.append(is_special)
                     seg_idx += 1
 
@@ -323,34 +352,54 @@ class BBPEJamoDataset(IterableDataset):
         max_L = self.max_seq_len
         max_P = self.max_patches
 
-        # [BOS] 추가 (무조건)
-        bos_seq, bos_sp = doc_segments[0]
-        buf_jamo.extend(bos_seq)
-        buf_segs.extend([seg_idx] * len(bos_seq))
-        buf_special.append(bos_sp)
-        seg_idx += 1
+        # 각 segment에 추가되는 자모 수
+        if self.fixed_slot:
+            slot_size = self.max_jamo_per_token  # 모든 seg가 이 크기
+        elif self.append_pad_slot:
+            slot_size = None  # 가변 (len(seq)+1)
+        else:
+            slot_size = None  # 가변 (len(seq))
 
-        # 중간 토큰들: [EOS] 자리 남겨두고 채움 (마지막 segment가 [EOS])
-        eos_seq, eos_sp = doc_segments[-1]
-        reserve_jamo = len(eos_seq)
-        reserve_seg = 1
-        for seq, is_sp in doc_segments[1:-1]:
-            if len(buf_jamo) + len(seq) + reserve_jamo > max_L:
-                break
-            if max_P is not None and seg_idx + reserve_seg >= max_P:
-                break
-            buf_jamo.extend(seq)
-            buf_segs.extend([seg_idx] * len(seq))
+        def _add_seg(seq, is_sp):
+            nonlocal seg_idx
+            if self.fixed_slot:
+                seq_t = list(seq[:self.max_jamo_per_token])
+                pad_n = self.max_jamo_per_token - len(seq_t)
+                buf_jamo.extend(seq_t + [JAMO_PAD] * pad_n)
+                buf_segs.extend([seg_idx] * self.max_jamo_per_token)
+            else:
+                buf_jamo.extend(seq)
+                buf_segs.extend([seg_idx] * len(seq))
+                if self.append_pad_slot:
+                    buf_jamo.append(JAMO_PAD)
+                    buf_segs.append(seg_idx)
             buf_special.append(is_sp)
             seg_idx += 1
 
+        def _seg_jamo_cost(seq):
+            if self.fixed_slot:
+                return self.max_jamo_per_token
+            return len(seq) + (1 if self.append_pad_slot else 0)
+
+        # [BOS] 추가 (무조건)
+        bos_seq, bos_sp = doc_segments[0]
+        _add_seg(bos_seq, bos_sp)
+
+        # 중간 토큰들: [EOS] 자리 남겨두고 채움 (마지막 segment가 [EOS])
+        eos_seq, eos_sp = doc_segments[-1]
+        reserve_jamo = _seg_jamo_cost(eos_seq)
+        reserve_seg = 1
+        for seq, is_sp in doc_segments[1:-1]:
+            if len(buf_jamo) + _seg_jamo_cost(seq) + reserve_jamo > max_L:
+                break
+            if max_P is not None and seg_idx + reserve_seg >= max_P:
+                break
+            _add_seg(seq, is_sp)
+
         # [EOS] 추가
-        if len(buf_jamo) + len(eos_seq) <= max_L and \
+        if len(buf_jamo) + _seg_jamo_cost(eos_seq) <= max_L and \
                 (max_P is None or seg_idx < max_P):
-            buf_jamo.extend(eos_seq)
-            buf_segs.extend([seg_idx] * len(eos_seq))
-            buf_special.append(eos_sp)
-            seg_idx += 1
+            _add_seg(eos_seq, eos_sp)
 
         return self._build_sample(buf_jamo, buf_segs, buf_special, seg_idx)
 
