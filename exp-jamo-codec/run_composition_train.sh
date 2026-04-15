@@ -30,6 +30,7 @@ INIT_FROM="${INIT_FROM:-}"
 # append_pad_slot으로 자모 수가 늘어나도 억지 flush 발생 안 함.
 # 토큰 처리량 유지하려 BATCH_SIZE 절반 (256×4096 = 기존 512×2048과 동일).
 BATCH_SIZE="${BATCH_SIZE:-256}"
+GRAD_ACCUM="${GRAD_ACCUM:-1}"
 SEQ_LEN="${SEQ_LEN:-4096}"
 D_MODEL="${D_MODEL:-256}"
 N_LAYERS="${N_LAYERS:-6}"
@@ -46,7 +47,7 @@ GDRIVE="${GDRIVE:-}"  # rclone 원격지 (예: gdrive:base-model-2-ckpts/composi
 echo "=== CompositionCodec 본학습 ==="
 echo "d=${D_MODEL}, L=${N_LAYERS}, k=${KERNEL}"
 echo "Corpus: ${CORPUS}"
-echo "Steps: ${MAX_STEPS}, Batch: ${BATCH_SIZE}×${NGPU:-4}gpu=$((BATCH_SIZE * ${NGPU:-4}))"
+echo "Steps: ${MAX_STEPS}, Batch: ${BATCH_SIZE}×${NGPU:-4}gpu×accum${GRAD_ACCUM}=$((BATCH_SIZE * ${NGPU:-4} * GRAD_ACCUM))"
 echo "Save every: ${SAVE_EVERY}, GDrive: ${GDRIVE:-none}"
 [ -n "${RESUME}" ] && echo "Resume: ${RESUME}"
 [ -n "${INIT_FROM}" ] && echo "Init from: ${INIT_FROM}"
@@ -89,7 +90,7 @@ torchrun --nproc_per_node=${NGPU:-4} exp-jamo-codec/train_composition.py \
   --corpus ${CORPUS} --text_key ${TEXT_KEY} \
   --d_model ${D_MODEL} --n_layers ${N_LAYERS} --kernel_size ${KERNEL} \
   --max_seq_len ${SEQ_LEN} \
-  --batch_size ${BATCH_SIZE} --max_steps ${MAX_STEPS} \
+  --batch_size ${BATCH_SIZE} --grad_accum_steps ${GRAD_ACCUM} --max_steps ${MAX_STEPS} \
   --lr ${LR} --warmup_steps ${WARMUP} \
   --bf16 ${COMPILE_FLAG} --num_workers ${NUM_WORKERS} \
   --log_every ${LOG_EVERY} --save_every ${SAVE_EVERY} \
