@@ -3,6 +3,19 @@
 set -e
 export PYTHONUNBUFFERED=1
 
+# glibc malloc이 tokenizers Rust arena 메모리를 OS에 반환 안 해서 RSS 무제한 성장
+# → OOM (측정: 10k step에 +1115MB, 64 processes × 5GB+ = 300GB+).
+# jemalloc이 OS 반환 공격적 → +424MB로 절반 이하, 2000 step 이후 거의 안정화.
+# NO_JEMALLOC=1 로 끌 수 있음.
+if [ -z "${NO_JEMALLOC}" ]; then
+    if [ -f /usr/lib/x86_64-linux-gnu/libjemalloc.so.2 ]; then
+        export LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libjemalloc.so.2${LD_PRELOAD:+:$LD_PRELOAD}"
+        echo "LD_PRELOAD: jemalloc enabled"
+    else
+        echo "WARNING: libjemalloc.so.2 없음, glibc malloc으로 진행 (RSS 무제한 성장 위험)"
+    fi
+fi
+
 CORPUS="${CORPUS:-corpus/train.parquet}"
 TEXT_KEY="text"
 MAX_STEPS="${MAX_STEPS:-600000}"
