@@ -311,7 +311,7 @@ def train(args):
             batch_desc = f"batch={'×'.join(parts)}={eff_batch}"
         print(f"\n학습 시작: max_steps={args.max_steps}, {batch_desc}"
               + f", seq_len={args.max_seq_len}")
-        print(f"{'step':>8} {'loss':>8} {'acc':>8} {'lr':>10} {'tok/s':>8}")
+        print(f"{'step':>8} {'loss':>15} {'acc':>17} {'lr':>10} {'tok/s':>8}")
         print("-" * 50)
 
     micro_step = 0
@@ -372,7 +372,7 @@ def train(args):
             lr = scheduler.get_last_lr()[0]
 
             progress = global_step / args.max_steps * 100
-            print(f"{global_step:8d} {avg_loss:8.4f} {avg_acc:7.2f}% {lr:10.2e} {tok_s:8.0f}  {progress:.1f}% L{max_line_counter:,}")
+            print(f"{global_step:8d} {avg_loss:15.12f} {avg_acc:16.12f}% {lr:10.2e} {tok_s:8.0f}  {progress:.1f}% L{max_line_counter:,}")
 
             accum_loss = 0.0
             accum_correct = 0
@@ -382,8 +382,8 @@ def train(args):
         # Validation
         if val_loader is not None and args.val_every > 0 and global_step % args.val_every == 0 and rank == 0:
             val_metrics = validate(codec, val_loader, device, args.val_samples)
-            print(f"  [VAL] loss={val_metrics['val_loss']:.4f}, "
-                  f"acc={val_metrics['val_acc']:.4f}%, "
+            print(f"  [VAL] loss={val_metrics['val_loss']:.12f}, "
+                  f"acc={val_metrics['val_acc']:.12f}%, "
                   f"samples={val_metrics['val_samples']}")
 
         # 체크포인트
