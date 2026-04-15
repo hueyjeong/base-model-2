@@ -161,6 +161,73 @@ class BBPEJamoDataset(IterableDataset):
                         yield abs_line, text
                     abs_line += 1
 
+    def _prewarm_encode(self, n_docs: int = 1000, verbose: bool = True):
+        """BBPE Rust tokenizer의 내부 arena를 미리 확장해 학습 중 성장 제거.
+
+        측정: batch encode 반복 시 첫 100회 호출까지 ~360MB 성장 후 점근.
+        다양한 문서를 미리 encode해 Rust side memory pool을 시작 시 확보.
+        Python wrapper(HF __call__) 대신 backend_tokenizer 직접 호출로
+        BatchEncoding 객체 생성 overhead 제거 (측정상 누수 5000docs 기준 171→41MB).
+        """
+        import time
+        t0 = time.time()
+        if verbose:
+            print(f"[Encode prewarm] {n_docs} docs encoding...")
+        rust_tok = self.bbpe.backend_tokenizer
+        buf: List[str] = []
+        count = 0
+        for _, text in self._iter_texts():
+            buf.append(text)
+            if len(buf) >= 64:
+                rust_tok.encode_batch(buf, add_special_tokens=False)
+                buf = []
+            count += 1
+            if count >= n_docs:
+                break
+        if buf:
+            rust_tok.encode_batch(buf, add_special_tokens=False)
+        if verbose:
+            print(f"[Encode prewarm] done in {time.time()-t0:.1f}s ({count} docs)")
+
+    def _prewarm_cache(self, verbose: bool = True):
+        """vocab 전체의 (tok_str, jamo) cache를 시작 시 한 번에 채움.
+
+        학습 중 cache 성장으로 인한 CPU RAM linear 증가를 제거. 학습 시작 시
+        시간(<1분) 소비하는 대신 메모리 고정. DataLoader worker_init_fn에서
+        각 worker 시작 후 호출해 모든 worker가 fork 후 자기 cache 채우게 함.
+        """
+        import time
+        vocab_size = int(self.bbpe.vocab_size)
+        t0 = time.time()
+        if verbose:
+            print(f"[Cache pre-warm] {vocab_size} tokens decoding...")
+        # batch_decode로 Rust parallel 디코드
+        all_strs = self.bbpe.batch_decode([[tid] for tid in range(vocab_size)])
+        for tid, tok_str in enumerate(all_strs):
+            if tid in self._tok_cache:
+                continue
+            base_jamo = decompose_token(tok_str, self.jamo)
+            if len(base_jamo) <= self.max_jamo_per_token:
+                self._tok_cache[tid] = (base_jamo,)
+            else:
+                parts_seqs: List[List[int]] = []
+                parts = re.split(r"( )", tok_str)
+                for part in parts:
+                    if not part:
+                        continue
+                    pj = decompose_token(part, self.jamo)
+                    if len(pj) <= self.max_jamo_per_token:
+                        parts_seqs.append(pj)
+                    else:
+                        for ch in part:
+                            cj = decompose_token(ch, self.jamo)
+                            if cj:
+                                parts_seqs.append(cj[:self.max_jamo_per_token])
+                self._tok_cache[tid] = tuple(parts_seqs)
+        if verbose:
+            print(f"[Cache pre-warm] done in {time.time()-t0:.1f}s "
+                  f"({len(self._tok_cache):,} entries)")
+
     def _decompose_ids(self, bbpe_ids: List[int]) -> List[List[int]]:
         """BBPE 토큰 ID 리스트 → 각 토큰 자모 분해 (cache 사용)."""
         cache = self._tok_cache
@@ -251,6 +318,10 @@ class BBPEJamoDataset(IterableDataset):
         worker별 interleaving 필터를 여기서 적용해 batch encode의 처리량을 극대화.
         (문서 하나씩 encode보다 8배 빠름).
         """
+        # HF wrapper(PreTrainedTokenizer.__call__)가 아닌 backend_tokenizer
+        # 직접 호출. BatchEncoding 객체 생성/저장 overhead 제거로 RSS 성장
+        # 75% 감소 (5000docs 측정: wrapper +171MB → backend +41MB).
+        rust_tok = self.bbpe.backend_tokenizer
         encode_bs = self.encode_batch_size
         buf_abs: List[int] = []
         buf_text: List[str] = []
@@ -263,15 +334,15 @@ class BBPEJamoDataset(IterableDataset):
             buf_abs.append(abs_line)
             buf_text.append(text)
             if len(buf_text) >= encode_bs:
-                encoded = self.bbpe(buf_text, add_special_tokens=False)["input_ids"]
-                for a, ids in zip(buf_abs, encoded):
-                    yield a, ids
+                encodings = rust_tok.encode_batch(buf_text, add_special_tokens=False)
+                for a, enc in zip(buf_abs, encodings):
+                    yield a, enc.ids
                 buf_abs = []
                 buf_text = []
         if buf_text:
-            encoded = self.bbpe(buf_text, add_special_tokens=False)["input_ids"]
-            for a, ids in zip(buf_abs, encoded):
-                yield a, ids
+            encodings = rust_tok.encode_batch(buf_text, add_special_tokens=False)
+            for a, enc in zip(buf_abs, encodings):
+                yield a, enc.ids
 
     def __iter__(self):
         """Multi-document packing: [BOS]문서1[EOS][BOS]문서2[EOS]...를 상한까지 이어붙여 yield.

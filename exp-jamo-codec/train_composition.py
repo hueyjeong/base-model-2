@@ -159,6 +159,18 @@ def train(args):
         append_pad_slot=args.append_pad_slot,
         fixed_slot=args.fixed_slot,
     )
+    # worker_init_fn: 각 worker fork 후 BBPE token→자모 cache를 prewarm.
+    # 학습 중 cache 성장으로 인한 RAM linear 증가 제거. 각 worker에서
+    # ~30초 소비(vocab 150K) 후 cache 고정.
+    def _worker_init(worker_id):
+        w_info = torch.utils.data.get_worker_info()
+        if w_info is None:
+            return
+        ds = w_info.dataset
+        v = (worker_id == 0)
+        ds._prewarm_cache(verbose=v)
+        ds._prewarm_encode(n_docs=1000, verbose=v)
+
     # pin_memory=True + num_workers>0 조합이 일부 DDP/Docker 환경에서
     # "Trying to resize storage that is not resizable" 에러 유발
     # (worker의 shared-storage 텐서를 collate가 resize 시도하다 실패).
@@ -173,9 +185,15 @@ def train(args):
         num_workers=args.num_workers,
         pin_memory=not args.no_pin_memory,
         persistent_workers=(args.num_workers > 0),
+        worker_init_fn=_worker_init if args.num_workers > 0 else None,
     )
     if args.num_workers > 0:
         loader_kwargs["prefetch_factor"] = args.prefetch_factor
+    else:
+        # num_workers=0: main process에서 직접 prewarm
+        v = (rank == 0)
+        dataset._prewarm_cache(verbose=v)
+        dataset._prewarm_encode(n_docs=1000, verbose=v)
     loader = DataLoader(dataset, **loader_kwargs)
 
     # Validation 데이터
