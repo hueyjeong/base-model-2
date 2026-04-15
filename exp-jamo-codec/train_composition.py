@@ -149,11 +149,16 @@ def train(args):
         append_pad_slot=args.append_pad_slot,
         fixed_slot=args.fixed_slot,
     )
+    # pin_memory=True + num_workers>0 조합이 일부 DDP/Docker 환경에서
+    # "Trying to resize storage that is not resizable" 에러 유발
+    # (worker의 shared-storage 텐서를 collate가 resize 시도하다 실패).
+    # --no_pin_memory 옵션으로 끌 수 있게 함.
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=not args.no_pin_memory,
+        persistent_workers=(args.num_workers > 0),
     )
 
     # Validation 데이터
@@ -452,6 +457,8 @@ def main():
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--no_pin_memory", action="store_true",
+                        help="pin_memory 끄기 (DDP/Docker에서 resize storage 에러 시)")
 
     # 로깅/저장/재개
     parser.add_argument("--log_every", type=int, default=100)
