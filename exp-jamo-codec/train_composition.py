@@ -33,8 +33,13 @@ def _unwrap_state_dict(model):
 
 
 @torch.no_grad()
-def validate(codec, val_loader, device, max_samples=1000):
-    """검증 세트 복원 정확도 측정"""
+def validate(codec, val_loader, device, max_samples=1000, world_size=1):
+    """검증 세트 복원 정확도 측정.
+
+    DDP: 모든 rank가 공동 실행. 각 rank는 max_samples/world_size 만큼만 돌고
+    집계는 all_reduce. rank 0만 validate 돌리면 나머지 rank의 다음 step
+    allreduce가 NCCL timeout(기본 600s) 걸림.
+    """
     codec.eval()
     total_correct = 0
     total_jamo = 0
@@ -46,31 +51,47 @@ def validate(codec, val_loader, device, max_samples=1000):
     raw_codec = raw_codec._orig_mod if hasattr(raw_codec, "_orig_mod") else raw_codec
     is_parallel = getattr(raw_codec, "parallel_decoder", False)
 
-    for batch in val_loader:
-        jamo_ids = batch["jamo_ids"].to(device)
-        jamo_mask = batch["jamo_mask"].to(device)
-        segment_ids = batch["segment_ids"].to(device)
-        n_segments = batch["n_segments"].to(device)
+    # rank당 상한 — world_size로 나눠 전체 max_samples 근사
+    per_rank_max = max(1, max_samples // max(world_size, 1))
 
-        out = codec(jamo_ids, jamo_mask, segment_ids, n_segments)
-        if is_parallel:
-            # logits: [B, P, S, V], target_slot: [B, P, S], slot_loss_mask: [B, P, S]
-            pred = out["logits"].argmax(dim=-1)  # [B, P, S]
-            target_slot = out["target_slot"]
-            slot_mask = out["slot_loss_mask"]
-            total_correct += ((pred == target_slot) & slot_mask).sum().item()
-            total_jamo += slot_mask.sum().item()
-        else:
-            pred = out["logits"].argmax(dim=-1)
-            valid = jamo_mask
-            total_correct += ((pred == jamo_ids) & valid).sum().item()
-            total_jamo += valid.sum().item()
-        total_loss += out["loss"].item()
-        n_batches += 1
-        n_samples += jamo_ids.size(0)
+    with torch.no_grad():
+        for batch in val_loader:
+            jamo_ids = batch["jamo_ids"].to(device)
+            jamo_mask = batch["jamo_mask"].to(device)
+            segment_ids = batch["segment_ids"].to(device)
+            n_segments = batch["n_segments"].to(device)
 
-        if n_samples >= max_samples:
-            break
+            out = codec(jamo_ids, jamo_mask, segment_ids, n_segments)
+            if is_parallel:
+                pred = out["logits"].argmax(dim=-1)
+                target_slot = out["target_slot"]
+                slot_mask = out["slot_loss_mask"]
+                total_correct += ((pred == target_slot) & slot_mask).sum().item()
+                total_jamo += slot_mask.sum().item()
+            else:
+                pred = out["logits"].argmax(dim=-1)
+                valid = jamo_mask
+                total_correct += ((pred == jamo_ids) & valid).sum().item()
+                total_jamo += valid.sum().item()
+            total_loss += out["loss"].item()
+            n_batches += 1
+            n_samples += jamo_ids.size(0)
+
+            if n_samples >= per_rank_max:
+                break
+
+    # DDP 집계 (rank 간 동기화 포함)
+    if world_size > 1 and dist.is_initialized():
+        stats = torch.tensor(
+            [total_correct, total_jamo, total_loss, n_batches, n_samples],
+            dtype=torch.float64, device=device,
+        )
+        dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+        total_correct = int(stats[0].item())
+        total_jamo = int(stats[1].item())
+        total_loss = float(stats[2].item())
+        n_batches = int(stats[3].item())
+        n_samples = int(stats[4].item())
 
     codec.train()
     acc = total_correct / max(total_jamo, 1) * 100
@@ -196,9 +217,10 @@ def train(args):
         dataset._prewarm_encode(n_docs=1000, verbose=v)
     loader = DataLoader(dataset, **loader_kwargs)
 
-    # Validation 데이터
+    # Validation 데이터 — 모든 rank에서 생성 (rank 샤딩) + all_reduce 집계
+    # rank 0만 val 돌리면 나머지 rank의 다음 step allreduce가 NCCL timeout됨
     val_loader = None
-    if args.val_corpus and rank == 0:
+    if args.val_corpus:
         val_dataset = BBPEJamoDataset(
             file_paths=args.val_corpus,
             bbpe_tokenizer=bbpe,
@@ -208,6 +230,8 @@ def train(args):
             text_key=args.text_key,
             append_pad_slot=args.append_pad_slot,
             fixed_slot=args.fixed_slot,
+            rank=rank,
+            world_size=world_size,
         )
         val_loader = DataLoader(val_dataset, batch_size=args.batch_size, num_workers=0)
 
@@ -379,12 +403,13 @@ def train(args):
             accum_total = 0
             t_start = time.time()
 
-        # Validation
-        if val_loader is not None and args.val_every > 0 and global_step % args.val_every == 0 and rank == 0:
-            val_metrics = validate(codec, val_loader, device, args.val_samples)
-            print(f"  [VAL] loss={val_metrics['val_loss']:.12f}, "
-                  f"acc={val_metrics['val_acc']:.12f}%, "
-                  f"samples={val_metrics['val_samples']}")
+        # Validation — 모든 rank 공동 실행 (샤딩 + all_reduce)
+        if val_loader is not None and args.val_every > 0 and global_step % args.val_every == 0:
+            val_metrics = validate(codec, val_loader, device, args.val_samples, world_size)
+            if rank == 0:
+                print(f"  [VAL] loss={val_metrics['val_loss']:.12f}, "
+                      f"acc={val_metrics['val_acc']:.12f}%, "
+                      f"samples={val_metrics['val_samples']}")
 
         # 체크포인트
         if args.save_every > 0 and global_step % args.save_every == 0 and rank == 0:
