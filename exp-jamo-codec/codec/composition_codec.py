@@ -338,13 +338,18 @@ class CompositionCodec(nn.Module):
                  segment_masked: bool = False,
                  parallel_decoder: bool = False,
                  decoder_layers: int = 2,
-                 decoder_heads: int = 4):
+                 decoder_heads: int = 4,
+                 fixed_output_len: int | None = None):
         """
         Args:
             parallel_decoder: True면 CompositionDecoder(conv) 대신 ParallelSlotDecoder 사용.
                 Encoder는 가변 입력 유지, decoder만 각 토큰을 max_jamo_per_token 슬롯으로
                 확장해 self-attention. decode_from_vec 완벽 대응. Dataset은 가변 원본 구조
                 (fixed_slot/append_pad_slot 불필요).
+            fixed_output_len: encoder 출력 token 수 고정. None이면 `segment_ids.max()+1`로
+                배치마다 가변 → torch.compile recompile 누적으로 CPU RAM 성장. 고정값
+                지정 시 static shape → recompile 없음. fixed_slot=True 코퍼스는
+                `max_seq_len // max_jamo_per_token`을 기본값으로 쓰면 됨.
         """
         super().__init__()
         self.jamo_vocab = jamo_vocab
@@ -357,6 +362,7 @@ class CompositionCodec(nn.Module):
             jamo_vocab, d_model, n_layers, kernel_size, dropout,
             max_jamo_per_token=max_jamo_per_token,
             segment_masked=segment_masked,
+            fixed_output_len=fixed_output_len,
         )
         if parallel_decoder:
             self.decoder = ParallelSlotDecoder(

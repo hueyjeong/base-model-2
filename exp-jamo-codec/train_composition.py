@@ -107,6 +107,13 @@ def train(args):
         print(f"BBPE: {bbpe.vocab_size:,} vocab, Jamo: {jamo.vocab_size} vocab")
 
     # 모델
+    # fixed_output_len: fixed_slot=True면 encoder 출력 토큰 수가 max_seq_len/max_jamo
+    # 상한으로 결정됨 → 이 값으로 고정해 torch.compile recompile 누적(= CPU RAM 성장)
+    # 방지. fixed_slot=False인 가변 구조에선 None 유지(기본 동작).
+    fixed_output_len = None
+    if args.fixed_slot:
+        fixed_output_len = args.max_seq_len // args.max_jamo_per_token
+
     codec = CompositionCodec(
         jamo_vocab=jamo.vocab_size,
         d_model=args.d_model,
@@ -118,7 +125,10 @@ def train(args):
         parallel_decoder=args.parallel_decoder,
         decoder_layers=args.decoder_layers,
         decoder_heads=args.decoder_heads,
+        fixed_output_len=fixed_output_len,
     ).to(device)
+    if rank == 0 and fixed_output_len is not None:
+        print(f"fixed_output_len={fixed_output_len} (encoder 출력 static shape)")
 
     n_params = sum(p.numel() for p in codec.parameters())
     if rank == 0:
