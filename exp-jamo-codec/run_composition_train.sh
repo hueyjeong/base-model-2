@@ -69,6 +69,8 @@ DEC_HEADS_FLAG=""
 NO_PIN_FLAG=""
 [ -n "${NO_PIN_MEMORY}" ] && NO_PIN_FLAG="--no_pin_memory"
 [ -n "${NO_PIN_MEMORY}" ] && echo "no_pin_memory: ON"
+PREFETCH_FLAG=""
+[ -n "${PREFETCH_FACTOR}" ] && PREFETCH_FLAG="--prefetch_factor ${PREFETCH_FACTOR}"
 
 torchrun --nproc_per_node=${NGPU:-4} exp-jamo-codec/train_composition.py \
   --corpus ${CORPUS} --text_key ${TEXT_KEY} \
@@ -81,7 +83,7 @@ torchrun --nproc_per_node=${NGPU:-4} exp-jamo-codec/train_composition.py \
   --val_corpus ${VAL_CORPUS} --val_every ${VAL_EVERY} --val_samples ${VAL_SAMPLES} \
   --out_dir ${OUT} \
   ${SEG_MASKED_FLAG} ${PAD_SLOT_FLAG} ${FIXED_SLOT_FLAG} ${MAX_JAMO_FLAG} \
-  ${PARALLEL_DEC_FLAG} ${DEC_LAYERS_FLAG} ${DEC_HEADS_FLAG} ${NO_PIN_FLAG} \
+  ${PARALLEL_DEC_FLAG} ${DEC_LAYERS_FLAG} ${DEC_HEADS_FLAG} ${NO_PIN_FLAG} ${PREFETCH_FLAG} \
   ${RESUME:+--resume ${RESUME}} \
   ${INIT_FROM:+--init_from ${INIT_FROM}} \
   2>&1 | tee exp-jamo-codec/composition_train_log.txt

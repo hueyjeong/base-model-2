@@ -153,13 +153,20 @@ def train(args):
     # "Trying to resize storage that is not resizable" 에러 유발
     # (worker의 shared-storage 텐서를 collate가 resize 시도하다 실패).
     # --no_pin_memory 옵션으로 끌 수 있게 함.
-    loader = DataLoader(
-        dataset,
+    #
+    # prefetch_factor: rank별 DataLoader batch 생산 속도 variance로 인한
+    # "돌아가며 GPU idle" 문제 완화. 기본 2 → 4~8로 높이면 worker가 미리
+    # 배치를 쌓아둬 variance 흡수. BBPE decode + 자모 분해가 CPU-heavy라
+    # worker 수(num_workers)도 넉넉하게.
+    loader_kwargs = dict(
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         pin_memory=not args.no_pin_memory,
         persistent_workers=(args.num_workers > 0),
     )
+    if args.num_workers > 0:
+        loader_kwargs["prefetch_factor"] = args.prefetch_factor
+    loader = DataLoader(dataset, **loader_kwargs)
 
     # Validation 데이터
     val_loader = None
@@ -457,6 +464,8 @@ def main():
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--prefetch_factor", type=int, default=4,
+                        help="DataLoader worker당 미리 prefetch할 batch 수 (rank 간 CPU variance 흡수)")
     parser.add_argument("--no_pin_memory", action="store_true",
                         help="pin_memory 끄기 (DDP/Docker에서 resize storage 에러 시)")
 
