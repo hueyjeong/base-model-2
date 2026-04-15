@@ -79,6 +79,12 @@ class BBPEJamoDataset(IterableDataset):
             self.append_pad_slot = False
         self._line_counter = 0
         self._resume_line = 0
+        # token_id → (tok_str, jamo_ids) lazy cache
+        # self.bbpe.decode([tid])가 Python↔Rust 왕복 overhead 크므로,
+        # 같은 토큰 반복 등장 시 cache 활용. Coverage 코퍼스는 150K 전부 등장하니
+        # 첫 epoch 후 cache hit 100% 근접. DataLoader worker마다 별도 cache
+        # (fork 시 copy-on-write; Python ref count로 실제 복사될 수 있지만 ~15MB).
+        self._tok_cache: dict = {}
 
     def _iter_texts(self, resume_row: int = 0):
         """파일에서 텍스트 스트리밍
@@ -153,28 +159,39 @@ class BBPEJamoDataset(IterableDataset):
                     abs_line += 1
 
     def _tokenize_and_decompose(self, text: str) -> List[List[int]]:
-        """텍스트 → BBPE 토큰화 → 각 토큰 자모 분해"""
+        """텍스트 → BBPE 토큰화 → 각 토큰 자모 분해 (캐시 사용).
+
+        - encode는 문서 단위 1회 호출 (Rust 구현 그대로 빠름)
+        - decode + decompose는 토큰마다 반복되므로 token_id별 cache로 가속
+        """
         bbpe_ids = self.bbpe.encode(text, add_special_tokens=False)
+        cache = self._tok_cache
         jamo_seqs = []
         for tid in bbpe_ids:
-            tok_str = self.bbpe.decode([tid])
-            jamo_ids = decompose_token(tok_str, self.jamo)
-            if len(jamo_ids) <= self.max_jamo_per_token:
-                jamo_seqs.append(jamo_ids)
-            else:
-                # 32자모 초과 → 공백 기준 어절 분절
-                parts = re.split(r'( )', tok_str)
-                for part in parts:
-                    if not part:
-                        continue
-                    pj = decompose_token(part, self.jamo)
-                    if len(pj) <= self.max_jamo_per_token:
-                        jamo_seqs.append(pj)
-                    else:
-                        for ch in part:
-                            cj = decompose_token(ch, self.jamo)
-                            if cj:
-                                jamo_seqs.append(cj[:self.max_jamo_per_token])
+            entry = cache.get(tid)
+            if entry is None:
+                tok_str = self.bbpe.decode([tid])
+                base_jamo = decompose_token(tok_str, self.jamo)
+                if len(base_jamo) <= self.max_jamo_per_token:
+                    entry = (base_jamo,)  # single seq
+                else:
+                    # 32자모 초과 → 공백 기준 어절 분절 (이 path는 드묾)
+                    parts_seqs: List[List[int]] = []
+                    parts = re.split(r'( )', tok_str)
+                    for part in parts:
+                        if not part:
+                            continue
+                        pj = decompose_token(part, self.jamo)
+                        if len(pj) <= self.max_jamo_per_token:
+                            parts_seqs.append(pj)
+                        else:
+                            for ch in part:
+                                cj = decompose_token(ch, self.jamo)
+                                if cj:
+                                    parts_seqs.append(cj[:self.max_jamo_per_token])
+                    entry = tuple(parts_seqs)
+                cache[tid] = entry
+            jamo_seqs.extend(entry)
         return jamo_seqs
 
     def _build_sample(self, buffer_jamo, buffer_segs, buffer_special, n_segments):
