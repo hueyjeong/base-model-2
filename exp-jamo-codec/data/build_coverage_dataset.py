@@ -349,6 +349,7 @@ def iter_local_parquet_batches(
     batch_size: int = 512,
     max_rows: Optional[int] = None,
     n_readers: int = 4,
+    max_text_len: Optional[int] = None,
 ) -> Iterator[tuple[list[str], list[int], list[str]]]:
     """로컬 Parquet 파일 → (sources, row_idxs, texts) 배치 생성자
 
@@ -424,7 +425,11 @@ def iter_local_parquet_batches(
 
             out_src, out_idx, out_txt = [], [], []
             for s, r, t in zip(chunk_src, chunk_idx, chunk_txt):
-                if t and len(t) >= 10:
+                if not t:
+                    continue
+                if max_text_len is not None and len(t) > max_text_len:
+                    t = t[:max_text_len]
+                if len(t) >= 10:
                     out_src.append(s)
                     out_idx.append(r)
                     out_txt.append(t)
@@ -674,6 +679,7 @@ def scan_local_parquet(
     log_interval: int = 10_000,
     batch_size: int = 512,
     n_readers: int = 4,
+    max_text_len: Optional[int] = None,
 ) -> int:
     """로컬 Parquet 파일을 소스로 재샘플링.
 
@@ -735,7 +741,7 @@ def scan_local_parquet(
     def _tokenize_worker():
         try:
             for srcs, idxs, texts in iter_local_parquet_batches(
-                parquet_path, batch_size, max_rows, n_readers,
+                parquet_path, batch_size, max_rows, n_readers, max_text_len,
             ):
                 batch_ids = _tokenize(texts)
                 tok_queue.put((srcs, idxs, texts, batch_ids))
@@ -917,6 +923,10 @@ def parse_args():
              "스키마: text, source, row_idx, n_tokens",
     )
     p.add_argument(
+        "--max_text_len", type=int, default=None,
+        help="텍스트 길이 제한 (문자 수). 초과 시 truncate 후 토크나이징 (기본: 제한 없음)",
+    )
+    p.add_argument(
         "--per_token_samples", type=int, default=10_000,
         help="토큰당 최대 수집 row 수 (기본: 10,000)",
     )
@@ -1011,6 +1021,7 @@ def main():
             log_interval=args.log_interval,
             batch_size=args.batch_size,
             n_readers=args.n_readers,
+            max_text_len=args.max_text_len,
         )
     else:
         for source_name in args.sources:
