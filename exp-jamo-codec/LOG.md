@@ -1619,3 +1619,74 @@ NGPU=4 bash exp-jamo-codec/run_composition_train.sh
    - parallel_decoder (encoder-only 경로 부담 줄이기)
    - λ 하향 (50→25 또는 10)
    - LR 스케줄 WSD 전환 (peak 유지 구간 줄이기)
+
+---
+
+## 2026-04-15 저녁 — RSS 무한 증가 → OOM 추적 및 해결
+
+### 증상
+
+5090×4 (256GB RAM) 서버에서 본학습 시도 시 수천 step 이내 OOM. num_workers=16→8 낮춰도 3000 step 전 사망. 8 이하는 GPU data 부족으로 놀아 비현실적.
+
+### 추적 과정 (로컬 1 process 기준)
+
+1. **torch.compile recompile 의심** → fixed_output_len=128 고정 (단일 compile)
+   - 단독 테스트 OK, 실제 학습은 여전히 증가
+2. **BBPE token cache prewarm** → 시작 시 150K vocab pre-cache
+   - Cache 고정됐지만 RSS 여전히 성장
+3. **HF Tokenizer wrapper vs Rust backend**: 5000 docs 측정
+   - `bbpe(texts)` (Python wrapper): +171MB
+   - `backend_tokenizer.encode_batch`: +41MB (1/4)
+   - → `_iter_encoded_texts`에서 backend 직접 호출로 변경
+4. **Python ref leak 확인** — tracemalloc: +3MB만 (Python level 아님)
+5. **del bbpe + gc.collect()** → RSS 감소 0 → **glibc malloc이 Rust drop 후에도 메모리 hold**
+6. **10k step 장기 테스트** (glibc): 1000 step당 +100MB 꾸준 증가 → linear leak 확정
+
+### 해결책 조합
+
+**A) LD_PRELOAD=libjemalloc.so.2**
+- glibc의 "drop된 메모리도 pool에 가둠" 동작을 대체. jemalloc은 OS 공격적 반환.
+- 측정: 10k step RSS 성장 +1115MB(glibc) → **+424MB(jemalloc, 62% 감소)**.
+- 2000 step 이후 거의 안정화, 일부 구간 감소(-5~30MB) 관찰.
+- `run_composition_train.sh`가 자동 LD_PRELOAD. `NO_JEMALLOC=1`로 끄기 가능.
+
+**B) Parquet `batch_size` 65536 → 4096**
+- row group 단위 `to_pylist()`가 65536개 Python string 일괄 생성 → peak 메모리 폭증.
+- 4096으로 낮춰 peak 16배 감소.
+
+**C) Worker filter를 `as_py()` 이전으로 이동**
+- 기존: batch 전체를 Python string으로 변환 → worker interleaving 필터 → 63/64 버림
+- 변경: batch 내부 `col[i].as_py()`를 내 몫일 때만 호출 → Python string 생성 자체를 1/64로 줄임
+- DataLoader worker 64개 × 1/64 = 원본 수준 메모리
+
+**D) Python 레벨 점검**
+- `buf_jamo = []` 등 flush는 이미 최적 (refcount 0 즉시 deallocated)
+- 무한 append 없음, self._tok_cache는 150K 상한
+- 핵심은 Python GC가 아닌 **native allocator 반환 문제**로 확정
+
+### 결과
+
+서버 환경 반영 후 **메모리 대폭 감소 + 아직 미터짐**. 50k step 완주 기대.
+
+**로컬 단일 process 기준 10k step**:
+- 기존 glibc + 65536 batch: +1115MB
+- jemalloc 적용: +424MB
+- jemalloc + batch 4096 + worker-first filter: 추가 감소 예상(로컬 재측정 생략)
+
+**서버 기준 64 processes 예상**:
+- 이전: worker당 5GB+ → 320GB+ (256GB OOM)
+- 지금: worker당 ~1-2GB → ~80-130GB (여유)
+
+### 핵심 커밋
+
+- `aa142ae` fix: LD_PRELOAD jemalloc 자동 적용
+- `69b7507` feat: prewarm_cache/encode + backend_tokenizer 직접 호출
+- `0edc20c` perf: batch_size 65536→4096 + worker filter를 as_py 이전으로
+
+### 교훈
+
+- "Python 메모리 누수"라 표현되는 현상의 절반 이상은 **native allocator (glibc) 반환 문제** — Python refcount가 0이어도 OS RSS는 안 줄어듦.
+- Huggingface `tokenizers` (Rust) 특유의 arena 확장은 다양한 입력이 올수록 점근적 성장 → 대규모 코퍼스 + 다량 worker 조합에서 OOM 유발.
+- 해결은 **LD_PRELOAD + 낭비 allocation 제거** 두 축 필요. 단독으로는 부족.
+- 디버깅 순서: Python level (tracemalloc) → Allocator level (jemalloc 시도) → Application level (batch/worker 구조).
+
