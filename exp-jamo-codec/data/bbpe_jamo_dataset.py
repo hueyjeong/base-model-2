@@ -89,15 +89,19 @@ class BBPEJamoDataset(IterableDataset):
         # (측정: one-by-one 0.84ms/doc → batch 0.10ms/doc = 8.3x)
         self.encode_batch_size = 64
 
-    def _iter_texts(self, resume_row: int = 0):
-        """파일에서 텍스트 스트리밍
+    def _iter_texts(self, resume_row: int = 0,
+                     worker_stride: int = 1, worker_offset: int = 0):
+        """파일에서 텍스트 스트리밍.
 
         Args:
             resume_row: 이 줄 번호부터 시작 (0이면 처음부터).
-                       Parquet: row group 단위 skip으로 빠른 이동.
+            worker_stride, worker_offset: worker interleaving 필터링을 여기서
+                처리해 자기 몫이 아닌 row는 Python string 변환 자체를 안 함
+                (기존엔 to_pylist로 batch 전체 변환 후 filter — 64 workers면
+                63/64가 낭비). pyarrow Array의 as_py()는 index 접근 시 lazy.
 
         Yields:
-            (abs_line, text) — 절대 줄 번호와 텍스트
+            (abs_line, text) — 절대 줄 번호와 텍스트 (worker 필터 통과분만)
         """
         for fpath in self.file_paths:
             is_jsonl = fpath.endswith(".jsonl") or fpath.endswith(".json")
@@ -118,32 +122,39 @@ class BBPEJamoDataset(IterableDataset):
                     if rows_skipped + rg_rows <= resume_row:
                         rows_skipped += rg_rows
                         continue
-                    # 이 row group부터 읽기 시작
                     rg_start = rg_idx
                     target_offset = resume_row - rows_skipped
                     break
 
-                # 지정된 row group부터 읽기
+                # batch_size 작게(4096) → 한 batch peak 메모리 약 16배 감소
+                # (65536 → 4096, batch 평균 ~6MB)
                 abs_line = rows_skipped
                 for batch in pf.iter_batches(
-                    batch_size=65536, columns=[text_col],
+                    batch_size=4096, columns=[text_col],
                     row_groups=list(range(rg_start, pf.num_row_groups)),
                 ):
-                    texts = batch[text_col].to_pylist()
+                    col = batch[text_col]
+                    n = len(col)
                     start = target_offset if target_offset > 0 else 0
-                    for i, text in enumerate(texts):
-                        if i < start:
-                            continue
+                    for i in range(start, n):
+                        abs_idx = abs_line + i
+                        if abs_idx % worker_stride != worker_offset:
+                            continue  # 내 몫 아니면 as_py() 호출 X
+                        text = col[i].as_py()
                         if text and len(text) >= self.min_length:
-                            yield abs_line + i, text
-                    abs_line += len(texts)
-                    target_offset = 0  # 첫 배치만 offset 적용
+                            yield abs_idx, text
+                    abs_line += n
+                    target_offset = 0
                 continue
 
-            # JSONL/텍스트: 순차 읽기
+            # JSONL/텍스트: 순차 읽기 (worker filter 적용)
             abs_line = 0
             with open(fpath, "r", encoding="utf-8") as f:
                 for line in f:
+                    my = abs_line % worker_stride == worker_offset
+                    if not my:
+                        abs_line += 1
+                        continue
                     line = line.strip()
                     if len(line) < self.min_length:
                         abs_line += 1
