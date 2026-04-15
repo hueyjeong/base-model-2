@@ -1428,3 +1428,194 @@ head fine-tune.
 
 코드 검증: bos pooling 정상 작동 확인 (BOS 자모 교체 시 logit diff 2.6 → BOS hidden 의존). 40k/50k 하락은 pooling 버그 아니라 진짜 pretraining 상태 변동.
 
+---
+
+## 2026-04-15 — KoELECTRA 사전학습 발산 확인 + codec 구조 전환
+
+### 120k 로그 분석: 발산 확인
+
+`exp-jamo-codec-koelectra-train-log.txt` (1226 step, 매 100 step 기록) 분석.
+
+| Step | val/gen | val/disc | val/dacc | 해석 |
+|---|---|---|---|---|
+| 5k~95k | 1.3~2.2 (↓↓) | 0.15~0.19 | 0.93~0.957 | **정상 학습** |
+| **100k** | **2.942** | **0.060** | **0.978** | **급변점** |
+| 110k | 3.026 | 0.094 | 0.966 | 불안정 |
+| 115k | 5.639 | 0.082 | 0.973 | gen 발산 시작 |
+| **120k** | **8.126** | 0.293 | 0.880 | **전체 붕괴** |
+
+Train 쪽도 99.1k에서 첫 gen spike(10.6), 106k~107k 국지 spike(13~18), 110.9k부터
+본격 폭주(gen 30~55). 120k 구간은 gen loss 바닥이 10.5로 사라짐.
+
+**원인: Nash equilibrium 붕괴**
+- val/disc_loss 95k → 100k에서 0.148 → **0.060으로 급락** (disc 너무 강해짐)
+- dacc 0.978까지 상승 (건강한 ELECTRA는 ~0.85)
+- Discriminator가 Generator를 "절대 못 속이는" 상태 → Gen 학습 signal 소멸
+- `λ=50 × gen_loss` 곱 때문에 gen spike → codec drift → 악순환
+- Linear LR decay 800k이라 120k에서 peak의 86% 유지 — decay 실질 없음
+
+### 90k NSMC로 확정
+
+| Step | Best Test Acc | 비고 |
+|---|---|---|
+| 30k | **83.05%** | (lucky) |
+| 40k | 81.56% | |
+| 50k | 81.95% | |
+| **90k** | **81.23%** | 오히려 50k보다 낮음 |
+
+82%±1% 천정에 수렴. 95k까지 val loss는 계속 내림에도 downstream은 정체 →
+codec의 **conv 리크**로 disc가 쉬운 patch detection만 배우고 실제 표현력은
+쌓이지 않은 것으로 해석. codec 설계 변경 결정.
+
+---
+
+## codec 구조 전환: segment-masked conv + decode_from_vec
+
+### 1) Segment-masked conv (리크 구조적 제거)
+
+기존 `ConvBlock`은 토큰 경계 무관 전체 concat 자모 시퀀스를 훑어서 RF=37(k=7,
+6L)이 여러 이웃 토큰을 섞음 (leak_test ±1에서 22~29%).
+
+**`SegmentMaskedConvBlock`**: conv kernel의 각 tap이 center와 같은 segment인
+자모만 참조하도록 mask. k번 shift+mask+matmul로 O(k) 메모리. 기존 ConvBlock과
+weight shape 동일(`[D,D,k]`, bias=False)이라 state_dict 호환.
+
+검증 (단독 block 레벨):
+- 토큰 1 slot에만 값 주입 → 토큰 0/2/3 출력 정확히 0.000000
+- forward/backward OK, 파라미터 수 기존과 동일
+
+### 2) PAD 조기 종료 구조 (decode_from_vec)
+
+설계 과정에서 여러 방식 실험:
+
+**시도 A: `+1 PAD slot` (각 segment 끝에 PAD 1개)**
+- val acc 99.999%에도 **decode_from_vec 실패**. 학습 분포에서 decoder는 within_pos
+  0..N만 본 반면 추론 시 max_slot=8/16/32 할당하면 within_pos가 OOD.
+- **val 경로(원본 segment_ids) 100%**, **decode_from_vec 경로(균일 max_slot) 0%**
+  — 같은 codec인데 decoder 입력 shape이 달라 성능 정반대.
+
+**시도 B: `fixed_slot=True` (모든 segment를 max_jamo_per_token 슬롯 고정)**
+- 학습/추론 분포 완전 일치 → **decode_from_vec 일치율 100%**
+- 놀랍게도 학습 밖인 max_slot=32에서도 99.92% 일반화 (max_jamo=16 실험)
+- Encoder도 fixed-slot 분포로 학습 → downstream encoder 입력 부담 증가
+  (자모 3x, ELECTRA에 영향)
+
+**시도 C: `parallel_decoder` (encoder 가변 + decoder만 per-token self-attn)**
+- Encoder 가변, decoder가 `[B, P, max_slot, V]` parallel head
+- 구조는 우아하지만 B×P가 effective batch → **5060 Ti에서 OOM** (B=16에서)
+- 학습은 가능하지만 5090에서도 decoder 비용 8배라 본학습 부담
+- 아이디어는 남김. 여유 있으면 향후 실험
+
+**채택**: **시도 B (fixed_slot) + segment-masked conv** 조합. Codec은 과적합이
+목표(같은 토큰이면 같은 벡터)이고 ELECTRA에 encoder도 같은 입력 분포로
+써야 분포 일치. downstream 자모 3x는 수용.
+
+### 3) Leak test 재검증
+
+`SegmentMaskedConvBlock + fixed_slot(max_jamo=16)` 10k smoke 체크포인트:
+
+| offset | 구 codec (unmasked) | 새 codec (segment_masked) |
+|---|---|---|
+| 0 (self) | 99.80% (600k) | 99.94% (10k만!) |
+| ±1 | 22~29% (리크) | **9.92%** |
+| ±2 | ~11% | **9.92%** |
+| ±3 | ~11% | 9.95% |
+| ±4 | ~11% | 9.95% |
+
+**±1..±4 모두 동일** → offset 의존성 사라짐. 9.92%는 fixed_slot이 PAD 슬롯
+많아서 "PAD 맞추기" baseline(~84%)이 평균에 기여한 결과일 뿐, offset 차이가
+없다는 게 리크 0의 증거.
+
+### 4) Codec 경량화 실험 (fixed_slot=True, max_jamo=32, val_10k 10k step)
+
+Segment-masked라 토큰 경계 넘지 못하므로 큰 RF 불필요. 토큰 내 자모만 훑으면
+되니 layer/k 축소 가능.
+
+| Config | Params | RF | val acc | self recon | PAD 일치 | tok/s |
+|---|---|---|---|---|---|---|
+| 6L, k=7 (기존) | 5.83M | 37 | 99.999% (16slot) | 99.9%+ | 100% | ~0.4M |
+| **3L, k=3 (채택)** | **1.50M** | **7** | **99.90%** | **99.94%** | **100%** | **1.4M** |
+| 1L, k=3 | 0.71M | 3 | 99.26% | 99.29% | 95.4% | 2.7M |
+
+3L*k=3이 품질 거의 동등하면서 파라미터 1/4, 속도 3.5x. 1L도 실용적이지만 PAD
+일치율 95.4%로 완벽하지 않음 (긴 토큰에서 약간 손실).
+
+**본학습 config 확정**: `N_LAYERS=3, KERNEL=3, MAX_JAMO_PER_TOKEN=32,
+SEG_MASKED=1, FIXED_SLOT=1`.
+
+### 5) 본학습 데이터 전환
+
+- Codec은 "같은 토큰 → 같은 벡터" lookup처럼 동작하므로 **과적합 OK**
+- 모든 vocab을 본 적 있게 하는 게 핵심
+- **`corpus/k-exaone_coverage_100.parquet`** (12GB, 2.6M rows, 148K 토큰 각 100 샘플)
+- packing util 측정: 평균 96.8% (128 slot 중 ~124 토큰)
+- `MAX_STEPS=50000` (~2.5 epoch) 권장
+
+### 6) 학습 파이프라인 최적화
+
+본학습 돌리며 발견한 문제들과 수정:
+
+**a) DataLoader collate 실패** (`resize storage is not resizable`)
+- `special_patch_mask`의 P가 `n_segments`로 샘플마다 다른 shape → collate stack 실패
+- fix: `P = max_patches or max_seq_len`으로 고정 shape
+
+**b) rank별 "돌아가며 0%" GPU idle**
+- BBPE decode + 자모 분해 + packing이 CPU-heavy, 문서마다 variance
+- DDP가 가장 느린 rank에 sync → 다른 rank 번갈아 block
+- fix: `prefetch_factor=4` 기본 + `persistent_workers=True`
+- `NO_PIN_MEMORY` 옵션 (일부 Docker 환경 workaround)
+
+**c) BBPE decode overhead**
+- `bbpe.decode([tid])`를 토큰마다 호출 → Python↔Rust 왕복
+- fix 1: **token_id → 자모 seq lazy cache** (2.3x speedup, warm cache 기준)
+- fix 2: **`bbpe(list_of_texts)` batch encode** (8.3x speedup, 64개씩 버퍼링)
+
+**d) CPU RAM linear 증가 (진짜 범인은 여기였음)**
+- 원인: `max_seg = segment_ids.max() + 1`로 encoder 출력 dynamic shape →
+  torch.compile dynamo가 배치마다 재컴파일 → inductor cache/guards 누적
+- fix: `fixed_slot=True`면 encoder `fixed_output_len = max_seq_len / max_jamo`
+  (=128)로 고정 → single compile
+- 사용자 확인: worker 수 문제가 아니라 재컴파일 문제였음
+
+**e) 체크포인트 디스크 누수**
+- `upload_gdrive.py` cleanup glob에 `composition_*_step*.pt` 패턴 없어 정리 미작동
+- fix: glob 추가
+
+### 7) 본학습 실행 config
+
+```bash
+CORPUS=<ssd>/k-exaone_coverage_100.parquet \
+VAL_CORPUS=corpus/val.parquet \
+N_LAYERS=3 KERNEL=3 MAX_JAMO_PER_TOKEN=32 \
+SEG_MASKED=1 FIXED_SLOT=1 \
+BATCH_SIZE=256 SEQ_LEN=4096 \
+MAX_STEPS=50000 WARMUP=1000 LR=3e-4 \
+SAVE_EVERY=10000 VAL_EVERY=5000 \
+NUM_WORKERS=16 PREFETCH_FACTOR=8 \
+GDRIVE=gdrive:base-model-2-ckpts/composition-3L-k3 \
+NGPU=4 bash exp-jamo-codec/run_composition_train.sh
+```
+
+### 핵심 커밋
+
+- `0e4e24b` feat: segment-masked conv + PAD 조기종료 + decoder 경량화 옵션
+- `7d4b899` fix: pin_memory 에러 우회 옵션
+- `0bf42b6` perf: DataLoader prefetch_factor=4
+- `9eddd28` perf: BBPE token→자모 lazy cache (2.3x)
+- `1c6f024` perf: BBPE encode를 64개 batch로 (8.3x)
+- `7b96731` fix: cleanup glob에 composition_*.pt 추가
+- `254d392` fix: fixed_slot 시 encoder fixed_output_len (compile recompile 방지)
+
+### 다음 단계
+
+1. Codec 50k step 본학습 (5090x4)
+2. Leak test 재검증 (±1..±4 모두 baseline 수준인지)
+3. decode_from_vec (max_slot=32) 일치율 100% 확인
+4. KoELECTRA Small v3 재학습 (새 codec, 기존 config 그대로)
+   - 800k step, λ=50, mask 20%, Gen=Disc 1:1
+   - 중간 NSMC: 50k, 100k, 200k, 400k
+   - 기대: 리크 0이므로 이전 "82%±1% 진동" 개선, KoELECTRA 원조 89.6% 근접
+5. **장기 대안 후보** (본학습 결과 기대 이하면):
+   - parallel_decoder (encoder-only 경로 부담 줄이기)
+   - λ 하향 (50→25 또는 10)
+   - LR 스케줄 WSD 전환 (peak 유지 구간 줄이기)
