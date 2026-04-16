@@ -267,16 +267,19 @@ class CompositionDecoder(nn.Module):
         self.head = nn.Linear(d_model, jamo_vocab)
 
     def forward(self, token_vecs: torch.Tensor, segment_ids: torch.Tensor,
-                target_len: int, jamo_mask: torch.Tensor = None) -> torch.Tensor:
+                target_len: int, jamo_mask: torch.Tensor = None,
+                return_hidden: bool = False):
         """
         Args:
             token_vecs: [B, max_segments, d_model]
             segment_ids: [B, L] 각 자모의 토큰 ID
             target_len: 출력 자모 길이 L
             jamo_mask: [B, L] bool, 유효 위치 (선택)
+            return_hidden: True 면 pre-head hidden state 도 함께 반환
 
         Returns:
             logits: [B, L, jamo_vocab]
+            (return_hidden=True 일 때 (logits, h_dec) tuple, h_dec: [B, L, D])
         """
         B, L = segment_ids.shape
         D = token_vecs.size(-1)
@@ -319,7 +322,10 @@ class CompositionDecoder(nn.Module):
                 if jamo_mask is not None:
                     x = x * jamo_mask.unsqueeze(-1).float()
 
-        return self.head(x)  # [B, L, V]
+        logits = self.head(x)  # [B, L, V]
+        if return_hidden:
+            return logits, x
+        return logits
 
 
 class CompositionCodec(nn.Module):
@@ -438,7 +444,10 @@ class CompositionCodec(nn.Module):
                     "target_slot": target_slot, "slot_loss_mask": slot_loss_mask}
 
         # === 기존 conv decoder 경로 ===
-        logits = self.decoder(z, segment_ids, L, jamo_mask)  # [B, L, V]
+        # return_hidden=True 로 pre-head hidden state 도 같이 받음 (VICReg 용)
+        logits, h_dec = self.decoder(
+            z, segment_ids, L, jamo_mask, return_hidden=True
+        )  # logits: [B, L, V], h_dec: [B, L, D]
 
         # Loss — jamo_mask로만 필터 (ignore_index 제거: PAD target도 학습 대상)
         flat_logits = logits.reshape(-1, self.jamo_vocab)
@@ -448,7 +457,7 @@ class CompositionCodec(nn.Module):
         loss = F.cross_entropy(flat_logits, flat_targets, reduction="none")
         loss = loss[valid].mean()
 
-        return {"logits": logits, "loss": loss, "z": z}
+        return {"logits": logits, "loss": loss, "z": z, "h_dec": h_dec}
 
     def encode(self, jamo_ids, jamo_mask, segment_ids, n_segments):
         """인코딩만 (backbone 입력용)"""

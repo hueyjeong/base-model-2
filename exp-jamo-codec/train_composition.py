@@ -32,6 +32,62 @@ def _unwrap_state_dict(model):
     return {k[len(prefix):] if k.startswith(prefix) else k: v for k, v in sd.items()}
 
 
+def vicreg_loss(feats: torch.Tensor, mask: torch.Tensor, eps: float = 1e-4):
+    """VICReg-style variance + covariance regularization.
+
+    BF16 autocast 영역 안에서 호출돼도 수치 안정성을 위해 **FP32 로 강제 계산**.
+    caller 는 autocast 컨텍스트 안에서 호출해도 안전.
+
+    Args:
+        feats: [B, T, D] feature tensor (encoder z 또는 decoder h_dec)
+        mask:  [B, T] bool, 유효 위치 마스크
+        eps: std clamp 하한
+
+    Returns:
+        (loss_var, loss_cov, eff_rank) — 각각 scalar tensor / float
+        loss_var: ReLU(1 - std).mean() — 각 차원이 unit variance 이상 되도록
+        loss_cov: off-diagonal covariance² 평균 — 차원 간 decorrelation
+        eff_rank: exp(spectral entropy) — 실효 랭크 (로깅용, no grad)
+    """
+    # FP32 강제 + autocast 비활성 (eigvalsh 가 bf16 미지원 + cov 수치 안정성)
+    with torch.autocast(device_type=feats.device.type, enabled=False):
+        feats = feats.float()
+        D = feats.size(-1)
+        # 유효 위치만 flatten
+        z = feats[mask]  # [N, D]
+        N = z.size(0)
+        if N < 2:
+            zero = feats.sum() * 0.0
+            return zero, zero, 0.0
+
+        # Centering
+        z_c = z - z.mean(dim=0, keepdim=True)
+
+        # Variance term: 각 차원 std >= 1
+        std = torch.sqrt(z_c.var(dim=0, unbiased=False) + eps)  # [D]
+        loss_var = torch.nn.functional.relu(1.0 - std).mean()
+
+        # Covariance term: off-diagonal² 평균
+        # cov: [D, D], 대각 제거 후 frobenius² / D
+        cov = (z_c.T @ z_c) / max(N - 1, 1)  # [D, D]
+        # 대각 요소 제거
+        off_diag = cov - torch.diag(torch.diag(cov))
+        loss_cov = off_diag.pow(2).sum() / D  # VICReg 원 공식
+
+        # 로깅용 effective rank (gradient 흐르지 않음)
+        with torch.no_grad():
+            eigvals = torch.linalg.eigvalsh(cov).clamp(min=1e-8)
+            total = eigvals.sum()
+            if total > 0:
+                p = eigvals / total
+                entropy = -(p * p.log()).sum()
+                eff_rank = float(torch.exp(entropy).item())
+            else:
+                eff_rank = 0.0
+
+    return loss_var, loss_cov, eff_rank
+
+
 @torch.no_grad()
 def validate(codec, val_loader, device, max_samples=1000, world_size=1):
     """검증 세트 복원 정확도 측정.
@@ -352,7 +408,43 @@ def train(args):
 
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
             out = codec(jamo_ids, jamo_mask, segment_ids, n_segments)
-            loss = out["loss"] / grad_accum
+            recon_loss = out["loss"]
+
+            # VICReg: variance + covariance 정규화
+            vicreg_var_loss = torch.zeros((), device=device)
+            vicreg_cov_loss = torch.zeros((), device=device)
+            eff_rank_z = 0.0
+            eff_rank_h = 0.0
+            if args.vicreg_var > 0 or args.vicreg_cov > 0:
+                # warmup 계수 (0~1)
+                if args.vicreg_warmup > 0:
+                    ramp = min(1.0, global_step / args.vicreg_warmup)
+                else:
+                    ramp = 1.0
+                lam_var = args.vicreg_var * ramp
+                lam_cov = args.vicreg_cov * ramp
+
+                # FP32 로 reg 계산 (BF16 autocast 안에서 covariance 수치 안정성 확보)
+                if args.vicreg_target in ("z", "both") and "z" in out:
+                    z = out["z"].float()  # [B, P, D]
+                    B_, P_, D_ = z.shape
+                    seg_idx = torch.arange(P_, device=z.device).unsqueeze(0).expand(B_, -1)
+                    seg_valid_mask = seg_idx < n_segments.unsqueeze(1)
+                    lv, lc, eff_rank_z = vicreg_loss(z, seg_valid_mask)
+                    vicreg_var_loss = vicreg_var_loss + lv
+                    vicreg_cov_loss = vicreg_cov_loss + lc
+
+                if args.vicreg_target in ("h_dec", "both") and "h_dec" in out:
+                    h = out["h_dec"].float()  # [B, L, D]
+                    lv, lc, eff_rank_h = vicreg_loss(h, jamo_mask)
+                    vicreg_var_loss = vicreg_var_loss + lv
+                    vicreg_cov_loss = vicreg_cov_loss + lc
+
+                total_loss = recon_loss + lam_var * vicreg_var_loss + lam_cov * vicreg_cov_loss
+            else:
+                total_loss = recon_loss
+
+            loss = total_loss / grad_accum
 
         loss.backward()
 
@@ -372,6 +464,15 @@ def train(args):
         accum_loss += loss.item() * grad_accum
         accum_correct += correct
         accum_total += total
+        # VICReg 통계 (있을 때만)
+        if args.vicreg_var > 0 or args.vicreg_cov > 0:
+            if "accum_var" not in locals():
+                accum_var, accum_cov, accum_rank_z, accum_rank_h, accum_rank_cnt = 0.0, 0.0, 0.0, 0.0, 0
+            accum_var += float(vicreg_var_loss.detach())
+            accum_cov += float(vicreg_cov_loss.detach())
+            accum_rank_z += eff_rank_z
+            accum_rank_h += eff_rank_h
+            accum_rank_cnt += 1
         micro_step += 1
 
         if micro_step % grad_accum != 0:
@@ -396,7 +497,15 @@ def train(args):
             lr = scheduler.get_last_lr()[0]
 
             progress = global_step / args.max_steps * 100
-            print(f"{global_step:8d} {avg_loss:15.12f} {avg_acc:16.12f}% {lr:10.2e} {tok_s:8.0f}  {progress:.1f}% L{max_line_counter:,}")
+            line = (f"{global_step:8d} {avg_loss:15.12f} {avg_acc:16.12f}% "
+                    f"{lr:10.2e} {tok_s:8.0f}  {progress:.1f}% L{max_line_counter:,}")
+            if args.vicreg_var > 0 or args.vicreg_cov > 0:
+                cnt = max(accum_rank_cnt, 1)
+                line += (f"  var={accum_var/cnt:.4f} cov={accum_cov/cnt:.4f} "
+                         f"rank_z={accum_rank_z/cnt:.1f} rank_h={accum_rank_h/cnt:.1f}")
+                accum_var = accum_cov = accum_rank_z = accum_rank_h = 0.0
+                accum_rank_cnt = 0
+            print(line)
 
             accum_loss = 0.0
             accum_correct = 0
@@ -521,6 +630,19 @@ def main():
                         help="DataLoader worker당 미리 prefetch할 batch 수 (rank 간 CPU variance 흡수)")
     parser.add_argument("--no_pin_memory", action="store_true",
                         help="pin_memory 끄기 (DDP/Docker에서 resize storage 에러 시)")
+
+    # VICReg (variance + covariance) 정규화
+    parser.add_argument("--vicreg_var", type=float, default=0.0,
+                        help="VICReg variance term λ (0=비활성). 각 차원 std>=1 강제. "
+                             "일반적 값 0.1~1.0")
+    parser.add_argument("--vicreg_cov", type=float, default=0.0,
+                        help="VICReg covariance term λ (0=비활성). 차원 간 decorrelation. "
+                             "일반적 값 0.005~0.05")
+    parser.add_argument("--vicreg_target", default="z",
+                        choices=["z", "h_dec", "both"],
+                        help="VICReg 적용 위치: z(encoder), h_dec(decoder pre-head), both")
+    parser.add_argument("--vicreg_warmup", type=int, default=0,
+                        help="VICReg λ 를 0→target 까지 선형 warmup 스텝 수 (0=즉시 적용)")
 
     # 로깅/저장/재개
     parser.add_argument("--log_every", type=int, default=100)

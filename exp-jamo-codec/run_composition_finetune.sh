@@ -123,6 +123,15 @@ DEC_HEADS_FLAG=""
 NO_PIN_FLAG=""
 [ -n "${NO_PIN_MEMORY}" ] && NO_PIN_FLAG="--no_pin_memory"
 
+# ── VICReg 플래그 (선택) ──
+# VICREG_VAR, VICREG_COV 설정 시 활성. VICREG_TARGET 은 z|h_dec|both (기본 z)
+VICREG_FLAGS=""
+if [ -n "${VICREG_VAR}" ] || [ -n "${VICREG_COV}" ]; then
+    VICREG_FLAGS="--vicreg_var ${VICREG_VAR:-0} --vicreg_cov ${VICREG_COV:-0}"
+    [ -n "${VICREG_TARGET}" ] && VICREG_FLAGS="${VICREG_FLAGS} --vicreg_target ${VICREG_TARGET}"
+    [ -n "${VICREG_WARMUP}" ] && VICREG_FLAGS="${VICREG_FLAGS} --vicreg_warmup ${VICREG_WARMUP}"
+fi
+
 echo "=== CompositionCodec fine-tune ==="
 if [ -n "${RESUME}" ]; then
     echo "Resume from: ${RESUME} (전체 상태 복원)"
@@ -158,6 +167,7 @@ torchrun --nproc_per_node=${NGPU} exp-jamo-codec/train_composition.py \
     --prefetch_factor ${PREFETCH_FACTOR} \
     ${SEG_MASKED_FLAG} ${PAD_SLOT_FLAG} ${FIXED_SLOT_FLAG} \
     ${PARALLEL_DEC_FLAG} ${DEC_LAYERS_FLAG} ${DEC_HEADS_FLAG} ${NO_PIN_FLAG} \
+    ${VICREG_FLAGS} \
     ${RESUME:+--resume ${RESUME}} \
     ${INIT_FROM:+--init_from ${INIT_FROM}} \
     2>&1 | tee "${LOG_PATH}"
