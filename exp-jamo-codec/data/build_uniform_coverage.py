@@ -1,25 +1,30 @@
 """build_uniform_coverage.py — BBPE 전체 vocab 균일 커버리지 데이터셋 생성
 
-K-Exaone 153K BBPE vocab의 모든 토큰 ID에 대해 동일 횟수(N)의 row를 생성.
-각 row는 해당 토큰의 디코딩 텍스트 1개. 자모 분해 > max_jamo_per_token인
-토큰은 fallback 경로(공백 분할 → 문자 분할)의 sub-part도 별도 row로 생성.
+K-Exaone 153K BBPE vocab의 모든 토큰 ID에 대해 1개 row 생성.
+각 row는 해당 토큰의 디코딩 텍스트를 ~target_chars(기본 2000)글자 채울 때까지
+separator(기본 "|")로 반복 연결. 한 row 안에서 해당 토큰이 N회 등장.
 
-SegmentMaskedConvBlock이 토큰 간 상호작용을 차단하므로,
-단일 토큰 row가 실제 문서 속 토큰과 동일한 gradient signal을 준다.
+이 구조의 이점:
+- 단일 토큰 row보다 훨씬 긴 row → 데이터 로더 처리 효율 ↑ (동일 커버리지 대비 row 수 1/N)
+- 한 번의 BBPE encode 로 수백 번의 gradient signal
+- SegmentMaskedConvBlock이 토큰 간 상호작용을 차단하므로, 반복된 같은 토큰이라도
+  각 세그먼트가 독립적으로 gradient 에 기여 (실제 문서 속 등장과 동일)
+
+Fallback 토큰(자모 > 32)도 같은 방식으로 row 생성. 데이터셋 로더의
+_decompose_ids 가 공백/문자 분할을 자동 수행하므로 별도 처리 불필요.
 
 사용:
-    # 기본 (토큰당 100행, parquet 저장)
+    # 기본 (토큰당 1행 × 2000자 ≈ 153,600행, parquet 저장)
     python exp-jamo-codec/data/build_uniform_coverage.py
 
-    # 토큰당 500행 + 기존 코퍼스 병합
+    # 행당 4000자 + 기존 코퍼스 병합
     python exp-jamo-codec/data/build_uniform_coverage.py \\
-        --repeats 500 \\
+        --target_chars 4000 \\
         --merge corpus/k-exaone_coverage_100.parquet \\
         --output corpus/k-exaone_coverage_100_uniform.parquet
 
-    # fallback 토큰만 집중 (각 1000행)
-    python exp-jamo-codec/data/build_uniform_coverage.py \\
-        --repeats 1000 --fallback_only
+    # fallback 토큰만 집중
+    python exp-jamo-codec/data/build_uniform_coverage.py --fallback_only
 """
 import argparse
 import os
@@ -43,96 +48,97 @@ def build_token_texts(
     fallback_only: bool = False,
     verbose: bool = True,
 ) -> dict:
-    """전체 BBPE vocab → 토큰별 텍스트 + fallback sub-part 텍스트 수집.
+    """전체 BBPE vocab → 토큰별 decode 텍스트 수집.
 
     Returns:
         {
-            "token_texts": list[str],       # 토큰 ID 순서대로 decode 텍스트
-            "fallback_parts": list[str],     # fallback 경로에서 나오는 sub-part 텍스트
-            "n_fallback_tokens": int,        # fallback 필요한 토큰 수
-            "n_fallback_parts": int,         # 총 fallback sub-part 수
+            "token_texts": list[str],       # 토큰 ID 순서대로 decode 텍스트 (빈 문자열 제외)
+            "n_fallback_tokens": int,        # 자모 > max_jamo_per_token 인 토큰 수
         }
     """
     vocab_size = len(bbpe_tok)
     token_texts: List[str] = []
-    fallback_parts: List[str] = []
-    fallback_parts_set: set = set()
     n_fallback = 0
 
     for tid in range(vocab_size):
         tok_str = bbpe_tok.decode([tid])
         if not tok_str:
-            tok_str = ""
+            continue
 
-        # 자모 분해 길이 확인
-        jids = jamo_tok.encode(tok_str, add_special=False) if tok_str else []
+        # 자모 분해 길이 확인 (fallback 판별)
+        jids = jamo_tok.encode(tok_str, add_special=False)
         is_fallback = len(jids) > max_jamo_per_token
 
         if fallback_only and not is_fallback:
             continue
 
         token_texts.append(tok_str)
-
         if is_fallback:
             n_fallback += 1
-            # fallback 경로 재현: 공백 분할 → 문자 분할
-            parts = re.split(r'( )', tok_str)
-            for part in parts:
-                if not part:
-                    continue
-                pj = jamo_tok.encode(part, add_special=False)
-                if len(pj) <= max_jamo_per_token:
-                    if part not in fallback_parts_set:
-                        fallback_parts_set.add(part)
-                        fallback_parts.append(part)
-                else:
-                    # 문자 단위 분할
-                    for ch in part:
-                        cj = jamo_tok.encode(ch, add_special=False)
-                        if cj and ch not in fallback_parts_set:
-                            fallback_parts_set.add(ch)
-                            fallback_parts.append(ch)
 
     if verbose:
         print(f"Vocab 크기: {vocab_size:,}")
-        print(f"토큰 텍스트: {len(token_texts):,}")
-        print(f"Fallback 토큰: {n_fallback:,} ({n_fallback/vocab_size*100:.2f}%)")
-        print(f"Fallback sub-part: {len(fallback_parts):,} (중복 제거)")
+        print(f"수집된 토큰 텍스트: {len(token_texts):,} (빈 문자열 제외)")
+        print(f"Fallback 토큰 (자모 > {max_jamo_per_token}): {n_fallback:,}")
 
     return {
         "token_texts": token_texts,
-        "fallback_parts": fallback_parts,
         "n_fallback_tokens": n_fallback,
-        "n_fallback_parts": len(fallback_parts),
     }
+
+
+def _make_row(text: str, target_chars: int, sep: str) -> str:
+    """한 토큰의 텍스트를 target_chars 까지 sep 로 구분하여 반복."""
+    if not text:
+        return ""
+    unit_len = len(text) + len(sep)
+    if unit_len <= 0:
+        return text
+    # 최소 1회 보장, sep 제외한 실 길이 기준 채우기
+    n = max(1, target_chars // unit_len)
+    return sep.join([text] * n)
 
 
 def generate_rows(
     token_texts: List[str],
-    fallback_parts: List[str],
-    repeats: int = 100,
+    target_chars: int = 2000,
+    separator: str = "|",
     seed: int = 42,
     verbose: bool = True,
 ) -> List[str]:
-    """토큰 텍스트와 fallback part를 repeats 횟수만큼 반복 → 셔플.
+    """각 토큰 텍스트 → target_chars 까지 반복 연결한 row 생성 후 셔플.
+
+    Args:
+        token_texts: 토큰별 decode 텍스트 리스트
+        target_chars: row 당 목표 문자 수 (기본 2000)
+        separator: 반복 사이 구분자 (기본 "|")
+        seed: 셔플 시드
 
     Returns:
-        셔플된 텍스트 row 리스트
+        셔플된 row 리스트 (토큰당 1개)
     """
     rows: List[str] = []
+    total_chars = 0
+    total_repeats = 0
 
-    # 각 토큰 텍스트 N번 반복
     for text in token_texts:
-        if text:  # 빈 문자열 제외
-            rows.extend([text] * repeats)
-
-    # fallback sub-part도 동일 횟수 반복
-    for part in fallback_parts:
-        if part:
-            rows.extend([part] * repeats)
+        row = _make_row(text, target_chars, separator)
+        if not row:
+            continue
+        rows.append(row)
+        total_chars += len(row)
+        # 반복 횟수 = row 길이 대비 unit 길이로 역산
+        unit_len = len(text) + len(separator)
+        n = len(row) // unit_len if unit_len > 0 else 1
+        total_repeats += n
 
     if verbose:
-        print(f"총 row 수 (셔플 전): {len(rows):,}")
+        avg_chars = total_chars / max(len(rows), 1)
+        avg_reps = total_repeats / max(len(rows), 1)
+        print(f"생성된 row: {len(rows):,}")
+        print(f"평균 row 길이: {avg_chars:.0f}자")
+        print(f"평균 토큰 반복 횟수: {avg_reps:.0f}")
+        print(f"총 텍스트 크기: {total_chars/1024/1024:.1f} MB")
 
     # 셔플
     rng = np.random.default_rng(seed)
@@ -183,8 +189,10 @@ def main():
         description="BBPE 전체 vocab 균일 커버리지 데이터셋 생성")
     parser.add_argument("--output", default="corpus/k-exaone_uniform_coverage.parquet",
                         help="출력 Parquet 경로")
-    parser.add_argument("--repeats", type=int, default=100,
-                        help="토큰당 반복 횟수 (기본 100)")
+    parser.add_argument("--target_chars", type=int, default=2000,
+                        help="row 당 목표 문자 수 (기본 2000)")
+    parser.add_argument("--separator", default="|",
+                        help="토큰 반복 사이 구분자 (기본 '|')")
     parser.add_argument("--max_jamo_per_token", type=int, default=32,
                         help="이 이상의 자모 길이 토큰은 fallback 경로로 처리")
     parser.add_argument("--fallback_only", action="store_true",
@@ -218,8 +226,8 @@ def main():
     # row 생성 + 셔플
     rows = generate_rows(
         result["token_texts"],
-        result["fallback_parts"],
-        repeats=args.repeats,
+        target_chars=args.target_chars,
+        separator=args.separator,
         seed=args.seed,
     )
 
