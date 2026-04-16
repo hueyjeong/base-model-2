@@ -1690,3 +1690,140 @@ NGPU=4 bash exp-jamo-codec/run_composition_train.sh
 - 해결은 **LD_PRELOAD + 낭비 allocation 제거** 두 축 필요. 단독으로는 부족.
 - 디버깅 순서: Python level (tracemalloc) → Allocator level (jemalloc 시도) → Application level (batch/worker 구조).
 
+---
+
+## 2026-04-16 — eval 포맷 버그 + 가변 길이 fine-tune + token_vec rank 분석
+
+### 1. eval_composition.py 포맷 불일치 버그 수정
+
+체크포인트 (`composition_5L_step40000.pt`, `fixed_slot=True`)는 학습 val 99.999% 였는데 동일 corpus 로 eval 돌리면 전혀 맞지 않는 현상.
+
+**원인**: 학습 경로([bbpe_jamo_dataset.py:358-468](data/bbpe_jamo_dataset.py#L358-L468))는 `BBPEJamoDataset(fixed_slot=True)` + BOS/EOS 래핑인데, eval 의 `_worker_tokenize_batch` 는 가변 길이 + BOS/EOS 없음 — 학습 분포 밖 입력을 모델에 넣고 있었음.
+
+**수정** ([eval_composition.py](eval_composition.py)):
+- `saved_args` 에서 `fixed_slot`, `append_pad_slot`, `max_jamo_per_token`, `fixed_output_len` 자동 복원
+- `_worker_tokenize_batch` 에 fixed_slot 패딩 + BOS/EOS 래핑 재현
+- 진단용 `--force_variable`, `--force_append_pad` 플래그 추가
+
+**검증**: 1000 샘플 자모 정확도 **100.0000%** 달성 (학습 val 과 일치).
+
+### 2. 가변 길이 fine-tune 성공 — 로컬 2k sanity
+
+fixed_slot 의 용량 낭비 (4096 자모 중 ~3200 이 intra-PAD → 토큰 126개 한계) 해결을 위해 가변 모드로 fine-tune.
+
+**로컬 2k 결과** (RTX 5060 Ti 단일 GPU, BATCH=16×ACCUM=4):
+
+| step | val acc | loss |
+|---|---|---|
+| 200 | 99.588% | 0.01503 |
+| 600 | 99.954% | 0.00166 |
+| 1000 | 99.979% | 0.00077 |
+| 2000 | 99.986% | 0.00048 |
+
+**eval (1000 샘플)**: 99.9681% (fixed_slot 체크포인트 100% / `--force_variable` 68.85% 비교) — 가변 적응 완료.
+
+**핵심 인사이트**: Conv weights 와 embedding 대부분이 가변 레이아웃에서도 그대로 유효 → `SegmentMaskedConvBlock` 이 진짜로 layout-agnostic. `intra_pos_emb` 만 빠르게 재매핑.
+
+### 3. 본학습 (DDP 4GPU, step 5k~25k) 결과
+
+INIT_FROM=`step40000.pt` (fixed_slot) 에서 warm-start, 순수 가변 모드로 5k 씩 resume 확장.
+
+| step | eval 자모 정확도 | 오류 샘플 | fail 토큰 |
+|---|---|---|---|
+| 15k (log 7) | 99.9995% | 1,407 | hangul 95, ascii 696, other 696 |
+| 15k 재평가 (log 9) | 99.9998% | 591 | 분포 약간 다름 (FP 비결정성) |
+| 20k (log 10, uniform corpus) | 99.9997% | 936 | 1,530 미출현 |
+| 25k (log 8) | **99.9998%** | **484** | hangul 44, ascii 232, other 217 |
+
+**5k → 10k → 15k → 20k → 25k resume 방식의 LR 동역학**: 각 resume 마다 cosine lambda 가 새 `max_steps` 로 재계산 → step N/N 에서 ~0% 까지 떨어졌던 LR 이 새 MAX_STEPS 기준 ~8% 로 점프 후 재감쇠. 부분 SGDR warm-restart 효과.
+
+**포화 확인**: 20k 이후 resume 으로 LR 낮춰도 loss 거의 안 떨어짐. 25k 에서 사실상 수렴.
+
+### 4. BBPE roundtrip 이슈 + uniform coverage 데이터셋
+
+**관찰**: 같은 BBPE 토큰이 A 문서에서는 성공, B 문서에서는 실패. **FP 비결정성** 원인:
+- `scatter_add_` (Segment Avg Pool) 의 CUDA atomic 누적 순서 비결정적
+- 배치/seq 크기 차이로 kernel scheduling 달라짐
+- 학습은 BF16 autocast, eval/val 은 FP32 — logit 경계 ~1e-7 노이즈에 argmax 뒤집힘
+- 실패 집중 토큰이 긴 / 희귀 / 동의어가 많은 것들 (logit 마진 얇은 케이스) 과 정확히 일치
+
+**해결책**: 실패/미출현 토큰 집중 노출. [build_uniform_coverage.py](data/build_uniform_coverage.py) 작성:
+- 153,600 BBPE 토큰 모두 1개 row
+- 각 row 를 `token|token|...` 로 ~2000자 채움 (평균 395회 반복)
+- 셔플 저장, ~2.8MB (zstd)
+- BBPE roundtrip 보존 검증 완료 (타겟 토큰 ID 가 재인코딩 시 250~1000회 일관되게 등장)
+
+**데이터 로더 효율 최적화**: 기존 "토큰당 N row" → "토큰당 1 row ×긴 문자열" 전환으로 row 수 1/400 로 감소, 데이터 로딩 병목 해소.
+
+### 5. Token vector rank 분석 (중요 발견)
+
+`d_model` 확장 / attention 전환 논의 중 **실제 representation space 가 얼마나 쓰이는지** 진단 → [analyze_token_vecs.py](analyze_token_vecs.py).
+
+**step 20000 체크포인트, 다양 코퍼스 10M 벡터 분석**:
+
+```
+Effective rank:   43.9 / 256 (17%)     ← 극도로 낮음
+95% variance:     60 / 256 (23%)
+99% variance:     109 / 256 (43%)
+상위 10% (25.6차원) = 분산의 78.2%
+cos mean: +0.0964, |cos| mean: 0.1378  (anisotropy 있음)
+```
+
+**해석**:
+- 256차원 중 실질 ~44차원만 활용 → 200+ 차원이 **사실상 노는 공간**
+- 153K 토큰이 저차원 subspace 에 빼곡히 packing 된 상태 ("pancake")
+- 토큰 간 평균 각도 ~15° — 구별은 되지만 마진 작음
+- 복원 99.9998% 되는 이유: log₂(153,600) ≈ 17 bits 정보를 7~44 차원이면 충분히 담음
+
+**영향**:
+- Codec 단독 용도: 문제 없음 (오히려 효율적)
+- **Downstream (ELECTRA/GEC) 용도: 문제** — 풍부한 의미 구조 학습에 필요한 capacity 부족
+- **d_model 확장은 효과 제한적** — 이미 놀고 있는 차원이 많은 상태에서 추가해도 활용 안 됨
+
+### 6. 다음 단계 설계 논의
+
+**해법 방향 — VICReg 스타일 variance + covariance regularization**:
+
+```python
+# 각 차원 std >= 1 강제 (collapse 방지)
+std = z.std(0)
+loss_var = F.relu(1.0 - std).mean()
+
+# 차원 간 decorrelation
+z_c = z - z.mean(0)
+cov = (z_c.T @ z_c) / (N - 1)
+off_diag = cov - torch.diag(torch.diag(cov))
+loss_cov = off_diag.pow(2).sum() / D
+
+total = recon + λ_var * loss_var + λ_cov * loss_cov
+```
+
+5개 후보 (VICReg, Barlow Twins, simple orthogonality, explicit effective rank, contrastive) 중 **VICReg 선택 이유**:
+- 구현 10줄 이내, 계산 비용 ~1%
+- variance + covariance 독립 튜닝 가능
+- Collapse 저항 강 (ReLU 하한)
+- 이 프로젝트에 contrastive 쓸 자연 pair 가 없음
+
+**다음 세대 모델 설계 방향**:
+- 처음부터 가변 모드 (fixed_slot 의 용량 낭비 제거)
+- `d_model=256` 유지 (확장 효과 제한적)
+- VICReg reg 추가 → 256차원 전부 활용하도록 학습
+- 혼합 코퍼스 (일반 텍스트 + uniform coverage)
+
+### 핵심 커밋
+
+- `f136f28` fix: eval_composition.py가 학습 포맷(fixed_slot/BOS-EOS) 복원
+- `5f8c5e1` feat: run_composition_finetune.sh — warm-start fine-tune 전용
+- `466feda` feat: build_uniform_coverage.py — BBPE 전체 vocab 균일 커버리지
+- `499b74f` refactor: build_uniform_coverage — row당 ~2000자 반복 연결 (로딩 병목 해소)
+- `8f61982` feat: run_composition_finetune.sh에 RESUME 지원
+- `2d74423` feat: analyze_token_vecs.py — encoder token_vec 공간 진단
+
+### 교훈
+
+- **체크포인트 `saved_args` 전체 복원 필수** — 학습 포맷과 eval 포맷이 달라지면 모델이 학습 분포 밖 입력을 받아 결과 붕괴. fixed_slot/append_pad_slot/fixed_output_len 같은 토큰화 영향 인자는 saved_args 에서 자동 복원해야 함.
+- **Fine-tune 이 from-scratch 대비 매우 효율적** — warm-start 로 2k step 만에 99.97% 달성. conv-based 아키텍처가 레이아웃 전환에 놀랄 만큼 robust.
+- **loss 포화 ≠ 모델 한계** — 현 체크포인트의 loss floor 는 rank collapse 된 표현의 한계일 수 있음. 차원 확장/정규화로 loss 바닥을 더 낮출 여지 있음.
+- **Codec reconstruction 지표만 보면 숨겨지는 문제** — 99.9998% acc 인 모델이 256차원 중 44차원만 쓰는 상태. Downstream 용도라면 rank 를 별도로 진단해야 함.
+- **데이터 특성이 rank 를 왜곡** — uniform coverage corpus 는 row 내 동일 토큰 반복이라 rank 분석이 인공적으로 낮게 나옴 (6.83). 반드시 다양한 텍스트 코퍼스로 재분석 필요.
+
