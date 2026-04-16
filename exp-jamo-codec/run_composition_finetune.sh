@@ -2,8 +2,20 @@
 # CompositionCodec fine-tune — warm-start 로 기존 체크포인트 가중치 재사용.
 # 기본: 순수 가변 (fixed_slot=F, append_pad_slot=F) 로 5k step sanity run.
 #
-# 예) 최소 호출 (4 GPU, 기본값):
+# INIT_FROM: 가중치만 로드, step 0 재시작, optimizer/scheduler 새로 생성.
+#            첫 fine-tune 런에 사용.
+# RESUME   : 모델+optimizer+scheduler+step+data_state 전체 복원. 이전 fine-tune
+#            런을 이어서 MAX_STEPS 확장 시 사용. cosine lambda 가 새 MAX_STEPS
+#            기준으로 재계산돼 SGDR 비슷한 부분 warm-restart 효과.
+# 둘 중 하나는 필수 (상호 배타). RESUME 지정 시 INIT_FROM 무시.
+#
+# 예) 최소 호출 (첫 fine-tune, 4 GPU):
 #   INIT_FROM=exp-jamo-codec/checkpoints/composition_5L_step40000.pt \
+#   NGPU=4 bash exp-jamo-codec/run_composition_finetune.sh
+#
+# 예) 이어서 5k 확장 (resume):
+#   RESUME=exp-jamo-codec/checkpoints_ft_variable/composition_5L_step25000.pt \
+#   MAX_STEPS=30000 \
 #   NGPU=4 bash exp-jamo-codec/run_composition_finetune.sh
 #
 # 예) GDRIVE 백업 포함:
@@ -28,14 +40,25 @@ if [ -z "${NO_JEMALLOC}" ]; then
     fi
 fi
 
-# ── INIT_FROM 필수 체크 ──
-if [ -z "${INIT_FROM}" ]; then
-    echo "ERROR: INIT_FROM 환경변수 필수 (warm-start 체크포인트 경로)"
-    echo "  예: INIT_FROM=exp-jamo-codec/checkpoints/composition_5L_step40000.pt"
+# ── INIT_FROM / RESUME 상호 배타 체크 ──
+RESUME="${RESUME:-}"
+INIT_FROM="${INIT_FROM:-}"
+if [ -z "${INIT_FROM}" ] && [ -z "${RESUME}" ]; then
+    echo "ERROR: INIT_FROM 또는 RESUME 둘 중 하나는 필수"
+    echo "  INIT_FROM=.../ckpt.pt  — 가중치만 로드, step 0 재시작 (첫 fine-tune)"
+    echo "  RESUME=.../ckpt.pt     — 전체 상태 복원, step 이어받음 (fine-tune 확장)"
     exit 1
 fi
-if [ ! -f "${INIT_FROM}" ]; then
+if [ -n "${RESUME}" ] && [ -n "${INIT_FROM}" ]; then
+    echo "WARNING: RESUME 과 INIT_FROM 모두 지정됨 — RESUME 우선 사용, INIT_FROM 무시"
+    INIT_FROM=""
+fi
+if [ -n "${INIT_FROM}" ] && [ ! -f "${INIT_FROM}" ]; then
     echo "ERROR: INIT_FROM 파일이 존재하지 않음: ${INIT_FROM}"
+    exit 1
+fi
+if [ -n "${RESUME}" ] && [ ! -f "${RESUME}" ]; then
+    echo "ERROR: RESUME 파일이 존재하지 않음: ${RESUME}"
     exit 1
 fi
 
@@ -101,7 +124,11 @@ NO_PIN_FLAG=""
 [ -n "${NO_PIN_MEMORY}" ] && NO_PIN_FLAG="--no_pin_memory"
 
 echo "=== CompositionCodec fine-tune ==="
-echo "Init from: ${INIT_FROM}"
+if [ -n "${RESUME}" ]; then
+    echo "Resume from: ${RESUME} (전체 상태 복원)"
+else
+    echo "Init from: ${INIT_FROM} (가중치만, step 0 재시작)"
+fi
 echo "Corpus: ${CORPUS}"
 echo "Val corpus: ${VAL_CORPUS}"
 echo "Arch: d=${D_MODEL}, L=${N_LAYERS}, k=${KERNEL}, max_jamo_per_token=${MAX_JAMO_PER_TOKEN}"
@@ -131,7 +158,8 @@ torchrun --nproc_per_node=${NGPU} exp-jamo-codec/train_composition.py \
     --prefetch_factor ${PREFETCH_FACTOR} \
     ${SEG_MASKED_FLAG} ${PAD_SLOT_FLAG} ${FIXED_SLOT_FLAG} \
     ${PARALLEL_DEC_FLAG} ${DEC_LAYERS_FLAG} ${DEC_HEADS_FLAG} ${NO_PIN_FLAG} \
-    --init_from ${INIT_FROM} \
+    ${RESUME:+--resume ${RESUME}} \
+    ${INIT_FROM:+--init_from ${INIT_FROM}} \
     2>&1 | tee "${LOG_PATH}"
 
 # rclone 로그 업로드
