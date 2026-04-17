@@ -1856,7 +1856,7 @@ step 30000 근처까지 VICReg ON (VAR=0.5 COV=0.01 TARGET=both WARMUP=1000) 으
 
 즉 SegmentMaskedConv 가 per-token 은 무관하게 만들지만, **optimizer state (Adam 1/2 moment) 는 per-weight 라 배치 구성에 의존**. Single-token-per-row 는 Adam moment 가 특정 토큰 weight 만 반복 업데이트 → 불안정.
 
-또 `"token|token|token|..."` 동일 반복 시 `"|"` separator 가 예측 불가한 BBPE merge 유발 → 배치별 실제 토큰 시퀀스가 미묘하게 달라짐.
+(초기 `"|"` separator 의 BBPE merge 영향도 의심했으나 실제 BBPE roundtrip 테스트 통과 — "|" 는 한국어 토큰과 merge 거의 없음. 실제 원인은 배치 diversity 단일.)
 
 ### 해결 — row 당 mixed tokens 로 재빌드
 
@@ -1869,14 +1869,12 @@ step 30000 근처까지 VICReg ON (VAR=0.5 COV=0.01 TARGET=both WARMUP=1000) 으
 
 1. **Per-token 신호 공평 ≠ 배치 통계 공평** — SegmentMaskedConv 같은 segment-indep 아키텍처라도 optimizer state 차원에서는 배치 diversity 가 영향. "token-level 공평" 코퍼스 (uniform_2000) 는 per-token 노출엔 완벽하지만 **배치 내 token diversity 가 낮으면 Adam 이 unstable**.
 
-2. **Separator 의 BBPE side effect** — uniform corpus 의 `"token|token|..."` 반복 패턴은 `"|"` 가 인접 토큰과 greedy merge 유발 가능성. Natural text 와 BBPE 동작이 미묘하게 달라 학습 분포 왜곡 위험.
-
-3. **좋은 coverage 코퍼스 = per-token 공평 + 배치 diverse + natural BBPE 경로**
+2. **좋은 coverage 코퍼스 = per-token 공평 + 배치 diverse**
    - 이상적 형태: 토큰 ID 전체를 랜덤 셔플해서 한 row 에 섞어넣기 (mixed tokens per row)
    - uniform coverage 의 원래 철학(모든 토큰 공평 노출) 유지하면서
-   - 배치/BBPE 측면에서 natural text 에 근접
+   - 배치 통계가 natural text 에 근접
 
-4. **VICReg 경계선** — reg 가 있을 때는 spike 에 더 robust (variance 제약이 안정자 역할), reg 끄면 uniform corpus 의 병리적 배치 분포가 즉시 노출. reg OFF 로 resume 전에 코퍼스 구조부터 점검 필요.
+3. **VICReg 경계선** — reg 가 있을 때는 spike 에 더 robust (variance 제약이 안정자 역할), reg 끄면 uniform corpus 의 병리적 배치 분포가 즉시 노출. reg OFF 로 resume 전에 코퍼스 구조부터 점검 필요.
 
 ### 현 진행
 
