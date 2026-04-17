@@ -343,6 +343,7 @@ class CompositionCodec(nn.Module):
                  max_jamo_per_token: int = 32,
                  segment_masked: bool = False,
                  parallel_decoder: bool = False,
+                 slot_decode: bool = False,
                  decoder_layers: int = 2,
                  decoder_heads: int = 4,
                  fixed_output_len: int | None = None):
@@ -352,16 +353,23 @@ class CompositionCodec(nn.Module):
                 Encoder는 가변 입력 유지, decoder만 각 토큰을 max_jamo_per_token 슬롯으로
                 확장해 self-attention. decode_from_vec 완벽 대응. Dataset은 가변 원본 구조
                 (fixed_slot/append_pad_slot 불필요).
+            slot_decode: True면 ConvDecoder 를 쓰되 각 토큰을 max_jamo_per_token 슬롯으로
+                확장해서 decoder forward. 인코더는 가변 입력(PAD 없음) 그대로. 디코더 target
+                은 `[실자모..., PAD, PAD, ...]` 로 S 슬롯 구성 → PAD terminator 학습 →
+                decode_from_vec 가능. parallel_decoder 와 배타적.
             fixed_output_len: encoder 출력 token 수 고정. None이면 `segment_ids.max()+1`로
                 배치마다 가변 → torch.compile recompile 누적으로 CPU RAM 성장. 고정값
                 지정 시 static shape → recompile 없음. fixed_slot=True 코퍼스는
                 `max_seq_len // max_jamo_per_token`을 기본값으로 쓰면 됨.
         """
         super().__init__()
+        if parallel_decoder and slot_decode:
+            raise ValueError("parallel_decoder 와 slot_decode 는 동시 True 불가")
         self.jamo_vocab = jamo_vocab
         self.d_model = d_model
         self.segment_masked = segment_masked
         self.parallel_decoder = parallel_decoder
+        self.slot_decode = slot_decode
         self.max_slot = max_jamo_per_token
 
         self.encoder = CompositionEncoder(
@@ -443,7 +451,56 @@ class CompositionCodec(nn.Module):
             return {"logits": logits_slot, "loss": loss, "z": z,
                     "target_slot": target_slot, "slot_loss_mask": slot_loss_mask}
 
-        # === 기존 conv decoder 경로 ===
+        # === slot_decode 경로: ConvDecoder + 토큰당 S 슬롯 확장 + PAD target ===
+        if self.slot_decode:
+            S = self.max_slot
+            P = z.size(1)
+
+            # 디코더용 segment_ids: 각 토큰당 S 슬롯 synthetic
+            dec_seg = (torch.arange(P, device=device)
+                       .unsqueeze(0).expand(B, -1)          # [B, P]
+                       .unsqueeze(-1).expand(-1, -1, S)     # [B, P, S]
+                       .reshape(B, P * S))                   # [B, P*S]
+
+            # 유효 토큰(= n_segments 이내) 의 모든 S 슬롯이 유효
+            seg_idx_all = torch.arange(P, device=device).unsqueeze(0).expand(B, -1)
+            seg_valid = seg_idx_all < n_segments.unsqueeze(1)  # [B, P]
+            dec_mask = seg_valid.unsqueeze(-1).expand(-1, -1, S).reshape(B, P * S)
+
+            # ConvDecoder forward — pre-head hidden 도 함께 받음 (VICReg 용)
+            logits_flat, h_dec_flat = self.decoder(
+                z, dec_seg, P * S, dec_mask, return_hidden=True
+            )  # [B, P*S, V], [B, P*S, D]
+            logits_slot = logits_flat.view(B, P, S, -1)  # [B, P, S, V]
+
+            # Target 재구성: 각 세그먼트 안에서 실 자모를 앞 슬롯에 배치, 나머지는 PAD(0)
+            # within_pos 계산 (encoder 와 동일)
+            arange_pos = torch.arange(L, device=device).unsqueeze(0).expand(B, -1)
+            seg_change = torch.cat([
+                torch.ones(B, 1, dtype=torch.bool, device=device),
+                segment_ids[:, 1:] != segment_ids[:, :-1],
+            ], dim=1)
+            seg_start_per_pos = torch.cummax(seg_change * arange_pos, dim=1).values
+            within_pos = (arange_pos - seg_start_per_pos).clamp(0, S - 1)
+
+            target_slot = torch.zeros(B, P, S, dtype=torch.long, device=device)
+            b_idx = torch.arange(B, device=device).unsqueeze(1).expand(-1, L)
+            valid = jamo_mask  # [B, L]
+            target_slot[b_idx[valid], segment_ids[valid], within_pos[valid]] = jamo_ids[valid]
+
+            # Loss: 유효 토큰의 모든 S 슬롯 (PAD 위치 포함 → PAD 예측 학습)
+            slot_loss_mask = seg_valid.unsqueeze(-1).expand(-1, -1, S)  # [B, P, S]
+            flat_logits = logits_slot.reshape(-1, self.jamo_vocab)
+            flat_targets = target_slot.reshape(-1)
+            flat_mask = slot_loss_mask.reshape(-1)
+            loss = F.cross_entropy(flat_logits, flat_targets, reduction="none")
+            loss = (loss * flat_mask.float()).sum() / flat_mask.sum().clamp(min=1)
+
+            return {"logits": logits_slot, "loss": loss, "z": z,
+                    "h_dec": h_dec_flat,
+                    "target_slot": target_slot, "slot_loss_mask": slot_loss_mask}
+
+        # === 기존 conv decoder 경로 (input_len == output_len) ===
         # return_hidden=True 로 pre-head hidden state 도 같이 받음 (VICReg 용)
         logits, h_dec = self.decoder(
             z, segment_ids, L, jamo_mask, return_hidden=True
@@ -513,9 +570,10 @@ class CompositionCodec(nn.Module):
                 results.append(tokens)
             return results
 
-        # === Conv decoder 경로 (이전 버전) ===
+        # === Conv decoder 경로 (slot_decode 학습 시 이 경로 사용) ===
+        # 학습과 동일하게 self.max_slot (=max_jamo_per_token) 를 기본 슬롯 수로
         if max_slot is None:
-            max_slot = 16
+            max_slot = self.max_slot
 
         seg_per_token = torch.arange(P, device=device).unsqueeze(1).expand(-1, max_slot).reshape(-1)
         segment_ids = seg_per_token.unsqueeze(0).expand(B, -1).contiguous()

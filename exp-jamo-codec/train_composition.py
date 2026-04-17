@@ -106,6 +106,7 @@ def validate(codec, val_loader, device, max_samples=1000, world_size=1):
     raw_codec = codec.module if hasattr(codec, "module") else codec
     raw_codec = raw_codec._orig_mod if hasattr(raw_codec, "_orig_mod") else raw_codec
     is_parallel = getattr(raw_codec, "parallel_decoder", False)
+    is_slot = getattr(raw_codec, "slot_decode", False)
 
     # rank당 상한 — world_size로 나눠 전체 max_samples 근사
     per_rank_max = max(1, max_samples // max(world_size, 1))
@@ -118,7 +119,8 @@ def validate(codec, val_loader, device, max_samples=1000, world_size=1):
             n_segments = batch["n_segments"].to(device)
 
             out = codec(jamo_ids, jamo_mask, segment_ids, n_segments)
-            if is_parallel:
+            if is_parallel or is_slot:
+                # slot_decode / parallel_decoder 둘 다 logits [B,P,S,V] + target_slot [B,P,S]
                 pred = out["logits"].argmax(dim=-1)
                 target_slot = out["target_slot"]
                 slot_mask = out["slot_loss_mask"]
@@ -200,6 +202,7 @@ def train(args):
         segment_masked=args.segment_masked,
         max_jamo_per_token=args.max_jamo_per_token,
         parallel_decoder=args.parallel_decoder,
+        slot_decode=args.slot_decode,
         decoder_layers=args.decoder_layers,
         decoder_heads=args.decoder_heads,
         fixed_output_len=fixed_output_len,
@@ -632,6 +635,13 @@ def main():
                         help="Decoder를 ParallelSlotDecoder(self-attention 2L)로 교체. "
                              "Encoder는 가변 입력 유지, decoder만 max_jamo_per_token 슬롯 학습. "
                              "Downstream encoder-only 경로 영향 없음")
+    parser.add_argument("--slot_decode", action="store_true",
+                        help="ConvDecoder 를 쓰되 각 토큰을 max_jamo_per_token 슬롯으로 확장. "
+                             "인코더는 가변 입력(PAD 없음), 디코더 target 은 "
+                             "[자모..., PAD, PAD, ...] → PAD terminator 학습. "
+                             "decode_from_vec 에서 PAD 만나면 stop. "
+                             "parallel_decoder 와 배타적. 데이터셋은 fixed_slot=False, "
+                             "append_pad_slot=False 로 가변으로 넣을 것.")
     parser.add_argument("--decoder_layers", type=int, default=2,
                         help="ParallelSlotDecoder transformer layer 수")
     parser.add_argument("--decoder_heads", type=int, default=4,

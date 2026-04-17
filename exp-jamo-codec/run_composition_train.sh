@@ -72,6 +72,8 @@ MAX_JAMO_FLAG=""
 [ -n "${MAX_JAMO_PER_TOKEN}" ] && MAX_JAMO_FLAG="--max_jamo_per_token ${MAX_JAMO_PER_TOKEN}"
 PARALLEL_DEC_FLAG=""
 [ -n "${PARALLEL_DECODER}" ] && PARALLEL_DEC_FLAG="--parallel_decoder"
+SLOT_DECODE_FLAG=""
+[ -n "${SLOT_DECODE}" ] && SLOT_DECODE_FLAG="--slot_decode"
 DEC_LAYERS_FLAG=""
 [ -n "${DECODER_LAYERS}" ] && DEC_LAYERS_FLAG="--decoder_layers ${DECODER_LAYERS}"
 DEC_HEADS_FLAG=""
@@ -98,7 +100,7 @@ torchrun --nproc_per_node=${NGPU:-4} exp-jamo-codec/train_composition.py \
   --val_corpus ${VAL_CORPUS} --val_every ${VAL_EVERY} --val_samples ${VAL_SAMPLES} \
   --out_dir ${OUT} \
   ${SEG_MASKED_FLAG} ${PAD_SLOT_FLAG} ${FIXED_SLOT_FLAG} ${MAX_JAMO_FLAG} \
-  ${PARALLEL_DEC_FLAG} ${DEC_LAYERS_FLAG} ${DEC_HEADS_FLAG} ${NO_PIN_FLAG} ${PREFETCH_FLAG} \
+  ${PARALLEL_DEC_FLAG} ${SLOT_DECODE_FLAG} ${DEC_LAYERS_FLAG} ${DEC_HEADS_FLAG} ${NO_PIN_FLAG} ${PREFETCH_FLAG} \
   ${RESUME:+--resume ${RESUME}} \
   ${INIT_FROM:+--init_from ${INIT_FROM}} \
   2>&1 | tee exp-jamo-codec/composition_train_log.txt

@@ -469,6 +469,7 @@ def main():
     k = saved_args.get("kernel_size", 7)
     seg_masked = saved_args.get("segment_masked", False)
     parallel_decoder = saved_args.get("parallel_decoder", False)
+    slot_decode = saved_args.get("slot_decode", False)
     decoder_layers = saved_args.get("decoder_layers", 2)
     decoder_heads = saved_args.get("decoder_heads", 4)
     max_jpt = saved_args.get("max_jamo_per_token", 32)
@@ -496,6 +497,7 @@ def main():
         jamo_vocab=jamo.vocab_size, d_model=d, n_layers=nl, kernel_size=k,
         segment_masked=seg_masked,
         parallel_decoder=parallel_decoder,
+        slot_decode=slot_decode,
         decoder_layers=decoder_layers,
         decoder_heads=decoder_heads,
         max_jamo_per_token=max_jpt,
@@ -611,8 +613,67 @@ def main():
 
                 with ac_ctx:
                     out = codec(jamo_ids, jamo_mask, segment_ids, n_segments)
-                    pred = out["logits"].argmax(dim=-1)
 
+                # slot_decode 경로: logits [B,P,S,V], target_slot [B,P,S], slot_loss_mask [B,P,S]
+                if "target_slot" in out:
+                    pred_slot = out["logits"].argmax(dim=-1)  # [B, P, S]
+                    target_slot = out["target_slot"]           # [B, P, S]
+                    slot_mask = out["slot_loss_mask"]          # [B, P, S]
+                    correct_slot = (pred_slot == target_slot) & slot_mask  # [B, P, S]
+                    total_correct += correct_slot.sum().item()
+                    total_jamo += slot_mask.sum().item()
+
+                    # BBPE 토큰별 집계: 토큰당 모든 S 슬롯 정답이면 success
+                    # 원 layout (batch[4] = [B, L] 의 per-jamo bbpe id) 에서 토큰당 bbpe id 추출
+                    bbpe_cpu_orig = batch[4].numpy()   # [B, L]
+                    seg_cpu_orig = segment_ids.cpu().numpy()  # [B, L]
+                    mask_cpu_orig = jamo_mask.cpu().numpy()   # [B, L]
+                    correct_token = correct_slot.all(dim=-1) & slot_mask.any(dim=-1)  # [B, P]
+                    correct_token_cpu = correct_token.cpu().numpy()
+                    valid_token = slot_mask.any(dim=-1).cpu().numpy()  # [B, P]
+
+                    for b in range(jamo_ids.shape[0]):
+                        m = mask_cpu_orig[b]
+                        if not m.any():
+                            continue
+                        vs = seg_cpu_orig[b][m]
+                        vb = bbpe_cpu_orig[b][m]
+                        # 각 세그먼트의 첫 jamo 위치에서 bbpe_id 추출
+                        breaks = np.where(np.diff(vs) != 0)[0] + 1
+                        starts = np.concatenate([[0], breaks])
+                        seg_ids_uniq = vs[starts]  # 각 세그먼트 id
+                        bbpe_ids_per_seg = vb[starts]  # 각 세그먼트의 bbpe id
+                        for seg_id_v, bid in zip(seg_ids_uniq, bbpe_ids_per_seg):
+                            if not valid_token[b, seg_id_v]:
+                                continue
+                            if correct_token_cpu[b, seg_id_v]:
+                                bbpe_ok[int(bid)] += 1
+                            else:
+                                bbpe_fail[int(bid)] += 1
+
+                    # 오류 샘플: valid 토큰 중 하나라도 틀렸으면 샘플 실패
+                    sample_has_err_t = ((~correct_token) & torch.from_numpy(valid_token).to(correct_token.device)).any(dim=-1)
+                    sample_has_err = sample_has_err_t.cpu().numpy()
+                    for b in range(jamo_ids.shape[0]):
+                        if bool(sample_has_err[b]):
+                            chunk_errs += 1
+                            if len(error_examples) + len(chunk_examples) < args.show_errors:
+                                # 첫 틀린 토큰의 예측/정답 슬롯 덤프
+                                for p in range(correct_token.size(1)):
+                                    if valid_token[b, p] and not correct_token_cpu[b, p]:
+                                        gt_slots = target_slot[b, p].cpu().tolist()
+                                        pr_slots = pred_slot[b, p].cpu().tolist()
+                                        gt_cut = gt_slots[:gt_slots.index(0)] if 0 in gt_slots else gt_slots
+                                        pr_cut = pr_slots[:pr_slots.index(0)] if 0 in pr_slots else pr_slots
+                                        gt_str = jamo.decode(gt_cut, skip_special=False)
+                                        pr_str = jamo.decode(pr_cut, skip_special=False)
+                                        if gt_str != pr_str:
+                                            chunk_examples.append((gt_str, pr_str))
+                                            break
+                    continue  # slot_decode 경로 끝
+
+                # 기존 ConvDecoder 경로 (input_len == output_len)
+                pred = out["logits"].argmax(dim=-1)
                 correct_mask = (pred == jamo_ids) & jamo_mask
                 total_correct += correct_mask.sum().item()
                 total_jamo += jamo_mask.sum().item()
