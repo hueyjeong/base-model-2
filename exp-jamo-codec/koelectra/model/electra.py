@@ -96,7 +96,10 @@ class JamoKoElectra(nn.Module):
         self.hidden_size = hidden_size
         self.gen_loss_weight = gen_loss_weight
 
-        # ── SimpleCodec (frozen) ──
+        # ── SimpleCodec (학습 가능, codec_lr_ratio 로 별도 param_group) ──
+        # Freeze 하면 generator 가 frozen decoder domain 에 혼자 align 해야 해서
+        # gen_loss 가 bottleneck. Codec 을 함께 학습하되 recon aux loss 로
+        # "자모 복원 능력" 유지 → downstream 문자열 출력 품질 보장.
         self.codec = SimpleCodec(
             jamo_vocab=jamo_vocab,
             d_model=codec_d_model,
@@ -106,9 +109,6 @@ class JamoKoElectra(nn.Module):
             max_jamo=max_jamo_per_token,
             dropout=codec_dropout,
         )
-        for p in self.codec.parameters():
-            p.requires_grad = False
-        self.codec.eval()
 
         # ── 공유 embedding 계층 ──
         self.emb_proj = nn.Linear(codec_d_model, embedding_size)
@@ -142,12 +142,6 @@ class JamoKoElectra(nn.Module):
                 nn.init.normal_(p, mean=0.0, std=0.02)
             elif "bias" in name:
                 nn.init.zeros_(p)
-
-    def train(self, mode: bool = True):
-        """codec 은 항상 eval (frozen + Dropout 고정)."""
-        super().train(mode)
-        self.codec.eval()
-        return self
 
     def load_codec_pretrained(self, ckpt_path: str, map_location="cpu"):
         """SimpleCodec 체크포인트(`checkpoints/simple_codec_final.pt`) 로드.
@@ -191,8 +185,27 @@ class JamoKoElectra(nn.Module):
         masked_jamo_mask: torch.Tensor,   # [B, P, S] (masked 토큰 전 슬롯 True)
         masked_patch_mask: torch.Tensor,  # [B, P] bool (마스킹된 토큰)
         per_jamo_mask: torch.Tensor,      # [B, P, S] bool (masked & 실자모 — loss target)
+        recon_weight: float = 0.0,        # codec self-recon aux loss weight
     ) -> dict:
         B, P, S = jamo_ids.shape
+
+        # ── (0) Codec self-reconstruction aux (원본 jamo_ids) ──
+        # encoder drift 하면 decoder 도 함께 따라가도록 self-supervised 신호 유지.
+        # 유효 토큰만 계산 (PAD/special 포함 — codec 이 그 패턴도 본 분포).
+        orig_flat = jamo_ids.reshape(B * P, S)
+        orig_mask_flat = jamo_mask.reshape(B * P, S)
+        z_orig_flat = self.codec.encode(orig_flat, orig_mask_flat)
+        if recon_weight > 0:
+            recon_logits = self.codec.decode(z_orig_flat)  # [B*P, S, V]
+            # target: 원본 jamo_ids (mask 위치는 어차피 PAD=0 이라 padding_idx 효과)
+            recon_loss = F.cross_entropy(
+                recon_logits.reshape(-1, self.jamo_vocab),
+                orig_flat.reshape(-1),
+                ignore_index=0,  # PAD 제외
+                reduction="mean",
+            )
+        else:
+            recon_loss = torch.zeros((), device=jamo_ids.device, dtype=torch.float32)
 
         # ── (1) Generator encode ──
         # masked 토큰은 전 슬롯 JAMO_MASK + jamo_mask 전 True 로 codec 에 saturate 신호
@@ -251,11 +264,16 @@ class JamoKoElectra(nn.Module):
             masked_tokens = masked_patch_mask.sum().float()
             patch_util = valid.sum().float() / (B * P)
 
-        total_loss = disc_loss + self.gen_loss_weight * gen_loss
+        total_loss = (
+            disc_loss
+            + self.gen_loss_weight * gen_loss
+            + recon_weight * recon_loss
+        )
         return {
             "total_loss": total_loss,
             "gen_loss": gen_loss.detach(),
             "disc_loss": disc_loss.detach(),
+            "recon_loss": recon_loss.detach(),
             "disc_acc": disc_acc,
             "replaced_rate": replaced_rate,
             "masked_tokens": masked_tokens,
@@ -291,11 +309,10 @@ if __name__ == "__main__":
 
     total_params = sum(p.numel() for p in model.parameters())
     codec_params = sum(p.numel() for p in model.codec_parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"params: total={total_params/1e6:.2f}M "
-          f"(codec frozen={codec_params/1e6:.2f}M, "
-          f"trainable={trainable/1e6:.2f}M)")
-    assert trainable == total_params - codec_params, "codec freeze 실패"
+          f"(codec={codec_params/1e6:.2f}M, "
+          f"non_codec={(total_params-codec_params)/1e6:.2f}M) — "
+          f"codec 별도 param_group (codec_lr_ratio)")
 
     # Dummy batch
     B, P, S = 2, 64, 32
@@ -315,7 +332,8 @@ if __name__ == "__main__":
 
     out = model(jamo_ids, jamo_mask, token_pad_mask,
                 masked_jamo_ids, masked_jamo_mask,
-                masked_patch_mask, per_jamo_mask)
+                masked_patch_mask, per_jamo_mask,
+                recon_weight=0.5)
     for k, v in out.items():
         if torch.is_tensor(v):
             print(f"  {k}: {v.item():.4f}")
@@ -326,4 +344,4 @@ if __name__ == "__main__":
     codec_grad = any(p.grad is not None and p.grad.abs().sum() > 0
                      for p in model.codec_parameters())
     print(f"backward: {'FAIL (NaN)' if has_nan else 'OK'}")
-    print(f"codec grad 존재: {codec_grad} (False 기대 — freeze)")
+    print(f"codec grad 존재: {codec_grad} (True 기대 — 학습)")

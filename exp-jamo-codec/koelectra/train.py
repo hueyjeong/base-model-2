@@ -93,9 +93,12 @@ def linear_lr(step: int, warmup: int, max_lr: float, max_steps: int, min_lr: flo
     return max_lr * (1 - progress) + min_lr * progress
 
 
-def apply_lr(optimizer, lr: float):
+def apply_lr(optimizer, lr_main: float, lr_codec: float):
     for pg in optimizer.param_groups:
-        pg["lr"] = lr
+        if pg.get("name") == "codec":
+            pg["lr"] = lr_codec
+        else:
+            pg["lr"] = lr_main
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -254,6 +257,7 @@ def run_validation(model, val_dataset, args, device, amp_dtype, rank, world_size
     )
     gen_sum = torch.zeros(1, device=device)
     disc_sum = torch.zeros(1, device=device)
+    recon_sum = torch.zeros(1, device=device)
     total_sum = torch.zeros(1, device=device)
     acc_sum = torch.zeros(1, device=device)
     util_sum = torch.zeros(1, device=device)
@@ -279,9 +283,11 @@ def run_validation(model, val_dataset, args, device, amp_dtype, rank, world_size
         with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=(device.type == "cuda")):
             out = model(jamo_ids, jamo_mask, token_pad_mask,
                         masked_jamo_ids, masked_jamo_mask,
-                        masked_patch_mask, per_jamo_mask)
+                        masked_patch_mask, per_jamo_mask,
+                        recon_weight=args.recon_weight)
         gen_sum += out["gen_loss"].detach().float()
         disc_sum += out["disc_loss"].detach().float()
+        recon_sum += out["recon_loss"].detach().float()
         total_sum += out["total_loss"].detach().float()
         acc_sum += out["disc_acc"].detach().float()
         util_sum += out["patch_util"].detach().float()
@@ -290,6 +296,7 @@ def run_validation(model, val_dataset, args, device, amp_dtype, rank, world_size
     if world_size > 1:
         dist.all_reduce(gen_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(disc_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(recon_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(total_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(acc_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(util_sum, op=dist.ReduceOp.SUM)
@@ -300,6 +307,7 @@ def run_validation(model, val_dataset, args, device, amp_dtype, rank, world_size
     return {
         "val/gen_loss": (gen_sum / count).item(),
         "val/disc_loss": (disc_sum / count).item(),
+        "val/recon_loss": (recon_sum / count).item(),
         "val/total_loss": (total_sum / count).item(),
         "val/disc_acc": (acc_sum / count).item(),
         "val/patch_util": (util_sum / count).item(),
@@ -338,6 +346,12 @@ def main():
 
     # 마스킹
     ap.add_argument("--mask_ratio", type=float, default=0.20)
+
+    # Codec co-training
+    ap.add_argument("--codec_lr_ratio", type=float, default=0.1,
+                    help="codec LR = main LR × this. 0 이면 freeze.")
+    ap.add_argument("--recon_weight", type=float, default=0.5,
+                    help="codec self-recon aux loss weight")
 
     # 학습
     ap.add_argument("--batch_size", type=int, default=128, help="per-GPU")
@@ -452,12 +466,14 @@ def main():
     if is_rank0(rank):
         total = sum(p.numel() for p in model.parameters())
         codec_n = sum(p.numel() for p in model.codec_parameters())
-        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        codec_state = (f"freeze (lr=0)" if args.codec_lr_ratio == 0
+                       else f"co-train (lr×{args.codec_lr_ratio})")
         print(f"[Model] total={total/1e6:.2f}M | "
-              f"codec(frozen)={codec_n/1e6:.2f}M | "
-              f"trainable={trainable/1e6:.2f}M")
+              f"codec={codec_n/1e6:.2f}M ({codec_state}) | "
+              f"non_codec={(total-codec_n)/1e6:.2f}M")
         print(f"[Codec load] missing={len(load_info['missing'])}, "
               f"unexpected={len(load_info['unexpected'])}")
+        print(f"[Aux] recon_weight={args.recon_weight}")
 
     # DDP
     if world_size > 1:
@@ -473,15 +489,36 @@ def main():
         if is_rank0(rank):
             print(f"[Compile] torch.compile mode={args.compile_mode}")
 
-    # ── Optimizer (codec freeze — non_codec_parameters 만) ──
-    trainable_params = list(unwrap(model).non_codec_parameters())
-    optimizer = torch.optim.AdamW(
-        trainable_params,
-        lr=args.lr,
-        betas=(args.adam_beta1, args.adam_beta2),
-        eps=args.adam_eps,
-        weight_decay=args.weight_decay,
-    )
+    # ── Optimizer ──
+    # codec 과 non-codec 은 별도 param_group. codec_lr_ratio=0 이면 codec freeze.
+    codec_params_list = list(unwrap(model).codec_parameters())
+    non_codec_params_list = list(unwrap(model).non_codec_parameters())
+    if args.codec_lr_ratio == 0:
+        # freeze: codec 을 optimizer 에서 제외 + requires_grad=False
+        for p in codec_params_list:
+            p.requires_grad = False
+        optimizer = torch.optim.AdamW(
+            non_codec_params_list,
+            lr=args.lr,
+            betas=(args.adam_beta1, args.adam_beta2),
+            eps=args.adam_eps,
+            weight_decay=args.weight_decay,
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": codec_params_list, "name": "codec",
+                 "lr": args.lr * args.codec_lr_ratio,
+                 "weight_decay": args.weight_decay},
+                {"params": non_codec_params_list, "name": "main",
+                 "lr": args.lr,
+                 "weight_decay": args.weight_decay},
+            ],
+            betas=(args.adam_beta1, args.adam_beta2),
+            eps=args.adam_eps,
+        )
+    # trainable_params: grad clip 용
+    trainable_params = [p for p in unwrap(model).parameters() if p.requires_grad]
 
     # ── Resume ──
     global_step = 0
@@ -512,7 +549,7 @@ def main():
 
     model.train()
     t0 = time.time()
-    acc_total = acc_gen = acc_disc = acc_acc = acc_rep = acc_mask = acc_util = 0.0
+    acc_total = acc_gen = acc_disc = acc_recon = acc_acc = acc_rep = acc_mask = acc_util = 0.0
     acc_count = 0
     last_log_step = global_step
 
@@ -550,13 +587,15 @@ def main():
                 with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
                     out = model(jamo_ids, jamo_mask, token_pad_mask,
                                 masked_jamo_ids, masked_jamo_mask,
-                                masked_patch_mask, per_jamo_mask)
+                                masked_patch_mask, per_jamo_mask,
+                                recon_weight=args.recon_weight)
                     loss = out["total_loss"] / args.grad_accum_steps
                 loss.backward()
 
             acc_total += out["total_loss"].detach().float().item()
             acc_gen += out["gen_loss"].detach().float().item()
             acc_disc += out["disc_loss"].detach().float().item()
+            acc_recon += out["recon_loss"].detach().float().item()
             acc_acc += out["disc_acc"].detach().float().item()
             acc_rep += out["replaced_rate"].detach().float().item()
             acc_mask += out["masked_tokens"].detach().float().item()
@@ -565,8 +604,9 @@ def main():
 
         if args.max_grad_norm > 0:
             torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
-        lr_now = linear_lr(global_step, args.warmup_steps, args.lr, args.max_steps, args.min_lr)
-        apply_lr(optimizer, lr_now)
+        lr_main = linear_lr(global_step, args.warmup_steps, args.lr, args.max_steps, args.min_lr)
+        lr_codec = lr_main * args.codec_lr_ratio
+        apply_lr(optimizer, lr_main, lr_codec)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
@@ -581,11 +621,12 @@ def main():
                    f"total {acc_total/n:.3f} | "
                    f"gen {acc_gen/n:.3f} | "
                    f"disc {acc_disc/n:.3f} | "
+                   f"recon {acc_recon/n:.3f} | "
                    f"disc_acc {acc_acc/n:.3f} | "
                    f"rep {acc_rep/n:.3f} | "
                    f"mtok {acc_mask/n:.0f} | "
                    f"util {acc_util/n:.3f} | "
-                   f"lr {lr_now:.2e} | "
+                   f"lr_m {lr_main:.2e} | lr_c {lr_codec:.2e} | "
                    f"{steps_per_s:.2f} step/s")
             if device.type == "cuda":
                 mem = torch.cuda.max_memory_allocated(device) / 1024**3
@@ -596,7 +637,7 @@ def main():
                 log_file.flush()
             t0 = time.time()
             last_log_step = global_step
-            acc_total = acc_gen = acc_disc = acc_acc = acc_rep = acc_mask = acc_util = 0.0
+            acc_total = acc_gen = acc_disc = acc_recon = acc_acc = acc_rep = acc_mask = acc_util = 0.0
             acc_count = 0
 
         # Validation

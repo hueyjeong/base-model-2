@@ -44,6 +44,10 @@ DROPOUT="${DROPOUT:-0.1}"
 MASK_RATIO="${MASK_RATIO:-0.20}"
 GEN_LOSS_WEIGHT="${GEN_LOSS_WEIGHT:-50.0}"
 
+# Codec co-training (freeze 원하면 CODEC_LR_RATIO=0)
+CODEC_LR_RATIO="${CODEC_LR_RATIO:-0.1}"
+RECON_WEIGHT="${RECON_WEIGHT:-0.5}"
+
 # 데이터
 TRAIN_PARQUET="${TRAIN_PARQUET:-corpus/k-exaone_random_coverage_1000_len4096.parquet}"
 VAL_PARQUET="${VAL_PARQUET:-corpus/k-exaone_coverage_5_len1000.parquet}"
@@ -83,7 +87,7 @@ KEEP_LATEST_N="${KEEP_LATEST_N:-3}"
 RESUME="${RESUME:-}"
 
 echo "=== KoELECTRA Small v3 + SimpleCodec 학습 ==="
-echo "Codec ckpt: ${CODEC_CKPT}  (frozen)"
+echo "Codec ckpt: ${CODEC_CKPT}  (lr_ratio=${CODEC_LR_RATIO}, recon_weight=${RECON_WEIGHT})"
 echo "Codec: d=${CODEC_D_MODEL}, enc_L=${CODEC_N_ENC_LAYERS}, dec_L=${CODEC_N_DEC_LAYERS}, k=${CODEC_KERNEL}, max_jamo=${MAX_JAMO}"
 echo "ELECTRA: P=${MAX_PATCHES}, embed=${EMBED}, hidden=${HIDDEN}, gen_L=${GEN_LAYERS}, disc_L=${DISC_LAYERS}"
 echo "Train: ${TRAIN_PARQUET}"
@@ -118,6 +122,7 @@ torchrun --nproc_per_node=${NGPU} -m koelectra.train \
     --gen_layers ${GEN_LAYERS} --disc_layers ${DISC_LAYERS} \
     --dropout ${DROPOUT} --mask_ratio ${MASK_RATIO} \
     --gen_loss_weight ${GEN_LOSS_WEIGHT} \
+    --codec_lr_ratio ${CODEC_LR_RATIO} --recon_weight ${RECON_WEIGHT} \
     --train_parquet ${TRAIN_PARQUET} --text_key ${TEXT_KEY} \
     --val_parquet ${VAL_PARQUET} \
     --min_length ${MIN_LENGTH} \
