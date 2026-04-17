@@ -36,7 +36,8 @@ def upload_and_cleanup(ckpt_path: str, log_path: str, remote_dest: str, keep_lat
                 + glob.glob(os.path.join(save_dir, "epoch_*.pt"))
                 + glob.glob(os.path.join(save_dir, "editor_*_step*.pt"))
                 + glob.glob(os.path.join(save_dir, "electra_step_*.pt"))
-                + glob.glob(os.path.join(save_dir, "composition_*_step*.pt")),
+                + glob.glob(os.path.join(save_dir, "composition_*_step*.pt"))
+                + glob.glob(os.path.join(save_dir, "simple_codec_step*.pt")),
                 key=os.path.getmtime,
             )
             if not all_ckpts:
