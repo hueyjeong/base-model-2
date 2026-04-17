@@ -499,12 +499,34 @@ def train(args):
             progress = global_step / args.max_steps * 100
             line = (f"{global_step:8d} {avg_loss:15.12f} {avg_acc:16.12f}% "
                     f"{lr:10.2e} {tok_s:8.0f}  {progress:.1f}% L{max_line_counter:,}")
-            if args.vicreg_var > 0 or args.vicreg_cov > 0:
+
+            reg_active = args.vicreg_var > 0 or args.vicreg_cov > 0
+            if reg_active:
                 cnt = max(accum_rank_cnt, 1)
                 line += (f"  var={accum_var/cnt:.4f} cov={accum_cov/cnt:.4f} "
                          f"rank_z={accum_rank_z/cnt:.1f} rank_h={accum_rank_h/cnt:.1f}")
                 accum_var = accum_cov = accum_rank_z = accum_rank_h = 0.0
                 accum_rank_cnt = 0
+            else:
+                # VICReg OFF 에도 진단용으로 rank 계산 (log_every 주기만, 오버헤드 ~1%)
+                # 최근 micro-batch 의 out 을 재사용
+                try:
+                    with torch.no_grad():
+                        if "z" in out:
+                            B_, P_, _ = out["z"].shape
+                            seg_idx_r = torch.arange(P_, device=device).unsqueeze(0).expand(B_, -1)
+                            seg_valid_r = seg_idx_r < n_segments.unsqueeze(1)
+                            _, _, rank_z_diag = vicreg_loss(out["z"], seg_valid_r)
+                        else:
+                            rank_z_diag = 0.0
+                        if "h_dec" in out:
+                            _, _, rank_h_diag = vicreg_loss(out["h_dec"], jamo_mask)
+                        else:
+                            rank_h_diag = 0.0
+                    line += f"  rank_z={rank_z_diag:.1f} rank_h={rank_h_diag:.1f}"
+                except Exception as _e:
+                    pass  # rank 계산 실패 시 조용히 스킵 (학습에 영향 없음)
+
             print(line)
 
             accum_loss = 0.0
