@@ -1827,3 +1827,62 @@ total = recon + λ_var * loss_var + λ_cov * loss_cov
 - **Codec reconstruction 지표만 보면 숨겨지는 문제** — 99.9998% acc 인 모델이 256차원 중 44차원만 쓰는 상태. Downstream 용도라면 rank 를 별도로 진단해야 함.
 - **데이터 특성이 rank 를 왜곡** — uniform coverage corpus 는 row 내 동일 토큰 반복이라 rank 분석이 인공적으로 낮게 나옴 (6.83). 반드시 다양한 텍스트 코퍼스로 재분석 필요.
 
+---
+
+## 2026-04-17 — VICReg 실험 후 퇴행 + uniform corpus 배치 diversity 교훈
+
+### VICReg 본학습 결과와 퇴행
+
+step 30000 근처까지 VICReg ON (VAR=0.5 COV=0.01 TARGET=both WARMUP=1000) 으로 학습:
+- rank_z 44 → ~200 까지 확장 (VICReg 효과 확실)
+- step 32500 VAL: **99.999986%** (피크)
+
+이후 VICReg OFF resume 로 계속 학습했는데 역전:
+- step 32500 VAL: 99.999986% (오류율 14 ppm)
+- step 35000 VAL: **99.9933%** (오류율 6,700 ppm) — **476× 증가**
+
+중간에 loss spike 반복 (step 31700 0.013, 34700 0.0002, 34900 0.0125 등) — 각 spike 가 weight 를 good optimum 에서 미세 이탈시킴 → 누적 손상.
+
+### 원인 분석 — uniform_2000 의 "single token per row" 구조적 문제
+
+**Per-token gradient signal 은 SegmentMaskedConv 덕에 동일** 하지만 **배치 수준 dynamics 가 왜곡**:
+
+| 항목 | single token per row | mixed tokens per row |
+|---|---|---|
+| Batch 64 rows × segments | 25,600 (같은 400× 반복) | ~2,560 (다양 ~40/row) |
+| Distinct tokens per batch | **64개만** | **~2,000+** |
+| Adam momentum 업데이트 | 64개 weight 에 집중 | 전 vocab 에 spread |
+| Epoch 반복 효과 | "같은 토큰 100번 연속" | natural text 와 유사 |
+
+즉 SegmentMaskedConv 가 per-token 은 무관하게 만들지만, **optimizer state (Adam 1/2 moment) 는 per-weight 라 배치 구성에 의존**. Single-token-per-row 는 Adam moment 가 특정 토큰 weight 만 반복 업데이트 → 불안정.
+
+또 `"token|token|token|..."` 동일 반복 시 `"|"` separator 가 예측 불가한 BBPE merge 유발 → 배치별 실제 토큰 시퀀스가 미묘하게 달라짐.
+
+### 해결 — row 당 mixed tokens 로 재빌드
+
+153,600 BBPE 토큰을 섞어서 한 row 에 여러 토큰이 혼합되게 데이터셋 재구성 (step 30000 체크포인트에서 resume):
+- 초기 결과: **loss 안정적 하강, VAL 회복 중**
+- spike 없음 (이전 20× loss spike 패턴 사라짐)
+- 가중치가 good optimum 쪽으로 복귀
+
+### 교훈 — BBPE codec 학습의 데이터 설계 원칙
+
+1. **Per-token 신호 공평 ≠ 배치 통계 공평** — SegmentMaskedConv 같은 segment-indep 아키텍처라도 optimizer state 차원에서는 배치 diversity 가 영향. "token-level 공평" 코퍼스 (uniform_2000) 는 per-token 노출엔 완벽하지만 **배치 내 token diversity 가 낮으면 Adam 이 unstable**.
+
+2. **Separator 의 BBPE side effect** — uniform corpus 의 `"token|token|..."` 반복 패턴은 `"|"` 가 인접 토큰과 greedy merge 유발 가능성. Natural text 와 BBPE 동작이 미묘하게 달라 학습 분포 왜곡 위험.
+
+3. **좋은 coverage 코퍼스 = per-token 공평 + 배치 diverse + natural BBPE 경로**
+   - 이상적 형태: 토큰 ID 전체를 랜덤 셔플해서 한 row 에 섞어넣기 (mixed tokens per row)
+   - uniform coverage 의 원래 철학(모든 토큰 공평 노출) 유지하면서
+   - 배치/BBPE 측면에서 natural text 에 근접
+
+4. **VICReg 경계선** — reg 가 있을 때는 spike 에 더 robust (variance 제약이 안정자 역할), reg 끄면 uniform corpus 의 병리적 배치 분포가 즉시 노출. reg OFF 로 resume 전에 코퍼스 구조부터 점검 필요.
+
+### 현 진행
+
+step 30000 체크포인트 + mixed-tokens uniform corpus 로 resume. 
+초기 관찰:
+- loss 안정적 하강 중
+- VAL 회복 추세
+- 토큰 뭉침 해소가 주효한 것으로 판단
+
