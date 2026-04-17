@@ -432,6 +432,8 @@ def main():
     parser.add_argument("--chunk_size", type=int, default=100000,
                         help="청크 크기 (한 번에 토큰화+추론할 샘플 수, 메모리 절약용)")
     parser.add_argument("--compile", action="store_true", help="torch.compile 적용")
+    parser.add_argument("--bf16", action="store_true",
+                        help="BF16 autocast 로 추론 (학습과 동일 조건, 2x+ 속도)")
     parser.add_argument("--force_variable", action="store_true",
                         help="체크포인트의 fixed_slot 설정을 무시하고 가변 길이로 토큰화 "
                              "(BOS/EOS 래핑은 유지). fixed_slot=True 로 학습된 모델에는 "
@@ -441,6 +443,11 @@ def main():
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # TF32 허용 (학습과 동일 — matmul/cudnn 의 10-bit mantissa 경로 → 속도 ↑ 정확도 거의 동일)
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     base_path = "/workspace/base-model-2"
     model_id = "LGAI-EXAONE/K-EXAONE-236B-A23B"
 
@@ -592,6 +599,9 @@ def main():
         loader = DataLoader(tensor_ds, batch_size=args.batch_size,
                             shuffle=False, num_workers=0, pin_memory=True)
 
+        ac_ctx = (torch.autocast("cuda", dtype=torch.bfloat16)
+                  if (device.type == "cuda" and args.bf16)
+                  else torch.autocast("cuda", enabled=False))
         with torch.no_grad():
             for batch in loader:
                 jamo_ids = batch[0].to(device, non_blocking=True)
@@ -599,8 +609,9 @@ def main():
                 segment_ids = batch[2].to(device, non_blocking=True)
                 n_segments = batch[3].to(device, non_blocking=True)
 
-                out = codec(jamo_ids, jamo_mask, segment_ids, n_segments)
-                pred = out["logits"].argmax(dim=-1)
+                with ac_ctx:
+                    out = codec(jamo_ids, jamo_mask, segment_ids, n_segments)
+                    pred = out["logits"].argmax(dim=-1)
 
                 correct_mask = (pred == jamo_ids) & jamo_mask
                 total_correct += correct_mask.sum().item()
