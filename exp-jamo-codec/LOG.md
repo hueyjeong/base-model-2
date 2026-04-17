@@ -1918,3 +1918,59 @@ step 30000 체크포인트 + mixed-tokens uniform corpus 로 resume.
 - **배치 diversity 는 optimizer stability 의 숨은 주역** — per-token gradient signal 이 공평해도 배치 내 token distinct 수가 적으면 Adam moment 가 왜곡. 좋은 coverage 코퍼스는 "per-token 공평 + 배치 diverse" 둘 다 만족해야 함.
 - **VAL 코퍼스도 학습과 같은 분포** — 학습 분포와 동떨어진 VAL 은 진단력 떨어짐. random_coverage_100_len2000 처럼 학습 코퍼스와 같은 철학 + 다른 샘플 조합 이 이상적.
 
+---
+
+## 2026-04-17 — SimpleCodec 전면 재설계 (per-token 독립 처리)
+
+### 맥락 — 왜 CompositionCodec 을 버렸나
+
+`decode_from_vec` 로 실제 추론 경로를 점검하면서 드러난 근본 문제:
+- CompositionCodec 은 **입력 시퀀스 길이(seq_len)와 segment_ids 에 강하게 결합**된 구조
+- 실추론 시 "가변 개수의 token_vec → 자모 시퀀스 복원" 하려면 segment_ids 를 인위적으로 재구성해야 함
+- `fixed_slot/append_pad_slot/parallel_decoder/slot_decode` 네 가지 모드가 누적된 상태 — 각기 다른 trade-off 로 혼란 가중
+- P*32 슬롯 버퍼 같은 "발적화" 구현이 사용자의 최초 의도(per-token 독립 처리)와 어긋남
+
+사용자 원래 요구: **토큰 하나당 자모 시퀀스 하나. 토큰끼리는 독립. GPU 는 배치로 병렬 처리만 하면 됨.** 내가 segment·시퀀스 기반으로 복잡하게 확장해버려서 entire project 가 잘못된 경로로 이탈.
+
+### SimpleCodec 설계 원칙
+
+1. **토큰 = 배치 차원**. seq_len 이란 개념 자체 제거. 한 번에 처리되는 단위는 1개 BBPE 토큰의 `[max_jamo]` 자모 시퀀스.
+2. **인코더**: `[T, max_jamo]` → `[T, D]` (T 는 배치, pool + proj)
+3. **디코더**: `[T, D]` → `[T, max_jamo, V]` (token_vec 을 max_jamo 만큼 replicate 후 Conv 로 정제)
+4. **no segment_ids, no packing, no segment_masked_conv**. 단순 Conv1D (causal 아닌 symmetric) + RMSNorm + SwiGLU.
+5. **PAD terminator**: 실추론에선 디코더가 PAD 를 예측한 위치까지만 자름 (`decode_from_vec`).
+
+### 새 파일 구성
+
+- `codec/simple_codec.py` — SimpleCodec (3.60M params @ d=256, enc_L=5, dec_L=5, k=5, max_jamo=32)
+  - `encode(jamo_ids, mask)`: embed → pos → Conv×L → mask pool → Linear → `z[T,D]`
+  - `decode(token_vecs)`: upsample → pos → Conv×L → head → `logits[T,max_jamo,V]`
+  - `decode_from_vec(token_vec)`: 단일 vector → PAD 만나면 cut (실추론)
+  - ConvBlock 은 짝수 kernel 길이 보존 위해 `F.pad(x, (k//2, (k-1)//2))` 사용
+- `data/simple_dataset.py` — SimpleJamoDataset
+  - BBPE vocab 153,600 개를 `batch_decode` → jamo 분해 prewarm cache
+  - 한 스텝에 한 토큰의 `{jamo_ids[max_jamo], mask, bbpe_id}` yield — packing 없음
+- `train_simple.py` — 학습 루프
+  - DDP + BF16 autocast + TF32
+  - validate() 가 `val_acc_valid`(실자모만) / `val_acc_all`(PAD 포함) 둘 다 리턴
+  - `save_every` 마다 `training/upload_gdrive.upload_and_cleanup` 으로 백그라운드 GDrive 업로드 + 구 ckpt 자동 정리
+  - 최종 체크포인트는 동기 rclone copy
+- `run_simple.sh` — 런처, 전 하이퍼파라미터 ENV 로 제어. `GDRIVE`/`LOG_PATH` 는 export 해서 `train_simple.py` 의 `os.environ` 으로 전달
+- `eval_simple.py` — per-token 평가
+  - metric: `jamo_acc_valid`(실자모), `jamo_acc_all`(PAD 포함), `token_acc`(전 슬롯 일치)
+  - BBPE 카테고리 통계 (hangul/ascii/byte/special/other)
+
+### 리소스 / 결과
+
+- 학습: **batch 2048/GPU 에 VRAM 2196MB**, 1시간 미만 수렴
+- `checkpoints/simple_codec_final.pt` 에서 50K 토큰 eval:
+  - `jamo_acc_valid/all/token = 100.000000%` (0 failures)
+  - 22K tok/s @ batch 1024
+
+### 교훈
+
+1. **초기 요구의 본질 파악 실패가 전체 실험 경로를 낭비** — 사용자는 "토큰 독립 함수, 배치 병렬" 이라는 단순한 그림을 이미 갖고 있었는데, 내가 segment·시퀀스 기반으로 일반화해서 4가지 모드가 쌓이는 복잡도를 만듦. 최초 모델 구현 전에 "그냥 토큰별 함수면 충분한 것 같은데?" 한 줄 확인만 했으면 전부 피할 수 있었음.
+2. **GPU 병렬성 ≠ 시퀀스 차원** — 토큰을 배치로 올리면 매 스텝 수천 개 토큰이 자연스럽게 병렬 처리됨. sequence 차원의 `[B, L, D]` 를 굳이 유지할 이유가 없음.
+3. **복잡도는 trade-off 로 누적된다** — fixed_slot 은 seq-packing 위한 우회, append_pad_slot 은 slot 해석 위한 우회, parallel_decoder 는 segment-conv 병목 우회, slot_decode 는 decode_from_vec 우회. 각각 local 합리성은 있었지만 글로벌로는 근본 구조가 잘못됨.
+4. **"실추론 시 어떻게 호출되는가" 를 먼저 확정** — decode_from_vec 의 요구를 초기부터 명확히 했다면 per-token 구조가 자명했을 것. interface 먼저, 내부 구현 나중.
+

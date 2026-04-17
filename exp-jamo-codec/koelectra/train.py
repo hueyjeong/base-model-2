@@ -1,19 +1,20 @@
-"""KoELECTRA Small v3 + Jamo-Codec 사전학습 스크립트.
+"""KoELECTRA Small v3 + SimpleCodec 사전학습 스크립트.
 
 사용 예시 (4 GPU DDP):
     torchrun --nproc_per_node=4 -m exp-jamo-codec.koelectra.train \
-        --codec_ckpt exp-jamo-codec/checkpoints/composition_6L_step600000.pt \
-        --train_parquet corpus/jamo-codec-v3/train.parquet \
-        --val_parquet   corpus/jamo-codec-v3/val.parquet \
-        --max_seq_len 2048 --max_patches 512 \
+        --codec_ckpt checkpoints/simple_codec_final.pt \
+        --train_parquet corpus/k-exaone_random_coverage_1000_len4096.parquet \
+        --val_parquet   corpus/k-exaone_coverage_5_len1000.parquet \
+        --max_patches 512 --max_jamo_per_token 32 \
         --batch_size 128 --grad_accum_steps 1 \
-        --lr 5e-4 --codec_lr_ratio 0.1 \
-        --warmup_steps 10000 --max_steps 800000 \
+        --lr 5e-4 --warmup_steps 10000 --max_steps 800000 \
         --mask_ratio 0.20 --gen_loss_weight 50.0 \
         --save_every 10000 --val_every 5000 \
         --rclone_remote "gdrive:exp-jamo-codec-koelectra/small/" \
         --keep_latest_n 3 \
         --bf16
+
+Codec 은 freeze. Transformer + proj + head 만 학습.
 """
 from __future__ import annotations
 
@@ -31,7 +32,7 @@ import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 
-# 경로 설정: exp-jamo-codec/ 를 sys.path에 등록하여 codec/, tok/, data/ import 가능
+# sys.path: exp-jamo-codec/ + 리포 루트
 _THIS = os.path.abspath(os.path.dirname(__file__))
 _EXP_ROOT = os.path.abspath(os.path.join(_THIS, ".."))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_EXP_ROOT, ".."))
@@ -39,11 +40,13 @@ for p in (_EXP_ROOT, _PROJECT_ROOT):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from data.bbpe_jamo_dataset import BBPEJamoDataset, load_bbpe_tokenizer  # noqa: E402
 from tok.jamo_tokenizer import JamoTokenizer  # noqa: E402
 
-from koelectra.model.electra import JamoKoElectra  # noqa: E402
+from koelectra.data.bbpe_token_dataset import (  # noqa: E402
+    BBPETokenDataset, load_bbpe_tokenizer, _worker_init_fn,
+)
 from koelectra.data.masking import make_patch_mask, apply_mask  # noqa: E402
+from koelectra.model.electra import JamoKoElectra  # noqa: E402
 from koelectra.upload import upload_checkpoint_bundle  # noqa: E402
 
 
@@ -51,7 +54,6 @@ from koelectra.upload import upload_checkpoint_bundle  # noqa: E402
 # DDP
 # ──────────────────────────────────────────────────────────────────────────
 def setup_ddp():
-    """환경변수 기반 DDP 초기화. 비-DDP 환경에서도 동작."""
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if world_size > 1:
         local_rank = int(os.environ["LOCAL_RANK"])
@@ -79,10 +81,10 @@ def cleanup_ddp(world_size: int):
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# LR 스케줄러 (linear warmup + linear decay)
+# LR 스케줄러
 # ──────────────────────────────────────────────────────────────────────────
 def linear_lr(step: int, warmup: int, max_lr: float, max_steps: int, min_lr: float = 0.0) -> float:
-    """ELECTRA 원논문 스케줄: linear warmup → linear decay to 0."""
+    """ELECTRA 원논문 스케줄: linear warmup → linear decay to min_lr."""
     if step < warmup:
         return max_lr * step / max(warmup, 1)
     remaining = max_steps - warmup
@@ -91,23 +93,19 @@ def linear_lr(step: int, warmup: int, max_lr: float, max_steps: int, min_lr: flo
     return max_lr * (1 - progress) + min_lr * progress
 
 
-def apply_lr(optimizer, lr_main: float, lr_codec: float):
+def apply_lr(optimizer, lr: float):
     for pg in optimizer.param_groups:
-        if pg.get("name") == "codec":
-            pg["lr"] = lr_codec
-        else:
-            pg["lr"] = lr_main
+        pg["lr"] = lr
 
 
 # ──────────────────────────────────────────────────────────────────────────
 # Flash Attention 검증
 # ──────────────────────────────────────────────────────────────────────────
 def check_flash_attention(device, dtype, rank: int):
-    """SDPBackend.FLASH_ATTENTION 컨텍스트에서 더미 forward. 실패 시 경고."""
     if not is_rank0(rank):
         return
     if device.type != "cuda":
-        print("[Flash] CPU 환경 — Flash Attention skip")
+        print("[Flash] CPU 환경 — skip")
         return
     try:
         from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -116,36 +114,27 @@ def check_flash_attention(device, dtype, rank: int):
         v = torch.randn(2, 4, 64, 64, device=device, dtype=dtype)
         with sdpa_kernel([SDPBackend.FLASH_ATTENTION]):
             out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=False)
-        print(f"[Flash] FLASH_ATTENTION backend 활성 OK (dtype={dtype}, out.shape={tuple(out.shape)})")
+        print(f"[Flash] OK (dtype={dtype}, out.shape={tuple(out.shape)})")
     except Exception as e:
-        print(f"[Flash] 경고: FLASH_ATTENTION 강제 실패 → {type(e).__name__}: {e}")
-        print("[Flash] 학습은 계속 진행 (기본 SDPA가 적절한 backend 자동 선택)")
+        print(f"[Flash] 경고: {type(e).__name__}: {e}")
 
 
 # ──────────────────────────────────────────────────────────────────────────
 # Collate
 # ──────────────────────────────────────────────────────────────────────────
 def collate_batch(samples):
-    """BBPEJamoDataset 배치화."""
+    """BBPETokenDataset 배치화."""
     jamo_ids = torch.stack([s["jamo_ids"] for s in samples])
     jamo_mask = torch.stack([s["jamo_mask"] for s in samples])
-    segment_ids = torch.stack([s["segment_ids"] for s in samples])
-    n_segments = torch.tensor([s["n_segments"] for s in samples], dtype=torch.long)
-    # special_patch_mask: 구버전 BBPEJamoDataset 호환 — 없으면 전부 False
-    if "special_patch_mask" in samples[0]:
-        special_patch_mask = torch.stack([s["special_patch_mask"] for s in samples])
-    else:
-        # max_patches 정보 없으면 n_segments 길이로 기본 False
-        P = segment_ids.size(1)  # jamo 길이가 아니라 max_patches여야 하지만 호환성 fallback
-        special_patch_mask = torch.zeros(len(samples), P, dtype=torch.bool)
-    line_counters = [s.get("_line_counter", 0) for s in samples]
+    token_pad_mask = torch.stack([s["token_pad_mask"] for s in samples])
+    special_token_mask = torch.stack([s["special_token_mask"] for s in samples])
+    n_tokens = torch.tensor([s["n_tokens"] for s in samples], dtype=torch.long)
     return {
         "jamo_ids": jamo_ids,
         "jamo_mask": jamo_mask,
-        "segment_ids": segment_ids,
-        "n_segments": n_segments,
-        "special_patch_mask": special_patch_mask,
-        "line_counters": line_counters,
+        "token_pad_mask": token_pad_mask,
+        "special_token_mask": special_token_mask,
+        "n_tokens": n_tokens,
     }
 
 
@@ -153,13 +142,7 @@ def collate_batch(samples):
 # 체크포인트
 # ──────────────────────────────────────────────────────────────────────────
 def unwrap(model):
-    """DDP + torch.compile 래퍼를 순차 해제해 원본 Module 반환.
-
-    래핑 순서가 DDP(model) → torch.compile(...)이면
-    `compiled._orig_mod` → DDP → `.module` → 원본 JamoKoElectra.
-    """
     m = model
-    # 최대 두 번 풀기 (compile → DDP → base)
     for _ in range(2):
         if hasattr(m, "_orig_mod"):
             m = m._orig_mod
@@ -171,12 +154,7 @@ def unwrap(model):
 
 
 def _rng_sidecar_path(ckpt_path: str, rank: int) -> str:
-    """체크포인트 본체와 같은 디렉터리에 rank별 RNG sidecar 파일.
-
-    예: electra_step_10000.pt → electra_step_10000.rng_rank2.pt
-    `electra_step_*` 글롭에 걸리므로 upload_and_cleanup이 함께 정리한다.
-    """
-    base, ext = os.path.splitext(ckpt_path)  # (.../electra_step_10000, .pt)
+    base, ext = os.path.splitext(ckpt_path)
     return f"{base}.rng_rank{rank}{ext}"
 
 
@@ -190,11 +168,6 @@ def _snapshot_rng():
 
 
 def save_checkpoint(path, step, model, optimizer, dataset, args, rank: int, extra=None):
-    """체크포인트 저장.
-
-    - rank0만 본체(model/optimizer/step/data_state/args)를 `path`에 저장
-    - 모든 rank가 자기 RNG를 sidecar 파일에 저장
-    """
     if is_rank0(rank):
         state = {
             "step": step,
@@ -209,7 +182,6 @@ def save_checkpoint(path, step, model, optimizer, dataset, args, rank: int, extr
         torch.save(state, tmp)
         os.replace(tmp, path)
 
-    # 모든 rank가 자기 RNG 저장 (독립 파일)
     rng_path = _rng_sidecar_path(path, rank)
     tmp = rng_path + ".tmp"
     torch.save(_snapshot_rng(), tmp)
@@ -217,7 +189,6 @@ def save_checkpoint(path, step, model, optimizer, dataset, args, rank: int, extr
 
 
 def _restore_rng(rng: dict, rank: int):
-    """rank별 RNG 딕셔너리에서 torch/cuda/python/numpy RNG 복원."""
     if rng.get("torch") is not None:
         try:
             torch_state = rng["torch"]
@@ -225,14 +196,14 @@ def _restore_rng(rng: dict, rank: int):
                 torch_state = torch_state.cpu().to(torch.uint8)
             torch.set_rng_state(torch_state)
         except Exception as e:
-            print(f"[Resume rank{rank}] torch RNG 복원 skip: {e}")
+            print(f"[Resume rank{rank}] torch RNG skip: {e}")
     if rng.get("cuda") is not None and torch.cuda.is_available():
         try:
             cuda_states = [s.cpu().to(torch.uint8) if torch.is_tensor(s) else s
                            for s in rng["cuda"]]
             torch.cuda.set_rng_state_all(cuda_states)
         except Exception as e:
-            print(f"[Resume rank{rank}] cuda RNG 복원 skip: {e}")
+            print(f"[Resume rank{rank}] cuda RNG skip: {e}")
     if rng.get("python") is not None:
         try:
             random.setstate(rng["python"])
@@ -246,13 +217,10 @@ def _restore_rng(rng: dict, rank: int):
 
 
 def load_checkpoint(path, model, optimizer, dataset, device, rank: int):
-    """체크포인트 본체(모든 rank) + 자기 rank의 RNG sidecar 로드."""
-    # 본체: 모든 rank가 동일하게 읽어야 model/optimizer가 동기화됨
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     unwrap(model).load_state_dict(ckpt["model"], strict=True)
     if optimizer is not None and "optimizer" in ckpt:
         optimizer.load_state_dict(ckpt["optimizer"])
-        # optimizer state의 tensor를 device로 이동
         for state in optimizer.state.values():
             for k, v in state.items():
                 if torch.is_tensor(v):
@@ -260,23 +228,14 @@ def load_checkpoint(path, model, optimizer, dataset, device, rank: int):
     if dataset is not None and "data_state" in ckpt:
         dataset.load_state_dict(ckpt["data_state"])
 
-    # RNG: rank별 sidecar 파일에서 로드
     rng_path = _rng_sidecar_path(path, rank)
     if os.path.exists(rng_path):
         rng = torch.load(rng_path, map_location="cpu", weights_only=False)
         _restore_rng(rng, rank)
         if is_rank0(rank):
-            print(f"[Resume] RNG sidecar 복원 (rank0): {rng_path}")
-    else:
-        # 구버전 체크포인트 호환: 본체에 rng_state가 있었던 경우
-        legacy = ckpt.get("rng_state")
-        if legacy is not None and is_rank0(rank):
-            _restore_rng(legacy, rank)
-            print(f"[Resume] rank0 RNG를 구버전 본체에서 복원 "
-                  f"(rank>0는 seed+rank로 재초기화)")
-        elif is_rank0(rank):
-            print(f"[Resume] RNG sidecar 없음: {rng_path} — "
-                  f"rank별 RNG는 seed+rank 초기값으로 진행")
+            print(f"[Resume] RNG sidecar 복원: {rng_path}")
+    elif is_rank0(rank):
+        print(f"[Resume] RNG sidecar 없음 — rank 별 재초기화")
     return ckpt.get("step", 0)
 
 
@@ -286,7 +245,6 @@ def load_checkpoint(path, model, optimizer, dataset, device, rank: int):
 @torch.no_grad()
 def run_validation(model, val_dataset, args, device, amp_dtype, rank, world_size,
                    n_batches: int = 500):
-    """Val loss 집계 (all_reduce 평균)."""
     model.eval()
     loader = DataLoader(
         val_dataset,
@@ -306,21 +264,22 @@ def run_validation(model, val_dataset, args, device, amp_dtype, rank, world_size
             break
         jamo_ids = batch["jamo_ids"].to(device, non_blocking=True)
         jamo_mask = batch["jamo_mask"].to(device, non_blocking=True)
-        segment_ids = batch["segment_ids"].to(device, non_blocking=True)
-        n_segments = batch["n_segments"].to(device, non_blocking=True)
+        token_pad_mask = batch["token_pad_mask"].to(device, non_blocking=True)
+        special_token_mask = batch["special_token_mask"].to(device, non_blocking=True)
+        n_tokens = batch["n_tokens"].to(device, non_blocking=True)
 
-        special_patch_mask = batch["special_patch_mask"].to(device, non_blocking=True)
         masked_patch_mask = make_patch_mask(
-            n_segments, max_patches=args.max_patches,
+            n_tokens, max_patches=args.max_patches,
             mask_ratio=args.mask_ratio,
-            special_patch_mask=special_patch_mask,
+            special_patch_mask=special_token_mask,
         )
-        masked_jamo_ids, per_jamo_mask = apply_mask(
-            jamo_ids, segment_ids, jamo_mask, masked_patch_mask
+        masked_jamo_ids, masked_jamo_mask, per_jamo_mask = apply_mask(
+            jamo_ids, jamo_mask, masked_patch_mask,
         )
         with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=(device.type == "cuda")):
-            out = model(jamo_ids, jamo_mask, segment_ids, n_segments,
-                        masked_jamo_ids, per_jamo_mask, masked_patch_mask)
+            out = model(jamo_ids, jamo_mask, token_pad_mask,
+                        masked_jamo_ids, masked_jamo_mask,
+                        masked_patch_mask, per_jamo_mask)
         gen_sum += out["gen_loss"].detach().float()
         disc_sum += out["disc_loss"].detach().float()
         total_sum += out["total_loss"].detach().float()
@@ -353,10 +312,12 @@ def run_validation(model, val_dataset, args, device, amp_dtype, rank, world_size
 def main():
     ap = argparse.ArgumentParser()
     # Codec & Model
-    ap.add_argument("--codec_ckpt", type=str, required=True)
+    ap.add_argument("--codec_ckpt", type=str,
+                    default="checkpoints/simple_codec_final.pt")
     ap.add_argument("--codec_d_model", type=int, default=256)
-    ap.add_argument("--codec_n_layers", type=int, default=6)
-    ap.add_argument("--codec_kernel_size", type=int, default=7)
+    ap.add_argument("--codec_n_enc_layers", type=int, default=5)
+    ap.add_argument("--codec_n_dec_layers", type=int, default=5)
+    ap.add_argument("--codec_kernel_size", type=int, default=5)
     ap.add_argument("--max_jamo_per_token", type=int, default=32)
     ap.add_argument("--embedding_size", type=int, default=128)
     ap.add_argument("--hidden_size", type=int, default=256)
@@ -372,7 +333,6 @@ def main():
     ap.add_argument("--train_parquet", type=str, nargs="+", required=True)
     ap.add_argument("--val_parquet", type=str, nargs="+", default=None)
     ap.add_argument("--text_key", type=str, default="text")
-    ap.add_argument("--max_seq_len", type=int, default=2048)
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--min_length", type=int, default=10)
 
@@ -384,7 +344,6 @@ def main():
     ap.add_argument("--val_batch_size", type=int, default=64)
     ap.add_argument("--grad_accum_steps", type=int, default=1)
     ap.add_argument("--lr", type=float, default=5e-4)
-    ap.add_argument("--codec_lr_ratio", type=float, default=0.1)
     ap.add_argument("--min_lr", type=float, default=0.0)
     ap.add_argument("--warmup_steps", type=int, default=10000)
     ap.add_argument("--max_steps", type=int, default=800000)
@@ -395,20 +354,10 @@ def main():
     ap.add_argument("--max_grad_norm", type=float, default=1.0)
     ap.add_argument("--bf16", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--compile", action="store_true",
-                    help="torch.compile 적용 (DDP wrap 뒤)")
+    ap.add_argument("--compile", action="store_true")
     ap.add_argument("--compile_mode", type=str, default="default",
                     choices=["default", "reduce-overhead", "max-autotune"])
-    ap.add_argument("--compile_dynamic", action="store_true",
-                    help="CompositionEncoder의 segment_ids.max() 등 "
-                         "data-dependent shape 재컴파일을 피하기 위해 dynamic=True. "
-                         "이제 codec이 fixed_output_len 사용하므로 보통 불필요.")
-    ap.add_argument("--no_tf32", action="store_true",
-                    help="TF32 자동 활성화를 끈다 (기본 ON)")
-    ap.add_argument("--disable_ddp_optimizer", action="store_true",
-                    help="torch._dynamo.config.optimize_ddp=False로 강제. "
-                         "보통은 compile_dynamic 사용 시에만 자동 OFF되지만 "
-                         "inductor 버그 재발 시 수동으로 끌 때 사용.")
+    ap.add_argument("--no_tf32", action="store_true")
 
     # 체크포인트 & 로깅
     ap.add_argument("--out_dir", type=str, default="exp-jamo-codec/koelectra/checkpoints")
@@ -417,17 +366,13 @@ def main():
     ap.add_argument("--val_every", type=int, default=5000)
     ap.add_argument("--val_batches", type=int, default=500)
     ap.add_argument("--resume", type=str, default=None)
-    ap.add_argument("--rclone_remote", type=str, default=None,
-                    help="예: gdrive:exp-jamo-codec-koelectra/small/")
+    ap.add_argument("--rclone_remote", type=str, default=None)
     ap.add_argument("--keep_latest_n", type=int, default=3)
-    ap.add_argument("--log_file", type=str, default=None,
-                    help="학습 로그 파일 경로 (rank0만 작성 & 업로드). "
-                         "None이면 {out_dir}/train.log 사용.")
+    ap.add_argument("--log_file", type=str, default=None)
 
     args = ap.parse_args()
 
-    # TF32 활성화 (BF16 autocast 밖의 FP32 경로 가속 — optimizer 일부, clip_grad_norm 등)
-    # 부작용 없음, 안 켜면 손해. --no_tf32로 비활성 가능.
+    # TF32
     if not args.no_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
@@ -440,7 +385,6 @@ def main():
     ddp = setup_ddp()
     rank, world_size, device = ddp["rank"], ddp["world_size"], ddp["device"]
 
-    # 시드 (rank별로 다르게 하면 DDP 샘플 다양성↑)
     torch.manual_seed(args.seed + rank)
     np.random.seed(args.seed + rank)
     random.seed(args.seed + rank)
@@ -450,9 +394,10 @@ def main():
 
     if is_rank0(rank):
         print(f"[Setup] rank={rank}/{world_size}, device={device}, bf16={args.bf16}")
+        print(f"[Setup] max_patches={args.max_patches}, "
+              f"max_jamo_per_token={args.max_jamo_per_token}")
         os.makedirs(args.out_dir, exist_ok=True)
 
-    # Flash Attention 검증
     check_flash_attention(device, amp_dtype, rank)
 
     # ── 토크나이저 ──
@@ -462,35 +407,36 @@ def main():
     jamo = JamoTokenizer()
 
     # ── Dataset ──
-    train_ds = BBPEJamoDataset(
+    train_ds = BBPETokenDataset(
         file_paths=args.train_parquet,
         bbpe_tokenizer=bbpe, jamo_tokenizer=jamo,
-        max_seq_len=args.max_seq_len,
+        max_patches=args.max_patches,
         max_jamo_per_token=args.max_jamo_per_token,
         text_key=args.text_key,
         min_length=args.min_length,
         rank=rank, world_size=world_size,
-        max_patches=args.max_patches,
     )
     val_ds = None
     if args.val_parquet:
-        val_ds = BBPEJamoDataset(
+        val_ds = BBPETokenDataset(
             file_paths=args.val_parquet,
             bbpe_tokenizer=bbpe, jamo_tokenizer=jamo,
-            max_seq_len=args.max_seq_len,
+            max_patches=args.max_patches,
             max_jamo_per_token=args.max_jamo_per_token,
             text_key=args.text_key,
             min_length=args.min_length,
             rank=rank, world_size=world_size,
-            max_patches=args.max_patches,
         )
+        val_ds._prewarm_cache(verbose=is_rank0(rank))
 
     # ── 모델 ──
     model = JamoKoElectra(
         codec_d_model=args.codec_d_model,
-        codec_n_layers=args.codec_n_layers,
+        codec_n_enc_layers=args.codec_n_enc_layers,
+        codec_n_dec_layers=args.codec_n_dec_layers,
         codec_kernel_size=args.codec_kernel_size,
         max_jamo_per_token=args.max_jamo_per_token,
+        codec_dropout=args.dropout,
         embedding_size=args.embedding_size,
         hidden_size=args.hidden_size,
         n_heads=args.n_heads,
@@ -504,67 +450,37 @@ def main():
 
     load_info = model.load_codec_pretrained(args.codec_ckpt, map_location=device)
     if is_rank0(rank):
-        total_params = sum(p.numel() for p in model.parameters())
-        codec_params = sum(p.numel() for p in model.codec_parameters())
-        print(f"[Model] total={total_params/1e6:.2f}M "
-              f"(codec={codec_params/1e6:.2f}M, tf+proj={(total_params-codec_params)/1e6:.2f}M)")
-        print(f"[Codec load] missing(enc/dec)={len(load_info['encoder_missing'])}/"
-              f"{len(load_info['decoder_missing'])}, "
-              f"unexpected={len(load_info['encoder_unexpected'])}/"
-              f"{len(load_info['decoder_unexpected'])}")
+        total = sum(p.numel() for p in model.parameters())
+        codec_n = sum(p.numel() for p in model.codec_parameters())
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"[Model] total={total/1e6:.2f}M | "
+              f"codec(frozen)={codec_n/1e6:.2f}M | "
+              f"trainable={trainable/1e6:.2f}M")
+        print(f"[Codec load] missing={len(load_info['missing'])}, "
+              f"unexpected={len(load_info['unexpected'])}")
 
-    # DDP (compile 전에 먼저 wrap)
+    # DDP
     if world_size > 1:
         model = DDP(model, device_ids=[ddp["local_rank"]], find_unused_parameters=False)
 
-    # torch.compile (DDP wrap 뒤에 적용 권장 — PyTorch 2.x 공식 패턴)
+    # torch.compile
     if args.compile:
-        # Dynamo 안전장치:
-        # (1) compile 실패 시 조용히 eager로 fallback (학습 중단 방지)
-        # (2) 재컴파일 한도 상향 — DDP + dynamic shape 조합에서 쉽게 8을 초과
-        # (3) DDPOptimizer는 기본 ON (DDP bucket 경계로 서브모듈 쪼개서
-        #     communication overlap 극대화). 단 dynamic shape와 조합 시
-        #     inductor `s67+1` codegen 버그가 알려짐 → compile_dynamic 또는
-        #     명시적 --disable_ddp_optimizer 시에만 OFF.
-        import torch._dynamo as _dynamo  # 함수 스코프 충돌 방지용 별칭
+        import torch._dynamo as _dynamo
         _dynamo.config.suppress_errors = True
         _dynamo.config.cache_size_limit = 64
         _dynamo.config.accumulated_cache_size_limit = 256
-        ddp_opt_off = (world_size > 1 and
-                       (args.compile_dynamic or args.disable_ddp_optimizer))
-        if ddp_opt_off:
-            _dynamo.config.optimize_ddp = False
-
-        compile_kwargs = {"mode": args.compile_mode}
-        if args.compile_dynamic:
-            compile_kwargs["dynamic"] = True
-        model = torch.compile(model, **compile_kwargs)
+        model = torch.compile(model, mode=args.compile_mode)
         if is_rank0(rank):
-            if world_size <= 1:
-                ddp_opt = "N/A"
-            elif ddp_opt_off:
-                ddp_opt = "OFF"
-            else:
-                ddp_opt = "ON (default)"
-            print(f"[Compile] torch.compile 적용 mode={args.compile_mode}"
-                  f" dynamic={args.compile_dynamic}"
-                  f" | suppress_errors=True, cache_size_limit=64,"
-                  f" optimize_ddp={ddp_opt}")
+            print(f"[Compile] torch.compile mode={args.compile_mode}")
 
-    # ── Optimizer: codec은 lr * codec_lr_ratio ──
-    codec_params_list = list(unwrap(model).codec_parameters())
-    non_codec_params_list = list(unwrap(model).non_codec_parameters())
+    # ── Optimizer (codec freeze — non_codec_parameters 만) ──
+    trainable_params = list(unwrap(model).non_codec_parameters())
     optimizer = torch.optim.AdamW(
-        [
-            {"params": codec_params_list, "name": "codec",
-             "lr": args.lr * args.codec_lr_ratio,
-             "weight_decay": args.weight_decay},
-            {"params": non_codec_params_list, "name": "main",
-             "lr": args.lr,
-             "weight_decay": args.weight_decay},
-        ],
+        trainable_params,
+        lr=args.lr,
         betas=(args.adam_beta1, args.adam_beta2),
         eps=args.adam_eps,
+        weight_decay=args.weight_decay,
     )
 
     # ── Resume ──
@@ -574,49 +490,37 @@ def main():
             print(f"[Resume] {args.resume}")
         global_step = load_checkpoint(args.resume, model, optimizer, train_ds, device, rank)
         if is_rank0(rank):
-            print(f"[Resume] step={global_step}, "
-                  f"dataset.line_counter={train_ds.state_dict().get('line_counter')}")
+            print(f"[Resume] step={global_step}")
 
     # ── DataLoader ──
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, num_workers=args.num_workers,
         collate_fn=collate_batch, persistent_workers=(args.num_workers > 0),
         pin_memory=(device.type == "cuda"),
+        worker_init_fn=_worker_init_fn if args.num_workers > 0 else None,
     )
 
-    # ── 학습 루프 ──
-    # 로그 파일: rank0만 작성 (업로드도 rank0의 이 파일만)
+    # 로그 파일
     if is_rank0(rank):
-        if args.log_file:
-            log_path = args.log_file
-            os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
-        else:
-            log_path = os.path.join(args.out_dir, "train.log")
+        log_path = args.log_file or os.path.join(args.out_dir, "train.log")
+        os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
     else:
         log_path = None
     log_file = open(log_path, "a") if log_path else None
     if is_rank0(rank):
-        print(f"[Log] writing to {log_path}")
+        print(f"[Log] {log_path}")
 
     model.train()
     t0 = time.time()
-    acc_total = 0.0
-    acc_gen = 0.0
-    acc_disc = 0.0
-    acc_acc = 0.0
-    acc_rep = 0.0
-    acc_mask = 0.0
-    acc_util = 0.0
+    acc_total = acc_gen = acc_disc = acc_acc = acc_rep = acc_mask = acc_util = 0.0
     acc_count = 0
     last_log_step = global_step
 
     data_iter = iter(train_loader)
     optimizer.zero_grad(set_to_none=True)
-
-    upload_threads: list = []  # 백그라운드 업로드 스레드 추적 (main 종료 전 join)
+    upload_threads: list = []
 
     while global_step < args.max_steps:
-        # grad accumulation 루프
         for micro in range(args.grad_accum_steps):
             try:
                 batch = next(data_iter)
@@ -626,24 +530,27 @@ def main():
 
             jamo_ids = batch["jamo_ids"].to(device, non_blocking=True)
             jamo_mask = batch["jamo_mask"].to(device, non_blocking=True)
-            segment_ids = batch["segment_ids"].to(device, non_blocking=True)
-            n_segments = batch["n_segments"].to(device, non_blocking=True)
+            token_pad_mask = batch["token_pad_mask"].to(device, non_blocking=True)
+            special_token_mask = batch["special_token_mask"].to(device, non_blocking=True)
+            n_tokens = batch["n_tokens"].to(device, non_blocking=True)
 
             masked_patch_mask = make_patch_mask(
-                n_segments, max_patches=args.max_patches, mask_ratio=args.mask_ratio
+                n_tokens, max_patches=args.max_patches,
+                mask_ratio=args.mask_ratio,
+                special_patch_mask=special_token_mask,
             )
-            masked_jamo_ids, per_jamo_mask = apply_mask(
-                jamo_ids, segment_ids, jamo_mask, masked_patch_mask
+            masked_jamo_ids, masked_jamo_mask, per_jamo_mask = apply_mask(
+                jamo_ids, jamo_mask, masked_patch_mask,
             )
 
-            # DDP: gradient all_reduce는 backward에서 자동. micro 스텝에선 no_sync 사용 가능
             is_last_micro = (micro == args.grad_accum_steps - 1)
             sync_ctx = (model.no_sync() if (isinstance(model, DDP) and not is_last_micro)
                         else _nullctx())
             with sync_ctx:
                 with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=use_amp):
-                    out = model(jamo_ids, jamo_mask, segment_ids, n_segments,
-                                masked_jamo_ids, per_jamo_mask, masked_patch_mask)
+                    out = model(jamo_ids, jamo_mask, token_pad_mask,
+                                masked_jamo_ids, masked_jamo_mask,
+                                masked_patch_mask, per_jamo_mask)
                     loss = out["total_loss"] / args.grad_accum_steps
                 loss.backward()
 
@@ -656,20 +563,15 @@ def main():
             acc_util += out["patch_util"].detach().float().item()
             acc_count += 1
 
-        # Optimizer step
         if args.max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(
-                unwrap(model).parameters(), args.max_grad_norm
-            )
-        lr_main = linear_lr(global_step, args.warmup_steps, args.lr, args.max_steps, args.min_lr)
-        lr_codec = lr_main * args.codec_lr_ratio
-        apply_lr(optimizer, lr_main, lr_codec)
+            torch.nn.utils.clip_grad_norm_(trainable_params, args.max_grad_norm)
+        lr_now = linear_lr(global_step, args.warmup_steps, args.lr, args.max_steps, args.min_lr)
+        apply_lr(optimizer, lr_now)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
         global_step += 1
 
-        # ── 로깅 ──
         if is_rank0(rank) and global_step % args.log_every == 0:
             elapsed = time.time() - t0
             steps_since = global_step - last_log_step
@@ -683,7 +585,7 @@ def main():
                    f"rep {acc_rep/n:.3f} | "
                    f"mtok {acc_mask/n:.0f} | "
                    f"util {acc_util/n:.3f} | "
-                   f"lr_m {lr_main:.2e} | lr_c {lr_codec:.2e} | "
+                   f"lr {lr_now:.2e} | "
                    f"{steps_per_s:.2f} step/s")
             if device.type == "cuda":
                 mem = torch.cuda.max_memory_allocated(device) / 1024**3
@@ -697,9 +599,8 @@ def main():
             acc_total = acc_gen = acc_disc = acc_acc = acc_rep = acc_mask = acc_util = 0.0
             acc_count = 0
 
-        # ── Validation ──
+        # Validation
         if val_ds is not None and global_step % args.val_every == 0:
-            # 매번 동일한 처음 N 배치를 평가 (val loss 비교 가능성 확보)
             val_ds.load_state_dict({"line_counter": 0})
             val_metrics = run_validation(
                 model, val_ds, args, device, amp_dtype, rank, world_size,
@@ -714,16 +615,14 @@ def main():
                     log_file.write(msg + "\n")
                     log_file.flush()
 
-        # ── 체크포인트 ──
+        # Checkpoint
         if global_step % args.save_every == 0:
-            # 모든 rank가 save_checkpoint 호출 (본체는 rank0, RNG sidecar는 각자)
             ckpt_path = os.path.join(args.out_dir, f"electra_step_{global_step}.pt")
             save_checkpoint(ckpt_path, global_step, model, optimizer, train_ds, args, rank)
-            # 업로드 전 모든 rank의 sidecar가 디스크에 내려앉았는지 barrier로 동기화
             if world_size > 1:
                 dist.barrier()
             if is_rank0(rank):
-                print(f"[Ckpt] saved → {ckpt_path} (+ {world_size} RNG sidecars)", flush=True)
+                print(f"[Ckpt] saved → {ckpt_path}", flush=True)
                 if args.rclone_remote:
                     t = upload_checkpoint_bundle(
                         ckpt_path=ckpt_path,
@@ -735,20 +634,17 @@ def main():
                     )
                     if t is not None:
                         upload_threads.append(t)
-                        # 완료된 thread는 정리 (unbounded 성장 방지)
                         upload_threads[:] = [u for u in upload_threads if u.is_alive()]
 
-    # 종료: 모든 rank가 final 체크포인트 + RNG sidecar 저장
+    # 최종 체크포인트
     final_path = os.path.join(args.out_dir, f"electra_step_{global_step}_final.pt")
     save_checkpoint(final_path, global_step, model, optimizer, train_ds, args, rank)
     if world_size > 1:
         dist.barrier()
     if is_rank0(rank):
-        print(f"[Done] final ckpt → {final_path} (+ {world_size} RNG sidecars)")
-        # 진행 중인 주기 업로드 스레드들 먼저 완료 대기
+        print(f"[Done] final → {final_path}")
         for t in upload_threads:
-            t.join(timeout=300)  # 5분 타임아웃
-        # Final 업로드는 blocking (daemon 강제 종료 방지)
+            t.join(timeout=300)
         if args.rclone_remote:
             if log_file:
                 log_file.flush()
@@ -766,7 +662,6 @@ def main():
     cleanup_ddp(world_size)
 
 
-# null context (Python 3.7+ contextlib.nullcontext 대체 — 호환성)
 class _nullctx:
     def __enter__(self): return None
     def __exit__(self, *a): return False
