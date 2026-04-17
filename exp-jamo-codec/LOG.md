@@ -1884,3 +1884,37 @@ step 30000 체크포인트 + mixed-tokens uniform corpus 로 resume.
 - VAL 회복 추세
 - 토큰 뭉침 해소가 주효한 것으로 판단
 
+### 검증 — 2400 step 후 (step 32500 재도달) 결과
+
+같은 step 번호에서 구/신 trajectory 비교:
+
+| 지표 | 구 (single token/row) step 32500 | **신 (mixed tokens/row) step 32500** |
+|---|---|---|
+| VAL loss | 8.5e-7 | **8.3e-8** (1/10) |
+| VAL acc | 99.999986% | **99.99999906%** |
+| 오류율 | 14 ppm | **~1 ppm** (14배 개선) |
+| VAL corpus | uniform_2000 | random_coverage_100_len2000 |
+
+동일 체크포인트 시작점에서 **코퍼스 재구성만으로 오류율 14배 감소 + 이전 피크 초과**. 배치 diversity 단일 요인 확정.
+
+### Rank 유지 (VICReg OFF 에서도)
+
+- **rank_z: 141~145** 안정 유지 (2400 step 동안 변화 거의 없음)
+- **rank_h: 220.9 → 208.8** (slow decay, -12/2400step)
+- VICReg 없어도 학습 중 만들어진 basin of attraction 에 머무는 중
+
+즉 **VICReg 은 "학습 중에만" 필요** — 수렴 후엔 reg 없이도 rank 가 유지되는 minimum 을 찾아둠. reg 제거 후 초기에 퇴행했던 건 코퍼스 문제였고, 코퍼스 고치니 자연스럽게 수렴.
+
+### 새 VAL 코퍼스 — `k-exaone_random_coverage_100_len2000.parquet`
+
+- 토큰당 100개씩 랜덤 배치 (한 row 에 여러 토큰 섞임)
+- max 2000자/row
+- 40,704 rows
+- 학습 corpus 와 동일 철학 → VAL 지표가 **실제 학습 품질 그대로 반영**
+
+### 최종 교훈 업데이트
+
+- **VICReg 은 학습 phase 도구, 추론 phase 제약 아님** — 학습 중 rank 확장 basin 을 만들고 나면 reg 제거해도 model 이 그 basin 유지. "수렴 시점에 끄기" 가 표준.
+- **배치 diversity 는 optimizer stability 의 숨은 주역** — per-token gradient signal 이 공평해도 배치 내 token distinct 수가 적으면 Adam moment 가 왜곡. 좋은 coverage 코퍼스는 "per-token 공평 + 배치 diverse" 둘 다 만족해야 함.
+- **VAL 코퍼스도 학습과 같은 분포** — 학습 분포와 동떨어진 VAL 은 진단력 떨어짐. random_coverage_100_len2000 처럼 학습 코퍼스와 같은 철학 + 다른 샘플 조합 이 이상적.
+
