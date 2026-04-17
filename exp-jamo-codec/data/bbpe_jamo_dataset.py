@@ -130,7 +130,7 @@ class BBPEJamoDataset(IterableDataset):
                 # (65536 → 4096, batch 평균 ~6MB)
                 abs_line = rows_skipped
                 for batch in pf.iter_batches(
-                    batch_size=4096, columns=[text_col],
+                    batch_size=65536, columns=[text_col],
                     row_groups=list(range(rg_start, pf.num_row_groups)),
                 ):
                     col = batch[text_col]
