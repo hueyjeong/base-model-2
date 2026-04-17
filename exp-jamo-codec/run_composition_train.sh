@@ -37,6 +37,7 @@ N_LAYERS="${N_LAYERS:-6}"
 KERNEL="${KERNEL:-7}"
 LR="${LR:-3e-4}"
 WARMUP="${WARMUP:-2000}"
+MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 LOG_EVERY="${LOG_EVERY:-1000}"
 SAVE_EVERY="${SAVE_EVERY:-10000}"
 NUM_WORKERS="${NUM_WORKERS:-16}"
@@ -91,7 +92,7 @@ torchrun --nproc_per_node=${NGPU:-4} exp-jamo-codec/train_composition.py \
   --d_model ${D_MODEL} --n_layers ${N_LAYERS} --kernel_size ${KERNEL} \
   --max_seq_len ${SEQ_LEN} \
   --batch_size ${BATCH_SIZE} --grad_accum_steps ${GRAD_ACCUM} --max_steps ${MAX_STEPS} \
-  --lr ${LR} --warmup_steps ${WARMUP} \
+  --lr ${LR} --warmup_steps ${WARMUP} --max_grad_norm ${MAX_GRAD_NORM} \
   --bf16 ${COMPILE_FLAG} --num_workers ${NUM_WORKERS} \
   --log_every ${LOG_EVERY} --save_every ${SAVE_EVERY} \
   --val_corpus ${VAL_CORPUS} --val_every ${VAL_EVERY} --val_samples ${VAL_SAMPLES} \
