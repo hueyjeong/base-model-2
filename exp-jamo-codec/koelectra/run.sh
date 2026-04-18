@@ -48,6 +48,10 @@ GEN_LOSS_WEIGHT="${GEN_LOSS_WEIGHT:-50.0}"
 CODEC_LR_RATIO="${CODEC_LR_RATIO:-0.0}"
 RECON_WEIGHT="${RECON_WEIGHT:-0.0}"
 
+# Generator aux signal (기본 OFF)
+FEAT_MATCH_WEIGHT="${FEAT_MATCH_WEIGHT:-0.0}"
+FOCAL_GAMMA="${FOCAL_GAMMA:-0.0}"
+
 # 데이터
 TRAIN_PARQUET="${TRAIN_PARQUET:-corpus/k-exaone_random_coverage_1000_len4096.parquet}"
 VAL_PARQUET="${VAL_PARQUET:-corpus/k-exaone_coverage_5_len1000.parquet}"
@@ -123,6 +127,7 @@ torchrun --nproc_per_node=${NGPU} -m koelectra.train \
     --dropout ${DROPOUT} --mask_ratio ${MASK_RATIO} \
     --gen_loss_weight ${GEN_LOSS_WEIGHT} \
     --codec_lr_ratio ${CODEC_LR_RATIO} --recon_weight ${RECON_WEIGHT} \
+    --feat_match_weight ${FEAT_MATCH_WEIGHT} --focal_gamma ${FOCAL_GAMMA} \
     --train_parquet ${TRAIN_PARQUET} --text_key ${TEXT_KEY} \
     --val_parquet ${VAL_PARQUET} \
     --min_length ${MIN_LENGTH} \

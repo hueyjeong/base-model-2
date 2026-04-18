@@ -284,7 +284,9 @@ def run_validation(model, val_dataset, args, device, amp_dtype, rank, world_size
             out = model(jamo_ids, jamo_mask, token_pad_mask,
                         masked_jamo_ids, masked_jamo_mask,
                         masked_patch_mask, per_jamo_mask,
-                        recon_weight=args.recon_weight)
+                        recon_weight=args.recon_weight,
+                        feat_match_weight=args.feat_match_weight,
+                        focal_gamma=args.focal_gamma)
         gen_sum += out["gen_loss"].detach().float()
         disc_sum += out["disc_loss"].detach().float()
         recon_sum += out["recon_loss"].detach().float()
@@ -352,6 +354,10 @@ def main():
                     help="codec LR = main LR × this. 0 이면 freeze (기본).")
     ap.add_argument("--recon_weight", type=float, default=0.0,
                     help="codec self-recon aux loss weight. 0 이면 aux 경로 건너뜀.")
+    ap.add_argument("--feat_match_weight", type=float, default=0.0,
+                    help="Generator h_gen ↔ z_orig MSE aux weight. 0 이면 경로 스킵.")
+    ap.add_argument("--focal_gamma", type=float, default=0.0,
+                    help="Gen CE focal loss γ. 0 이면 표준 CE.")
 
     # 학습
     ap.add_argument("--batch_size", type=int, default=128, help="per-GPU")
@@ -548,7 +554,7 @@ def main():
 
     model.train()
     t0 = time.time()
-    acc_total = acc_gen = acc_disc = acc_recon = acc_acc = acc_rep = acc_mask = acc_util = 0.0
+    acc_total = acc_gen = acc_disc = acc_recon = acc_fm = acc_acc = acc_rep = acc_mask = acc_util = 0.0
     acc_count = 0
     last_log_step = global_step
 
@@ -587,7 +593,9 @@ def main():
                     out = model(jamo_ids, jamo_mask, token_pad_mask,
                                 masked_jamo_ids, masked_jamo_mask,
                                 masked_patch_mask, per_jamo_mask,
-                                recon_weight=args.recon_weight)
+                                recon_weight=args.recon_weight,
+                                feat_match_weight=args.feat_match_weight,
+                                focal_gamma=args.focal_gamma)
                     loss = out["total_loss"] / args.grad_accum_steps
                 loss.backward()
 
@@ -595,6 +603,7 @@ def main():
             acc_gen += out["gen_loss"].detach().float().item()
             acc_disc += out["disc_loss"].detach().float().item()
             acc_recon += out["recon_loss"].detach().float().item()
+            acc_fm += out["feat_match_loss"].detach().float().item()
             acc_acc += out["disc_acc"].detach().float().item()
             acc_rep += out["replaced_rate"].detach().float().item()
             acc_mask += out["masked_tokens"].detach().float().item()
@@ -621,6 +630,7 @@ def main():
                    f"gen {acc_gen/n:.3f} | "
                    f"disc {acc_disc/n:.3f} | "
                    f"recon {acc_recon/n:.3f} | "
+                   f"fm {acc_fm/n:.3f} | "
                    f"disc_acc {acc_acc/n:.3f} | "
                    f"rep {acc_rep/n:.3f} | "
                    f"mtok {acc_mask/n:.0f} | "
@@ -636,7 +646,7 @@ def main():
                 log_file.flush()
             t0 = time.time()
             last_log_step = global_step
-            acc_total = acc_gen = acc_disc = acc_recon = acc_acc = acc_rep = acc_mask = acc_util = 0.0
+            acc_total = acc_gen = acc_disc = acc_recon = acc_fm = acc_acc = acc_rep = acc_mask = acc_util = 0.0
             acc_count = 0
 
         # Validation

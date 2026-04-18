@@ -202,70 +202,105 @@ class JamoKoElectra(nn.Module):
         masked_patch_mask: torch.Tensor,  # [B, P] bool (마스킹된 토큰)
         per_jamo_mask: torch.Tensor,      # [B, P, S] bool (masked & 실자모 — loss target)
         recon_weight: float = 0.0,        # codec self-recon aux loss weight
+        feat_match_weight: float = 0.0,   # Generator h_gen ↔ z_orig MSE aux weight
+        focal_gamma: float = 0.0,         # Gen CE focal loss γ. 0 이면 표준 CE
     ) -> dict:
         B, P, S = jamo_ids.shape
+        device = jamo_ids.device
 
         # ── (0) Codec self-reconstruction aux (원본 jamo_ids) ──
-        # recon_weight > 0 일 때만 계산. 0 이면 encode/decode 완전 스킵
-        # (freeze 모드에서 불필요한 forward 제거).
+        # recon_weight > 0 일 때만 계산. 0 이면 encode/decode 완전 스킵.
         if recon_weight > 0:
             orig_flat = jamo_ids.reshape(B * P, S)
             orig_mask_flat = jamo_mask.reshape(B * P, S)
             z_orig_flat = self.codec.encode(orig_flat, orig_mask_flat)
-            recon_logits = self.codec.decode(z_orig_flat)  # [B*P, S, V]
+            recon_logits = self.codec.decode(z_orig_flat)
             recon_loss = F.cross_entropy(
                 recon_logits.reshape(-1, self.jamo_vocab),
                 orig_flat.reshape(-1),
-                ignore_index=0,  # PAD 제외
+                ignore_index=0,
                 reduction="mean",
             )
         else:
-            recon_loss = torch.zeros((), device=jamo_ids.device, dtype=torch.float32)
+            recon_loss = torch.zeros((), device=device, dtype=torch.float32)
 
-        # ── (1) Generator encode ──
-        # masked 토큰은 전 슬롯 JAMO_MASK + jamo_mask 전 True 로 codec 에 saturate 신호
-        m_flat = masked_jamo_ids.reshape(B * P, S)
-        m_mask_flat = masked_jamo_mask.reshape(B * P, S)
-        z_flat = self.codec.encode(m_flat, m_mask_flat)
-        z_masked = z_flat.view(B, P, -1)
+        # ── (1) Shared codec.encode ──
+        # 비마스킹 토큰은 Generator/Discriminator 공통. 마스킹 토큰만 경로별로 다름.
+        # → encode(non-masked) 1회 + encode(masked saturate) 1회 로 기존 2×B·P 대신 1.2×B·P.
+        non_mask = ~masked_patch_mask  # [B, P]
+        m = masked_patch_mask          # [B, P]
 
+        shared_ids = jamo_ids[non_mask]          # [N_u, S]
+        shared_m   = jamo_mask[non_mask]         # [N_u, S]
+        z_shared   = self.codec.encode(shared_ids, shared_m)  # [N_u, D]
+
+        m_ids  = masked_jamo_ids[m]              # [N_m, S]
+        m_mask = masked_jamo_mask[m]             # [N_m, S]
+        z_m_only = self.codec.encode(m_ids, m_mask)  # [N_m, D]
+
+        D = z_shared.size(-1)
+        z_masked = torch.empty(B, P, D, device=device, dtype=z_shared.dtype)
+        z_masked[non_mask] = z_shared
+        z_masked[m]        = z_m_only
+
+        # ── (2) Generator transformer ──
         e_masked = self._embed(z_masked, token_pad_mask)
-        h_gen = self.gen_hidden_proj(e_masked)  # [B, P, hidden]
+        h_gen = self.gen_hidden_proj(e_masked)
         h_gen = self.generator(h_gen, token_pad_mask)  # [B, P, hidden]
 
-        # ── Generator decode ──
-        h_gen_flat = h_gen.reshape(B * P, -1)  # [B*P, hidden=256=d_model]
-        logits_flat = self.codec.decode(h_gen_flat)  # [B*P, S, V]
+        # ── (3) Generator decode → jamo logits ──
+        h_gen_flat = h_gen.reshape(B * P, -1)
+        logits_flat = self.codec.decode(h_gen_flat)
         jamo_logits = logits_flat.view(B, P, S, -1)
 
-        # Gen loss: per_jamo_mask 위치만
+        # ── (4) Gen loss (focal 지원) ──
         V = self.jamo_vocab
         ce = F.cross_entropy(
             jamo_logits.reshape(-1, V),
             jamo_ids.reshape(-1),
             reduction="none",
         ).reshape(B, P, S)
+        if focal_gamma > 0:
+            with torch.no_grad():
+                p = F.softmax(jamo_logits, -1).gather(
+                    -1, jamo_ids.unsqueeze(-1)
+                ).squeeze(-1)
+                focal = (1.0 - p).clamp(min=0.0).pow(focal_gamma)
+            ce = ce * focal
         denom = per_jamo_mask.sum().clamp(min=1)
         gen_loss = (ce * per_jamo_mask.float()).sum() / denom
 
-        # ── (2) Corrupted 재구성 (stop-gradient) ──
+        # ── (5) Feature matching aux (masked 위치만, no_grad target) ──
+        if feat_match_weight > 0:
+            with torch.no_grad():
+                z_orig_m = self.codec.encode(jamo_ids[m], jamo_mask[m])  # [N_m, D]
+            h_gen_m = h_gen[m]  # [N_m, hidden=D]
+            feat_match_loss = ((h_gen_m - z_orig_m.detach()) ** 2).sum(-1).mean()
+        else:
+            feat_match_loss = torch.zeros((), device=device, dtype=torch.float32)
+
+        # ── (6) Corrupted 재구성 (stop-gradient) ──
         with torch.no_grad():
-            sampled = jamo_logits.argmax(-1)  # [B, P, S]
+            sampled = jamo_logits.argmax(-1)
             jamo_corrupted = torch.where(per_jamo_mask, sampled, jamo_ids)
             diff = ((sampled != jamo_ids) & per_jamo_mask).any(dim=-1)  # [B, P]
-            replaced = diff & masked_patch_mask  # 비마스킹 토큰은 False
+            replaced = diff & masked_patch_mask
 
-        # ── (3) Discriminator ──
-        c_flat = jamo_corrupted.reshape(B * P, S)
-        z_c_flat = self.codec.encode(c_flat, jamo_mask.reshape(B * P, S))
-        z_corrupted = z_c_flat.view(B, P, -1)
+        # ── (7) Discriminator encode — 비마스킹은 z_shared 재활용, 마스킹만 재계산 ──
+        c_ids  = jamo_corrupted[m]
+        c_mask = jamo_mask[m]
+        z_c_only = self.codec.encode(c_ids, c_mask)  # [N_m, D]
 
+        z_corrupted = torch.empty(B, P, D, device=device, dtype=z_shared.dtype)
+        z_corrupted[non_mask] = z_shared  # 공유 (gradient 두 경로 합산됨 — 의도)
+        z_corrupted[m]        = z_c_only
+
+        # ── (8) Discriminator transformer ──
         e_corrupted = self._embed(z_corrupted, token_pad_mask)
         h_disc = self.disc_hidden_proj(e_corrupted)
         h_disc = self.discriminator(h_disc, token_pad_mask)
         disc_logits = self.disc_head(h_disc).squeeze(-1)  # [B, P]
 
-        # Disc loss: 유효 토큰만
         valid = token_pad_mask
         disc_loss = F.binary_cross_entropy_with_logits(
             disc_logits[valid], replaced[valid].float()
@@ -283,12 +318,14 @@ class JamoKoElectra(nn.Module):
             disc_loss
             + self.gen_loss_weight * gen_loss
             + recon_weight * recon_loss
+            + feat_match_weight * feat_match_loss
         )
         return {
             "total_loss": total_loss,
             "gen_loss": gen_loss.detach(),
             "disc_loss": disc_loss.detach(),
             "recon_loss": recon_loss.detach(),
+            "feat_match_loss": feat_match_loss.detach(),
             "disc_acc": disc_acc,
             "replaced_rate": replaced_rate,
             "masked_tokens": masked_tokens,
