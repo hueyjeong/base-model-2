@@ -2062,3 +2062,130 @@ freeze 모드 회귀 시 메모리 회귀 발견 → 2 가지 원인 fix:
   ```
 - compile 적용 (모든 fine-tune script `--compile` 옵션) — chain 전체 ~30분.
 
+---
+
+## 2026-04-18 (후반) — Binary encoding BBPE 설계 (compact 전 기록)
+
+### 세션 흐름 요약
+
+1. **속도 병목 조사** — unfreeze 0.62 step/s (freeze 1.85 의 1/3) 가 이상. "코덱이 그렇게 느린가?" 의문.
+2. **Profile** (torch.profiler, B=8 P=256 1GPU):
+   - freeze: 113ms / 8.8 step/s / 1.81GB
+   - unfreeze: 277ms / 3.6 step/s / 5.02GB  (2.43×)
+   - encoder_only: 159ms / 6.3 step/s / 2.97GB  (1.40×)
+   - **의외 결과**: codec 이 step time 의 32% (conv1d) + 29% (copy_, scatter). 사용자 직관("codec 비중 작을 것")과 반대
+   - 원인: S=32 작은 seq dim → Conv1d 효율 낮음 + shared encode scatter 가 copy 유발
+3. **Codec 대체 검토** — bench_codec.py 로 측정 (T=4096 tokens):
+   - SimpleCodec 5+5L: 228ms / 4.4 step/s / 4307MB (3.60M, 현재)
+   - SimpleCodec 2+2L: 99ms / 10.1 step/s / 2117MB (1.63M)
+   - SACodec 1+1L h8: 118ms / 8.5 step/s / 3440MB (1.90M)
+   - HeadCodec (inter-slot X): 33ms / 30.1 step/s / 1428MB (0.78M, **6.85× 빠름**)
+4. **HeadCodec 학습 실험** — 5K step sanity → **64% acc_valid plateau** (SimpleCodec 100% 대비 -36%p). inter-slot interaction 없이는 표현력 한계. token-level 정확도 0.64^5 ≈ 11% 로 generator 쓰기 부적합.
+5. **근본 방향 전환 — codec 자체 제거 + binary encoding**:
+   - 사용자 insight: "모델이 codec 학습을 cheat 함. token_id 를 1/153600 float 으로 직접 주면 cheat 방지"
+   - 토론 결과: binary encoding (18 bit, 153600 ≈ 2^18) 이 더 안전
+     - float 1/153600 ≈ 6.5e-6 → BF16 precision 위험
+     - binary 18 bit 는 bit 별 분별 쉬움, 비트 연산 O(1) 복원
+6. **Softmax 153K 회피**:
+   - 원 ELECTRA BBPE 쓰면 `Linear(hidden, 153600)` generator head 필요 (39M params + 매 forward softmax)
+   - Binary encoding + per-bit BCE: `Linear(hidden, 18)` 4.6K params, **softmax 완전 제거**
+   - 기존 BBPE 가 이걸 안 한 이유: softmax framing 관습 + bit 간 correlation 학습 어려움 가정
+7. **설계 공간 — z 의 차원 할당**:
+   ```
+   z[0:18]       = binary(token_id)            deterministic, 0 params
+   z[18:18+k]    = Embedding(153600, k)[id]    learned, V×k params
+   z[18+k:256]   = 0                           context (transformer 가 채움)
+   ```
+   - k=0: pure binary, 해방 **+4.48M 전부** (KoELECTRA vocab 자리 전체)
+   - k=32: compressed embedding 최소, `153600 × 32` = 4.92M (해방 -0.44M, break-even)
+   - k=128: KoELECTRA 표준 수준, 해방 -15.2M (부담 큼)
+
+### 결정 — 실험할 두 변종
+
+**변종 A — Pure binary (k=0)**:
+- 극단적 반항: identity 만 주고 의미는 context 가 전부 학습
+- 해방 4.48M → transformer 증설
+- 학습 가능성 불확실 (초반 수렴 어려울 수 있음)
+- 가장 작은 param footprint
+
+**변종 B — Hybrid (k=32)**:
+- binary 18 (identity) + learned 32 (coarse semantic landmark) + context 206
+- 해방 ≈ 0, KoELECTRA-Small v3 크기 유지
+- 학습 안정 보장 가설
+- 기존 ELECTRA 와 비교 공정
+
+### 구현 계획
+
+**새 파일** (codec 경로 완전 우회):
+- `exp-jamo-codec/koelectra/binary_electra.py` — 새 모델
+  - codec 없음
+  - `forward(bbpe_ids[B, P], token_pad_mask[B, P], masked_patch_mask, ...)`
+  - Encoder: binary encode + small embedding lookup → z[B, P, 256] → emb_proj → pos → transformer
+  - Generator transformer → `Linear(hidden, 18)` → sigmoid → per-bit BCE (gen loss)
+  - Corrupted: sigmoid > 0.5 → binary vector → int → 다시 binary encode
+  - Discriminator transformer → disc_head (기존)
+- `exp-jamo-codec/koelectra/data/bbpe_dataset.py` — 새 dataset (jamo 경로 제거)
+  - `BBPEDataset`: `bbpe_ids[P]`, `token_pad_mask[P]`, `special_token_mask[P]` 만 yield
+  - multi-doc packing 유지
+- `exp-jamo-codec/koelectra/train_binary.py` — 새 학습 스크립트 (간소화)
+- `exp-jamo-codec/koelectra/run_binary.sh` — 런처
+
+**기존 파일 변경 없음** — freeze/unfreeze 체크포인트 분석은 이어서 가능.
+
+### 하이퍼파라미터 출발점
+
+KoELECTRA-Small v3 설정 따름:
+- batch 512 (128/GPU × 4GPU), seq max_patches=512, LR 5e-4, warmup 10000
+- max_steps 800K (but freeze 30k plateau 확인했으니 variant 맞게 조정 가능)
+- Generator:Disc 1:1 (Small v3 관행)
+
+**변종 A (k=0)**:
+```
+Embedding 없음
+Gen: 14L d=256 emb=128 ff=1024 (해방 4.48M / 2 ≈ 2.24M 분배)
+Disc: 14L d=256 emb=128 ff=1024
+Binary encode/decode: bit 연산, O(1)
+Total: ~23M
+```
+
+**변종 B (k=32)**:
+```
+Embedding(153600, 32) — 4.92M
+Gen: 12L d=256 emb=128 ff=1024 (표준 유지)
+Disc: 12L d=256 emb=128 ff=1024
+Total: ~24M
+```
+
+### Claude 재개 시 읽을 핵심 노트
+
+**현재 코드 상태** (2026-04-18 커밋 f79970d 기준):
+- KoELECTRA + SimpleCodec per-token 통합 완료
+- freeze 모드 기본. co-train 은 ENV 로 활성 (CODEC_LR_RATIO>0)
+- Downstream 평가: finetune_downstream.py (6 task) + finetune_ner.py + finetune_mrc.py + run_bench.sh (8 task chain)
+- freeze 30k 체크포인트에서 4개 task plateau 확인 (NSMC/NLI/YNAT/PAWS-X 가 20k 대비 약간 후퇴)
+
+**핵심 결정 근거**:
+1. SimpleCodec 5+5L 은 S=32 작은 seq 에서 Conv1d 효율 낮아 profile 32% 차지 → codec 제거 동기
+2. HeadCodec 실패 (64% plateau) → inter-slot interaction 필수 확인
+3. Binary encoding 은 softmax 153K + codec params 둘 다 우회하는 유일한 방법
+4. Hybrid (k>0) 는 compressed embedding 문헌 (Shu+ 2018) 근거, pure binary (k=0) 는 우리만의 가설 — 둘 다 검증 가치
+
+**주의사항**:
+- **BF16 precision**: float 1/153600 ≈ 6.5e-6 는 BF16 mantissa (7 bit) 한계 밖. binary encoding 은 bit 별 분별 쉬워 precision 안전
+- **ELECTRA generator task asymmetry**: per-bit BCE 학습 어려움 가능. Gray code (인접 int hamming=1) 시도 고려
+- **기존 freeze/unfreeze checkpoint 와 비교 불가** — binary 경로는 codec state_dict 완전히 다른 구조 → warm-start 불가
+- **비교 기준**: 같은 step 수 (예: 30k) 에서 downstream (8 task chain) 평가로 공정 비교
+- **코드 정리**: binary 버전은 **별도 파일** 로 유지 (기존 codec 경로 보존). 나중에 binary 가 우세하면 교체
+
+**앞으로 할 일 순서**:
+1. 변종 A (k=0) 구현 + 100-step sanity
+2. 안 되면 변종 B (k=32) 로 fallback + sanity 비교
+3. 되는 쪽 (또는 둘 다) 로 4GPU 30K step 학습 (freeze 30k 와 같은 비교 지점)
+4. `run_bench.sh` 로 8 task downstream 평가
+5. freeze 30k, unfreeze 10k 결과와 비교 — binary encoding 이 의미 있는지 검증
+
+**기타 맥락**:
+- 프로젝트 최종 목표: 웹소설 플랫폼 → 저작툴 → 맞춤법 교정기 → 토크나이저 → **PLM** (5단계 사이드)
+- GEC 평가 만들기는 일단 pass (사용자 결정)
+- KLUE-NER/MRC 는 작동하지만 recall/em 낮음 (1 epoch 부족 + alignment 단순화)
+- SimpleCodec 체크포인트 (`checkpoints/simple_codec_final.pt`) 는 유지 — codec 기반 학습 복귀 필요시 사용
