@@ -490,13 +490,11 @@ def main():
             print(f"[Compile] torch.compile mode={args.compile_mode}")
 
     # ── Optimizer ──
-    # codec 과 non-codec 은 별도 param_group. codec_lr_ratio=0 이면 codec freeze.
+    # codec 은 기본 freeze (__init__ 에서 requires_grad=False + eval()).
+    # codec_lr_ratio > 0 이면 enable_codec_cotrain() 호출해 해제.
     codec_params_list = list(unwrap(model).codec_parameters())
     non_codec_params_list = list(unwrap(model).non_codec_parameters())
     if args.codec_lr_ratio == 0:
-        # freeze: codec 을 optimizer 에서 제외 + requires_grad=False
-        for p in codec_params_list:
-            p.requires_grad = False
         optimizer = torch.optim.AdamW(
             non_codec_params_list,
             lr=args.lr,
@@ -505,6 +503,7 @@ def main():
             weight_decay=args.weight_decay,
         )
     else:
+        unwrap(model).enable_codec_cotrain()
         optimizer = torch.optim.AdamW(
             [
                 {"params": codec_params_list, "name": "codec",

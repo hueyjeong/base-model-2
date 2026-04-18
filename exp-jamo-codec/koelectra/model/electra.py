@@ -96,10 +96,9 @@ class JamoKoElectra(nn.Module):
         self.hidden_size = hidden_size
         self.gen_loss_weight = gen_loss_weight
 
-        # ── SimpleCodec (학습 가능, codec_lr_ratio 로 별도 param_group) ──
-        # Freeze 하면 generator 가 frozen decoder domain 에 혼자 align 해야 해서
-        # gen_loss 가 bottleneck. Codec 을 함께 학습하되 recon aux loss 로
-        # "자모 복원 능력" 유지 → downstream 문자열 출력 품질 보장.
+        # ── SimpleCodec ──
+        # Freeze 모드 (기본): requires_grad=False + codec.eval() (Dropout 고정).
+        # Co-train 모드: 외부에서 `enable_codec_cotrain()` 호출해 활성화.
         self.codec = SimpleCodec(
             jamo_vocab=jamo_vocab,
             d_model=codec_d_model,
@@ -109,6 +108,10 @@ class JamoKoElectra(nn.Module):
             max_jamo=max_jamo_per_token,
             dropout=codec_dropout,
         )
+        self._codec_frozen = True
+        for p in self.codec.parameters():
+            p.requires_grad = False
+        self.codec.eval()
 
         # ── 공유 embedding 계층 ──
         self.emb_proj = nn.Linear(codec_d_model, embedding_size)
@@ -142,6 +145,19 @@ class JamoKoElectra(nn.Module):
                 nn.init.normal_(p, mean=0.0, std=0.02)
             elif "bias" in name:
                 nn.init.zeros_(p)
+
+    def enable_codec_cotrain(self):
+        """codec freeze 해제 — train 루프에서 codec_lr_ratio > 0 일 때 호출."""
+        self._codec_frozen = False
+        for p in self.codec.parameters():
+            p.requires_grad = True
+
+    def train(self, mode: bool = True):
+        """freeze 모드면 codec 은 항상 eval (Dropout 고정)."""
+        super().train(mode)
+        if self._codec_frozen:
+            self.codec.eval()
+        return self
 
     def load_codec_pretrained(self, ckpt_path: str, map_location="cpu"):
         """SimpleCodec 체크포인트(`checkpoints/simple_codec_final.pt`) 로드.
@@ -190,14 +206,13 @@ class JamoKoElectra(nn.Module):
         B, P, S = jamo_ids.shape
 
         # ── (0) Codec self-reconstruction aux (원본 jamo_ids) ──
-        # encoder drift 하면 decoder 도 함께 따라가도록 self-supervised 신호 유지.
-        # 유효 토큰만 계산 (PAD/special 포함 — codec 이 그 패턴도 본 분포).
-        orig_flat = jamo_ids.reshape(B * P, S)
-        orig_mask_flat = jamo_mask.reshape(B * P, S)
-        z_orig_flat = self.codec.encode(orig_flat, orig_mask_flat)
+        # recon_weight > 0 일 때만 계산. 0 이면 encode/decode 완전 스킵
+        # (freeze 모드에서 불필요한 forward 제거).
         if recon_weight > 0:
+            orig_flat = jamo_ids.reshape(B * P, S)
+            orig_mask_flat = jamo_mask.reshape(B * P, S)
+            z_orig_flat = self.codec.encode(orig_flat, orig_mask_flat)
             recon_logits = self.codec.decode(z_orig_flat)  # [B*P, S, V]
-            # target: 원본 jamo_ids (mask 위치는 어차피 PAD=0 이라 padding_idx 효과)
             recon_loss = F.cross_entropy(
                 recon_logits.reshape(-1, self.jamo_vocab),
                 orig_flat.reshape(-1),
