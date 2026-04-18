@@ -48,6 +48,23 @@ from koelectra.model.electra import JamoKoElectra  # noqa: E402
 JAMO_SEP = 5  # JamoTokenizer specials
 
 
+def _pearson_np(x: np.ndarray, y: np.ndarray) -> float:
+    x = x.astype(np.float64); y = y.astype(np.float64)
+    xm, ym = x - x.mean(), y - y.mean()
+    denom = np.sqrt((xm ** 2).sum() * (ym ** 2).sum())
+    if denom < 1e-12:
+        return float("nan")
+    return float((xm * ym).sum() / denom)
+
+
+def _rank(x: np.ndarray) -> np.ndarray:
+    """평균 ranking (동률 처리)."""
+    order = np.argsort(x)
+    ranks = np.empty_like(order, dtype=np.float64)
+    ranks[order] = np.arange(len(x), dtype=np.float64)
+    return ranks
+
+
 # ─────────────────────────────────────────────
 # Task config
 # ─────────────────────────────────────────────
@@ -87,6 +104,15 @@ TASK_CONFIGS = {
         "loader": "hf", "hf_name": "paws-x", "hf_subset": "ko",
         "train_split": "train", "val_split": "validation",
         "text_fields": ["sentence1", "sentence2"],
+        "label_field": "label",
+    },
+    "klue_re": {
+        "type": "classification", "n_classes": 30, "pair": True,
+        "loader": "hf", "hf_name": "klue", "hf_subset": "re",
+        "train_split": "train", "val_split": "validation",
+        "text_fields": ["sentence"],
+        # nested entity word 추가 segment 로 — sentence | subject_word | object_word
+        "entity_fields": [("subject_entity", "word"), ("object_entity", "word")],
         "label_field": "label",
     },
 }
@@ -134,8 +160,14 @@ def _load_tsv(path: str, text_fields: List[str], label_field: str):
 
 def _extract_hf(ds, cfg):
     items = []
+    entity_fields = cfg.get("entity_fields", [])
     for row in ds:
         texts = [row[k] for k in cfg["text_fields"]]
+        # nested entity 추가 (예: subject_entity["word"])
+        for outer, inner in entity_fields:
+            v = row.get(outer)
+            if isinstance(v, dict) and inner in v:
+                texts.append(str(v[inner]))
         if not all(isinstance(t, str) and t.strip() for t in texts):
             continue
         lbl = row[cfg["label_field"]]
@@ -289,12 +321,13 @@ class DownstreamHead(nn.Module):
         self.is_regression = is_regression
         hidden = electra.hidden_size
 
-        # Regression: BOS+mean concat pool + MLP (tanh) — BERT STS 튜닝 관행
+        # Regression: mean pool + GELU MLP (BOS+mean concat 도 collapse 했음).
+        # 출력 bias 를 label range 중앙(2.5)으로 init 해 평균 trivial → 학습 출발선 안정화.
         # Classification: BOS pool + 단일 linear (기존 동작 유지, 비교 일관성)
         if is_regression:
             self.head = nn.Sequential(
-                nn.Linear(2 * hidden, hidden),
-                nn.Tanh(),
+                nn.Linear(hidden, hidden),
+                nn.GELU(),
                 nn.Dropout(dropout),
                 nn.Linear(hidden, n_outputs),
             )
@@ -302,6 +335,8 @@ class DownstreamHead(nn.Module):
                 if isinstance(m, nn.Linear):
                     nn.init.normal_(m.weight, std=0.02)
                     nn.init.zeros_(m.bias)
+            # 마지막 Linear bias 를 label center 로 (KLUE-STS: 0~5 → 2.5)
+            self.head[-1].bias.data.fill_(2.5)
         else:
             self.head = nn.Linear(hidden, n_outputs)
             nn.init.normal_(self.head.weight, std=0.02)
@@ -327,11 +362,9 @@ class DownstreamHead(nn.Module):
         h = self.discriminator(h, token_pad_mask)  # [B, P, hidden]
 
         if self.is_regression:
-            # BOS + mean pool concat (두 벡터 모두 문장쌍 관계 반영)
-            bos_vec = h[:, 0, :]  # [B, hidden]
+            # Mean pool only (전 토큰 representation 평균 — SBERT 관행)
             mask_f = token_pad_mask.unsqueeze(-1).to(h.dtype)
-            mean_vec = (h * mask_f).sum(1) / mask_f.sum(1).clamp(min=1)
-            pooled = torch.cat([bos_vec, mean_vec], dim=-1)  # [B, 2*hidden]
+            pooled = (h * mask_f).sum(1) / mask_f.sum(1).clamp(min=1)
             pooled = self.head_dropout(pooled)
             return self.head(pooled)
         else:
@@ -390,12 +423,17 @@ def evaluate_regression(model, loader, device, amp_dtype, use_amp):
         n_batches += 1
     preds = np.concatenate(preds_all)
     labels = np.concatenate(labels_all)
-    try:
-        from scipy.stats import pearsonr, spearmanr
-        pearson = float(pearsonr(preds, labels)[0])
-        spearman = float(spearmanr(preds, labels)[0])
-    except Exception:
+    # NaN/Inf 정리
+    valid = np.isfinite(preds)
+    if (~valid).any():
+        preds = preds[valid]
+        labels = labels[valid]
+    # numpy 기반 corr (scipy 의존 제거)
+    if len(preds) < 2 or preds.std() < 1e-9:
         pearson = spearman = float("nan")
+    else:
+        pearson = float(_pearson_np(preds, labels))
+        spearman = float(_pearson_np(_rank(preds), _rank(labels)))
     model.train()
     return {"pearson": pearson, "spearman": spearman,
             "mse": loss_sum / max(n_batches, 1),
