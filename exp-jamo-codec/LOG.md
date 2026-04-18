@@ -2184,8 +2184,20 @@ Total: ~24M
 4. `run_bench.sh` 로 8 task downstream 평가
 5. freeze 30k, unfreeze 10k 결과와 비교 — binary encoding 이 의미 있는지 검증
 
-**기타 맥락**:
-- 프로젝트 최종 목표: 웹소설 플랫폼 → 저작툴 → 맞춤법 교정기 → 토크나이저 → **PLM** (5단계 사이드)
-- GEC 평가 만들기는 일단 pass (사용자 결정)
-- KLUE-NER/MRC 는 작동하지만 recall/em 낮음 (1 epoch 부족 + alignment 단순화)
-- SimpleCodec 체크포인트 (`checkpoints/simple_codec_final.pt`) 는 유지 — codec 기반 학습 복귀 필요시 사용
+### 진행 — 변종 A 구현 완료 (sanity OK)
+
+**파일**:
+- `koelectra/binary_electra.py` — 22.20M (gen 11.06M + disc 11.06M, embed 10.9K, head 4.9K). codec 없음, `Linear(hidden, 18)` per-bit head + sigmoid + BCE
+- `koelectra/data/bbpe_dataset.py` — jamo 분해 제거, BBPE-only IterableDataset (multi-doc packing)
+- `koelectra/train_binary.py` + `koelectra/run_binary.sh`
+- `mask_id = 153600` (vocab 밖, 18 bit 안: `0b100101100000000000`)
+- vocab range clamp: `sampled_ids.clamp(max=vocab_size-1)` — out-of-vocab corruption 방지
+
+**Sanity** (1 GPU, 4L gen/disc, 30 step, BATCH=4, P=256):
+- gen_loss 0.69 → 0.63 (per-bit BCE, 초기 ln 2 = 0.693)
+- disc_loss 0.61 → 0.32, disc_acc 68% → 82%
+- bit_acc 55% → 61% (random 50% 위, 학습 신호 확인)
+- gen_acc 0% (예상대로 — 18 bit 모두 정확해야 token 일치, 153,600 중 1)
+- backward NaN 없음, mem 0.2GB, ~46 step/s (compile 없이)
+
+**다음**: 4GPU 30K step 본학습 (run_binary.sh 기본값) → 8 task chain 평가
