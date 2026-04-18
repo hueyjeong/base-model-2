@@ -347,11 +347,11 @@ def main():
     # 마스킹
     ap.add_argument("--mask_ratio", type=float, default=0.20)
 
-    # Codec co-training
-    ap.add_argument("--codec_lr_ratio", type=float, default=0.1,
-                    help="codec LR = main LR × this. 0 이면 freeze.")
-    ap.add_argument("--recon_weight", type=float, default=0.5,
-                    help="codec self-recon aux loss weight")
+    # Codec co-training (기본 OFF — freeze 모드. co-train 원하면 ENV 로 override)
+    ap.add_argument("--codec_lr_ratio", type=float, default=0.0,
+                    help="codec LR = main LR × this. 0 이면 freeze (기본).")
+    ap.add_argument("--recon_weight", type=float, default=0.0,
+                    help="codec self-recon aux loss weight. 0 이면 aux 경로 건너뜀.")
 
     # 학습
     ap.add_argument("--batch_size", type=int, default=128, help="per-GPU")

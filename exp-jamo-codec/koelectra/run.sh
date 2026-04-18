@@ -44,9 +44,9 @@ DROPOUT="${DROPOUT:-0.1}"
 MASK_RATIO="${MASK_RATIO:-0.20}"
 GEN_LOSS_WEIGHT="${GEN_LOSS_WEIGHT:-50.0}"
 
-# Codec co-training (freeze 원하면 CODEC_LR_RATIO=0)
-CODEC_LR_RATIO="${CODEC_LR_RATIO:-0.1}"
-RECON_WEIGHT="${RECON_WEIGHT:-0.5}"
+# Codec co-training (기본 freeze. co-train 원하면 CODEC_LR_RATIO=0.1 RECON_WEIGHT=0.5 같이 지정)
+CODEC_LR_RATIO="${CODEC_LR_RATIO:-0.0}"
+RECON_WEIGHT="${RECON_WEIGHT:-0.0}"
 
 # 데이터
 TRAIN_PARQUET="${TRAIN_PARQUET:-corpus/k-exaone_random_coverage_1000_len4096.parquet}"
