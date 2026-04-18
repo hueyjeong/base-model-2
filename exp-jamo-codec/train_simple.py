@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 
 from codec.simple_codec import SimpleCodec
+from codec.head_codec import HeadCodec
 from data.simple_dataset import SimpleJamoDataset, load_bbpe_tokenizer
 from tok.jamo_tokenizer import JamoTokenizer
 
@@ -117,20 +118,35 @@ def train(args):
         print(f"BBPE vocab: {bbpe.vocab_size:,}, Jamo vocab: {jamo.vocab_size}")
 
     # 모델
-    codec = SimpleCodec(
-        jamo_vocab=jamo.vocab_size,
-        d_model=args.d_model,
-        n_enc_layers=args.n_enc_layers,
-        n_dec_layers=args.n_dec_layers,
-        kernel_size=args.kernel_size,
-        max_jamo=args.max_jamo,
-        dropout=args.dropout,
-    ).to(device)
+    if args.codec_type == "simple":
+        codec = SimpleCodec(
+            jamo_vocab=jamo.vocab_size,
+            d_model=args.d_model,
+            n_enc_layers=args.n_enc_layers,
+            n_dec_layers=args.n_dec_layers,
+            kernel_size=args.kernel_size,
+            max_jamo=args.max_jamo,
+            dropout=args.dropout,
+        ).to(device)
+    elif args.codec_type == "head":
+        codec = HeadCodec(
+            jamo_vocab=jamo.vocab_size,
+            d_model=args.d_model,
+            max_jamo=args.max_jamo,
+            dec_hidden=args.dec_hidden,
+            dropout=args.dropout,
+        ).to(device)
+    else:
+        raise ValueError(f"unknown codec_type: {args.codec_type}")
     n_params = sum(p.numel() for p in codec.parameters())
     if rank == 0:
-        print(f"SimpleCodec: d={args.d_model}, enc_L={args.n_enc_layers}, "
-              f"dec_L={args.n_dec_layers}, k={args.kernel_size}, "
-              f"max_jamo={args.max_jamo}, params={n_params/1e6:.2f}M")
+        if args.codec_type == "simple":
+            print(f"SimpleCodec: d={args.d_model}, enc_L={args.n_enc_layers}, "
+                  f"dec_L={args.n_dec_layers}, k={args.kernel_size}, "
+                  f"max_jamo={args.max_jamo}, params={n_params/1e6:.2f}M")
+        else:
+            print(f"HeadCodec: d={args.d_model}, dec_hidden={args.dec_hidden}, "
+                  f"max_jamo={args.max_jamo}, params={n_params/1e6:.2f}M")
 
     if args.compile:
         if rank == 0:
@@ -389,10 +405,12 @@ def main():
     p.add_argument("--val_corpus", nargs="+", default=None)
 
     # 모델
+    p.add_argument("--codec_type", choices=["simple", "head"], default="simple")
     p.add_argument("--d_model", type=int, default=256)
-    p.add_argument("--n_enc_layers", type=int, default=5)
-    p.add_argument("--n_dec_layers", type=int, default=5)
-    p.add_argument("--kernel_size", type=int, default=5)
+    p.add_argument("--n_enc_layers", type=int, default=5, help="simple 전용")
+    p.add_argument("--n_dec_layers", type=int, default=5, help="simple 전용")
+    p.add_argument("--kernel_size", type=int, default=5, help="simple 전용")
+    p.add_argument("--dec_hidden", type=int, default=1024, help="head 전용")
     p.add_argument("--max_jamo", type=int, default=32)
     p.add_argument("--dropout", type=float, default=0.1)
 
