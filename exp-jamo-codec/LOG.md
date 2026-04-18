@@ -1974,3 +1974,91 @@ step 30000 체크포인트 + mixed-tokens uniform corpus 로 resume.
 3. **복잡도는 trade-off 로 누적된다** — fixed_slot 은 seq-packing 위한 우회, append_pad_slot 은 slot 해석 위한 우회, parallel_decoder 는 segment-conv 병목 우회, slot_decode 는 decode_from_vec 우회. 각각 local 합리성은 있었지만 글로벌로는 근본 구조가 잘못됨.
 4. **"실추론 시 어떻게 호출되는가" 를 먼저 확정** — decode_from_vec 의 요구를 초기부터 명확히 했다면 per-token 구조가 자명했을 것. interface 먼저, 내부 구현 나중.
 
+---
+
+## 2026-04-18 — KoELECTRA + SimpleCodec 통합 + downstream 평가 체계
+
+### 통합 마무리
+
+- `koelectra/` 전 코드를 SimpleCodec 기반 per-token 포맷으로 재작성 (CompositionCodec 자산 전량 삭제 후 commit `b248821`).
+- BBPE-level special/MASK 토큰은 32 슬롯 모두 해당 id 로 saturate (jamo_mask 도 전 슬롯 True). codec 이 OOD 입력을 받지만 "균일 패턴" 이라 transformer 가 학습 가능. 100-step sanity 에서 disc_acc 가 기존 92.5% → 96.7% 로 더 빨라짐 (commit `b248821` smoke).
+- 100-step 1GPU sanity 통과 후 4GPU 본학습 시작.
+
+### 학습 모드 전환
+
+#### Phase A — co-train + recon aux (commit `cac1ff7`)
+
+Generator 가 frozen decoder 의 domain 에 갇혀 gen_loss bottleneck. → **codec 를 같이 fine-tune (lr × 0.1)** + **codec self-recon aux loss (weight 0.5)** 도입. recon 은 encoder 가 의미 쪽으로 drift 해도 decoder 가 재구성 가능성 유지하도록 self-supervised regularization.
+
+본학습 9.3k step 관찰:
+- step ~5700–7000: 완전 plateau (gen 3.19, disc 0.045, disc_acc 0.977, rep 0.194)
+- step 7000–9300 (warmup 끝나는 지점): adversarial 곡선 시작
+  - gen_loss 3.19 → 2.47, rep 0.194 → 0.169 (gen 정확도 ↑)
+  - disc_loss 0.045 → 0.128, disc_acc 0.976 → 0.957 (disc 어려워짐)
+- 4 지표 모두 "건강한" 방향이지만 step/s 0.62 (freeze 모드 대비 3× 느림), 메모리 22.5GB (4× ↑)
+
+#### Phase B — freeze 모드 회귀 (commit `27ee0df`)
+
+Co-train 의 wall-clock 비용이 너무 큼. **freeze 가 step/s 1.85 로 3.35× 빠름** → freeze 한 step 의 학습 효율이 unfreeze 의 1/2.98 = 0.34 이상이면 wall-clock 우세.
+
+freeze 모드 회귀 시 메모리 회귀 발견 → 2 가지 원인 fix:
+1. `recon_weight=0` 에도 `codec.encode(orig)` 매번 실행 → `if recon_weight > 0:` 가드 안으로 이동
+2. `codec.eval()` 누락 → freeze 시 dropout 활성 → `_codec_frozen` 플래그 + `train()` override 재도입
+
+### 평가 체계 구축 (commits `0e6439f`, `8147217`, `901e634`, +compile flag)
+
+8 task downstream pipeline:
+- `finetune_downstream.py`: NSMC, KLUE-NLI, KLUE-YNAT, KLUE-STS, KLUE-RE, PAWS-X-KO (sentence-level)
+- `finetune_ner.py`: KLUE-NER (token-level + char→BBPE alignment + entity F1)
+- `finetune_mrc.py`: KLUE-MRC (span extraction + KorQuAD-style F1/EM)
+- `run_bench.sh`: 8 task chain 자동 실행 + summary
+
+**STS 디버그**: pearson/spearman NaN 의 진짜 원인은 head 가 아니라 **scipy 미설치** 였음. numpy 직접 구현으로 fallback. 부수적으로 head 도 mean pool + GELU + bias init=2.5 로 개선.
+
+**compile 옵션**: 각 finetune script 에 `--compile` 추가. KLUE-RE 1ep smoke 에서 step/s 6.75 → 16.47 (+30% 후반).
+
+**중요한 발견 — Generator task asymmetry**:
+- 원 ELECTRA: generator 가 vocab 중 token id argmax (discrete 선택 한 번)
+- 우리 구조: generator 가 32 슬롯 자모를 **per-slot 독립 예측** → 자연스럽게 vocab 안에 머물지 않음
+- → Discriminator 가 "자모 valid 여부" 만 보고도 쉽게 이김. Disc_acc 가 ELECTRA-small 표준 (85–92%) 보다 높은 95%+ 에 머무는 이유.
+- 두 시나리오 모두 긍정 가능: vocab argmax 회귀 (Path A — token-like) 또는 manifold 확장 (Path B — OOV/신조어 generalization).
+
+### Downstream 결과 (3 ckpt 비교)
+
+| Task | Chance | unfreeze 10k | freeze 20k | freeze 30k |
+|---|---:|---:|---:|---:|
+| NSMC | 50.0 | 83.26 | **81.92** | 81.31 |
+| KLUE-NLI | 33.3 | **39.20** | 36.67 | 36.43 |
+| KLUE-YNAT | 14.3 | **69.84** | 62.45 | 60.58 |
+| KLUE-STS spearman | — | (NaN/scipy) | (NaN/scipy) | 0.2939 |
+| KLUE-RE | 3.3 | — | — | **53.56** |
+| PAWS-X | 50.0 | 58.40 | 58.85 | 58.80 |
+| KLUE-NER f1 | 0 | — | — | 0.4141 |
+| KLUE-MRC f1 | 0 | — | — | 0.0601 |
+
+### 핵심 분석
+
+1. **freeze 모드의 천장 = 약 20k step**: NSMC/NLI/YNAT/PAWS-X 모두 freeze 30k 가 freeze 20k 와 동등 또는 약간 후퇴 (-0.6 ~ -1.9%p). plateau 도달.
+2. **Wall-clock 효율 비교 (freeze 20k vs unfreeze 10k)**: 같은 시간에 freeze 가 ~3.35× 더 많은 step → freeze 20k = unfreeze 6.7k 시간. 절대 점수는 unfreeze 10k 가 3/4 task 우세.
+   - 효율 비율 평균 0.86 (임계 0.34 대폭 ↑) → wall-clock 으론 freeze 가 우세하지만 절대 ceiling 은 unfreeze 가 더 높음.
+3. **표층 vs 추론 분기**:
+   - 표층 (NSMC 감성, YNAT 주제): 쉬운 학습, 1만 step 으로 충분
+   - 추론 (NLI, PAWS-X): 두 모드 모두 chance + 5~10%p 수준 — 의미 학습이 표층 valid 체크 수준에 머무름. ELECTRA generator asymmetry 의 결과로 보임.
+4. **NER recall 낮음 (0.295)**: precision 0.696 vs recall 0.295 — 모델이 entity 경계 보수적으로 잡음. char→BBPE alignment 의 FIRST 전략이 짧은 entity 를 놓치는 현상. seqeval 표준 lib 도입 시 수정 가능.
+5. **MRC f1 6%**: 어려운 span extraction task. 짧은 fine-tune (3 epoch) + 미숙한 pretrain 의 한계. 단지 **동작 확인** 정도 의미.
+
+### 결정 사항
+
+- **freeze 모드는 short-cycle prototype** 에 적합. 빠르게 30k 까지 보고 plateau 확인.
+- **본격 품질 추구는 co-train 모드 + 더 긴 학습** 필요. 단 wall-clock 비용 큼.
+- **Hybrid schedule** (예: 0~30k freeze → 30k+ co-train) 가 타협안 — freeze 로 빠르게 대략적 representation 확보, co-train 으로 추론 능력 확장.
+
+### 추가 인프라
+
+- 8 task 자동 chain 스크립트 — 매 ckpt 마다 한 줄로 평가:
+  ```bash
+  bash exp-jamo-codec/koelectra/run_bench.sh checkpoints/<ckpt>.pt <tag>
+  # → /tmp/bench_<tag>_summary.txt
+  ```
+- compile 적용 (모든 fine-tune script `--compile` 옵션) — chain 전체 ~30분.
+

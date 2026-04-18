@@ -280,6 +280,8 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--num_workers", type=int, default=2)
     ap.add_argument("--log_every", type=int, default=200)
+    ap.add_argument("--compile", action="store_true",
+                    help="torch.compile 적용")
     args = ap.parse_args()
 
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -322,6 +324,12 @@ def main():
     electra.load_state_dict(ckpt["model"], strict=False)
     model = NERHead(electra, n_tags=N_NER, dropout=0.1).to(device)
     print(f"[Model] trainable={sum(p.numel() for p in model.parameters() if p.requires_grad)/1e6:.2f}M")
+    if args.compile:
+        import torch._dynamo as _dynamo
+        _dynamo.config.suppress_errors = True
+        _dynamo.config.cache_size_limit = 64
+        model = torch.compile(model)
+        print("[Compile] torch.compile 활성")
 
     bbpe = load_bbpe_tokenizer()
     jamo = JamoTokenizer()

@@ -29,7 +29,7 @@ run_task() {
     echo "=== ${task} ===" | tee -a "${SUMMARY}"
     python -u -m koelectra.${module} \
         --ckpt "${CKPT}" \
-        --epochs 3 --bf16 --num_workers 2 \
+        --epochs 3 --bf16 --num_workers 2 --compile \
         ${extra} 2>&1 | tee "${log}" | grep -E "^\[Eval|^\[Done" | tee -a "${SUMMARY}"
     echo "" >> "${SUMMARY}"
 }

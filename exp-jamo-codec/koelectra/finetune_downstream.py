@@ -459,6 +459,8 @@ def main():
     ap.add_argument("--num_workers", type=int, default=2)
     ap.add_argument("--log_every", type=int, default=100)
     ap.add_argument("--no_tf32", action="store_true")
+    ap.add_argument("--compile", action="store_true",
+                    help="torch.compile 적용 (warmup 비용 ↑, 이후 1.5~2x 가속)")
     args = ap.parse_args()
 
     if not args.no_tf32:
@@ -511,6 +513,12 @@ def main():
     model = DownstreamHead(electra, n_outputs=n_out,
                            dropout=0.1,
                            is_regression=(cfg["type"] == "regression")).to(device)
+    if args.compile:
+        import torch._dynamo as _dynamo
+        _dynamo.config.suppress_errors = True
+        _dynamo.config.cache_size_limit = 64
+        model = torch.compile(model)
+        print("[Compile] torch.compile 활성")
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[Model] trainable={trainable/1e6:.2f}M")
 
