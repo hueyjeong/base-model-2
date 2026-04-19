@@ -18,9 +18,12 @@ import torch
 from torch.utils.data import IterableDataset
 
 
-def load_bbpe_tokenizer(model_id: str = "LGAI-EXAONE/K-EXAONE-236B-A23B"):
+def load_bbpe_tokenizer(model_id_or_path: str = "LGAI-EXAONE/K-EXAONE-236B-A23B"):
+    """HuggingFace model id 또는 로컬 디렉토리 경로 모두 지원.
+    로컬 경로면 AutoTokenizer 가 디렉토리 감지해 PreTrainedTokenizerFast 로 로드.
+    """
     from transformers import AutoTokenizer
-    return AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    return AutoTokenizer.from_pretrained(model_id_or_path, trust_remote_code=True)
 
 
 class BBPEDataset(IterableDataset):

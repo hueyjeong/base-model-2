@@ -2201,3 +2201,85 @@ Total: ~24M
 - backward NaN 없음, mem 0.2GB, ~46 step/s (compile 없이)
 
 **다음**: 4GPU 30K step 본학습 (run_binary.sh 기본값) → 8 task chain 평가
+
+---
+
+## 2026-04-19 — 변종 A 110k 학습 결과 + capacity 가설
+
+### Downstream 평가 harness 구축
+
+기존 finetune_*.py 는 JamoKoElectra 전용 → BinaryElectra 용 복제:
+- `koelectra/finetune_downstream_binary.py` — 6 task (NSMC/NLI/YNAT/STS/RE/PAWS-X-KO)
+  - `DownstreamDatasetBinary`: jamo 분해 제거, BBPE id 직접 packing
+  - `BinaryDownstreamHead`: `bit_proj/pos_emb/emb_layer_norm/disc_hidden_proj/discriminator` 재활용
+  - Pair 포맷: `[BOS] s1 [EOS] [BOS] s2 [EOS]` (pretrain multi-doc packing 과 일치, SEP 없음)
+- `koelectra/finetune_ner_binary.py` — KLUE-NER (BIO 13-tag, entity F1)
+- `koelectra/finetune_mrc_binary.py` — KLUE-MRC (span extraction, EM/F1)
+  - input_offset = `1 + q_len + 1 + 1` (BOS + q + EOS + BOS)
+- `koelectra/run_bench_binary.sh` — 8 task chain runner (/tmp/bench_binary_* 로 분리)
+
+### Bench 결과 (변종 A, 4 체크포인트 비교)
+
+| Task | 20k | 30k | 40k | 110k | Δ(20k→110k) |
+|------|-----|-----|-----|------|-------------|
+| NSMC | 0.809 | 0.820 | 0.823 | **0.827** | +1.8 |
+| KLUE-NLI | 0.430 | 0.461 | 0.490 | **0.493** | +6.3 |
+| KLUE-YNAT | 0.589 | 0.665 | 0.660 | **0.721** | +13.2 |
+| KLUE-STS(ρ) | 0.575 | 0.586 | **0.606** | 0.602 | +2.7 |
+| KLUE-RE | 0.446 | 0.498 | 0.474 | **0.501** | +5.4 |
+| PAWS-X-KO | 0.646 | 0.628 | 0.648 | **0.671** | +2.6 |
+| KLUE-NER | 0.725 | 0.743 | **0.746** | 0.741 | +1.6 |
+| KLUE-MRC | 0.127 | 0.144 | 0.142 | **0.165** | +3.9 |
+
+**vs freeze 30k (codec 기반)**:
+- NSMC: binary 0.820 > freeze 0.813
+- NER: binary **0.743 >> freeze 0.414** (codec 경로의 recall 한계가 binary 에선 풀림)
+- MRC: binary 0.144 > freeze 0.060 (2.4x, 둘 다 낮음)
+- 나머지 task 비교는 freeze bench log 부재로 미집계
+
+**정체 구간**: 40k → 110k (pretrain 2.75x 증가) 에 대부분 task 개선 < 2pp. YNAT (+6.1pp) 만 예외.
+
+### Capacity 가설 (사용자 관찰)
+
+**gen_acc plateau**: 0.27~0.29 (= 153,600 × 0.28 ≈ **43,000 토큰**) — generator 가 딱 이만큼만 외움. 나머지 long-tail 은 학습 포기.
+
+**N_memorize ≈ params / d_model**:
+- Gen 11.06M params / d_model 256 = **43K** ← plateau 값과 일치
+- Base 로 추정: gen ~92M / d=768 = **120K** (153K 의 78%)
+- 해석: 각 token 의 고유 representation 이 d_model 차원 벡터 → 파라미터 전체를 lookup 에 쓸 수 있는 상한
+
+**파라미터 분배 이분화**:
+```
+Gen  11M →  lookup (43K vocab 외우기) 거의 전부 소진
+Disc 11M →  거의 전부 language representation (token identity 외울 필요 없음, contextual 판정)
+```
+- KoELECTRA Small v3 factorized (emb 4.48M + disc 11M) 의 "언어 예산" 11M 과 거의 일치 → downstream 동등
+- NER 에서 binary 가 훨씬 높은 이유: codec 경로가 자모 복원에 gen 파라미터를 낭비했던 반면, binary 는 disc 가 온전히 분류에 전념
+
+**교훈**: "공짜 점심 없다" — codec 제거로 해방된 4.48M 을 transformer 증설에 썼지만, generator 는 다시 lookup 에 소진. 실제 language 증가는 2L (≈1.6M) 수준.
+
+### 다음 실험 — 변종 C (capacity 가설 검증)
+
+**의도**: "번호 ↔ 의미 상관관계로 외울 한도 = params/d_model" 이 맞으면, vocab 을 gen capacity (43K) 안으로 줄이면 gen_acc 이 정상화되고 남는 공간이 language 로 가야 함.
+
+**설계**:
+- vocab = **35,000** (BBPE + byte fallback) — Small v3 원본 수준
+- `bbpe_bits = 16` (2^16 = 65,536)
+- `Embedding(35000, 32)` = 1.12M (factorized, variant B 스타일이지만 극단적으로 작음)
+- 해방분 = 4.48 - 1.12 = **3.36M** → 레이어 증설 (~4 layer 추가)
+- 예상 구조: 16L gen + 16L disc, d=256, ff=1024
+- gen_head: `Linear(hidden, 16)` per-bit BCE
+
+**예상 lookup capacity**:
+- Gen 16L ≈ 12.6M / d=256 = **49K** > vocab 35K → full coverage 가능
+- gen_acc 0.8+ 기대
+
+**토크나이저 옵션** (미결정):
+- A: 공개 BBPE (예: kogpt2 51K) — 바로 사용 가능, 크기 살짝 큼
+- B: K-EXAONE corpus 로 35K BBPE + byte fallback 직접 학습 — 실험 순수성↑, 30분-1시간
+- C: K-EXAONE 153K 그대로 + embed_dim=32 로 variant B 간접 검증 — 토크나이저 교체 회피
+
+**검증 포인트**:
+- gen_acc 이 정말 0.8+ 까지 올라가는가 (capacity 가설 맞음)
+- Downstream 이 variant A 대비 의미 있게 향상되는가 (language 공간 확장 효과)
+

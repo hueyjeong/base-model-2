@@ -73,7 +73,8 @@ class BinaryElectra(nn.Module):
         dropout: float = 0.1,
         max_patches: int = 512,
         gen_loss_weight: float = 50.0,
-        mask_id: int | None = None,  # 기본 = vocab_size (vocab 밖, 18 bit 안)
+        mask_id: int | None = None,  # 기본 = vocab_size (vocab 밖, bbpe_bits 안)
+        embedding_dim_k: int = 0,    # 0 → pure binary (variant A), k>0 → hybrid (C)
     ):
         super().__init__()
         assert (1 << bbpe_bits) >= vocab_size + 1, \
@@ -84,10 +85,22 @@ class BinaryElectra(nn.Module):
         self.hidden_size = hidden_size
         self.gen_loss_weight = gen_loss_weight
         self.mask_id = mask_id if mask_id is not None else vocab_size
+        self.embedding_dim_k = embedding_dim_k
 
         # ── 공유 embedding 계층 ──
-        # 18 bit (±1) → embedding_size (matrix 18×128 = 2.3K params, 거의 무료)
-        self.bit_proj = nn.Linear(bbpe_bits, embedding_size)
+        # binary bits (±1) + 선택적 compressed embedding lookup → embedding_size
+        # variant A (k=0): input = bbpe_bits
+        # variant C (k>0): input = bbpe_bits + k, Embedding(vocab+1, k) 추가
+        # mask_id = vocab_size 용 슬롯 포함하려 size = vocab_size + 1
+        if embedding_dim_k > 0:
+            self.token_embedding = nn.Embedding(
+                vocab_size + 1, embedding_dim_k, padding_idx=0,
+            )
+            input_dim = bbpe_bits + embedding_dim_k
+        else:
+            self.token_embedding = None
+            input_dim = bbpe_bits
+        self.bit_proj = nn.Linear(input_dim, embedding_size)
         self.pos_emb = nn.Embedding(max_patches, embedding_size)
         self.emb_layer_norm = nn.LayerNorm(embedding_size)
         self.emb_dropout = nn.Dropout(dropout)
@@ -117,14 +130,26 @@ class BinaryElectra(nn.Module):
                 nn.init.normal_(p, mean=0.0, std=0.02)
             elif "bias" in name:
                 nn.init.zeros_(p)
+        # token_embedding 은 std=1/sqrt(k) 로 덮어씀 (compressed dim 에 맞춰 분산 조절)
+        if self.token_embedding is not None:
+            k = self.embedding_dim_k
+            nn.init.normal_(self.token_embedding.weight, mean=0.0, std=1.0 / (k ** 0.5))
+            self.token_embedding.weight.data[0].zero_()  # padding_idx
 
     # ─────────────────────────────────────────────
     def _embed_bits(self, ids: torch.Tensor, token_pad_mask: torch.Tensor) -> torch.Tensor:
-        """ids[B, P] → emb[B, P, embedding_size]. binary 18 → ±1 → linear → +pos → LN → dropout."""
+        """ids[B, P] → emb[B, P, embedding_size]. binary ±1 (+선택적 embedding) → linear → +pos → LN → dropout."""
         B, P = ids.shape
-        bits = int_to_bits(ids, self.bbpe_bits)  # [B, P, 18] in {0,1}
-        bits = bits * 2.0 - 1.0                   # ±1 정규화
-        e = self.bit_proj(bits)
+        bits = int_to_bits(ids, self.bbpe_bits)    # [B, P, bits] in {0,1}
+        bits = bits * 2.0 - 1.0                     # ±1 정규화
+        if self.token_embedding is not None:
+            # ids 는 vocab_size (mask_id) 까지 가능 — Embedding size = vocab_size + 1
+            safe_ids = ids.clamp(max=self.vocab_size)
+            emb = self.token_embedding(safe_ids)    # [B, P, k]
+            x = torch.cat([bits, emb], dim=-1)      # [B, P, bits + k]
+        else:
+            x = bits
+        e = self.bit_proj(x)
         positions = torch.arange(P, device=ids.device).unsqueeze(0).expand(B, -1)
         e = e + self.pos_emb(positions)
         e = self.emb_layer_norm(e)

@@ -295,6 +295,9 @@ def main():
     ap.add_argument("--dropout", type=float, default=0.1)
     ap.add_argument("--max_patches", type=int, default=512)
     ap.add_argument("--gen_loss_weight", type=float, default=50.0)
+    ap.add_argument("--embedding_dim_k", type=int, default=0,
+                    help="0 = pure binary (variant A), >0 = hybrid with "
+                         "Embedding(vocab+1, k) concat (variant C)")
 
     # 데이터
     ap.add_argument("--train_parquet", type=str, nargs="+", required=True)
@@ -302,6 +305,10 @@ def main():
     ap.add_argument("--text_key", type=str, default="text")
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--min_length", type=int, default=10)
+    ap.add_argument("--tokenizer_path", type=str,
+                    default="LGAI-EXAONE/K-EXAONE-236B-A23B",
+                    help="HF model id 또는 로컬 디렉토리. "
+                         "로컬 BBPE 학습 결과: checkpoints/bbpe_35k")
 
     # 마스킹
     ap.add_argument("--mask_ratio", type=float, default=0.20)
@@ -367,8 +374,13 @@ def main():
 
     # ── 토크나이저 (BBPE only) ──
     if is_rank0(rank):
-        print("[Tok] BBPE(K-EXAONE) 로드")
-    bbpe = load_bbpe_tokenizer()
+        print(f"[Tok] 로드: {args.tokenizer_path}")
+    bbpe = load_bbpe_tokenizer(args.tokenizer_path)
+    if is_rank0(rank):
+        print(f"[Tok] vocab_size={bbpe.vocab_size}, "
+              f"bos={bbpe.bos_token_id}, eos={bbpe.eos_token_id}, "
+              f"pad={bbpe.pad_token_id}, unk={bbpe.unk_token_id}, "
+              f"mask={getattr(bbpe, 'mask_token_id', None)}")
 
     # ── Dataset ──
     train_ds = BBPEDataset(
@@ -403,6 +415,7 @@ def main():
         dropout=args.dropout,
         max_patches=args.max_patches,
         gen_loss_weight=args.gen_loss_weight,
+        embedding_dim_k=args.embedding_dim_k,
     ).to(device)
     mask_id = model.mask_id
 
@@ -410,8 +423,11 @@ def main():
         total = sum(p.numel() for p in model.parameters())
         gen_n = sum(p.numel() for p in model.generator.parameters())
         disc_n = sum(p.numel() for p in model.discriminator.parameters())
+        emb_n = (model.token_embedding.weight.numel()
+                 if model.token_embedding is not None else 0)
         print(f"[Model] total={total/1e6:.2f}M | "
               f"gen={gen_n/1e6:.2f}M | disc={disc_n/1e6:.2f}M | "
+              f"tok_emb={emb_n/1e6:.2f}M (k={args.embedding_dim_k}) | "
               f"mask_id={mask_id}")
 
     if world_size > 1:
