@@ -1,0 +1,1 @@
+exp-jamo-codec/koelectra/run.sh: line 112: torchrun: command not found

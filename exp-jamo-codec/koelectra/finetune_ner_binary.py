@@ -127,6 +127,8 @@ class BinaryNERHead(nn.Module):
     def __init__(self, electra: BinaryElectra, n_tags: int, dropout: float = 0.1):
         super().__init__()
         self.bbpe_bits = electra.bbpe_bits
+        self.vocab_size = electra.vocab_size
+        self.token_embedding = electra.token_embedding
         self.bit_proj = electra.bit_proj
         self.pos_emb = electra.pos_emb
         self.emb_layer_norm = electra.emb_layer_norm
@@ -141,7 +143,12 @@ class BinaryNERHead(nn.Module):
     def forward(self, bbpe_ids: torch.Tensor, token_pad_mask: torch.Tensor):
         B, P = bbpe_ids.shape
         bits = int_to_bits(bbpe_ids, self.bbpe_bits) * 2.0 - 1.0
-        e = self.bit_proj(bits)
+        if self.token_embedding is not None:
+            safe_ids = bbpe_ids.clamp(max=self.vocab_size)
+            x = torch.cat([bits, self.token_embedding(safe_ids)], dim=-1)
+        else:
+            x = bits
+        e = self.bit_proj(x)
         positions = torch.arange(P, device=bbpe_ids.device).unsqueeze(0).expand(B, -1)
         e = e + self.pos_emb(positions)
         e = self.emb_layer_norm(e)

@@ -2283,3 +2283,97 @@ Disc 11M →  거의 전부 language representation (token identity 외울 필�
 - gen_acc 이 정말 0.8+ 까지 올라가는가 (capacity 가설 맞음)
 - Downstream 이 variant A 대비 의미 있게 향상되는가 (language 공간 확장 효과)
 
+
+---
+
+## 2026-04-19 — BLT 피봇 검토 및 Phase 0 벤치마크
+
+### 배경
+
+변종 A (pure binary 18-bit, k=0) 110k 학습 후 gen_acc 0.27-0.29 plateau.
+변종 C (BBPE 35K + k=32 hybrid, 16L) 40k 학습 후 downstream 소폭 개선 (NLI/RE/PAWS-X) 있었지만 plateau 양상 유사.
+사용자 결론: **아키텍처 한계 (per-bit BCE) + 코퍼스 한계**.
+
+다시 BLT (Byte Latent Transformer, Meta 2024.12) 로 방향 전환 논의.
+엔트로피 모델은 1M 로 축소, hash n-gram 유지, encoder/decoder 구조 원 설계 따름.
+
+### 문헌 정리
+
+[exp-jamo-codec/docs/blt_overview.md](docs/blt_overview.md) 작성. 핵심:
+
+- 3 모듈 구조: Local Encoder (bytes → patch) + Latent Transformer (patch-level) + Local Decoder (patch → bytes)
+- Entropy patching: `H(x_t) > θ_g` (global) 또는 `H(x_t) - H(x_{t-1}) > θ_r` (monotonic)
+- 논문 entropy model: 100M, 14L, h=512, sliding window=512 byte. 우리는 **1M 로 축소**
+- Hash n-gram: `e_i = x_i + Σ_{n=3..8} E_n^hash(RollPolyHash(g_{i,n}))`, 500K bucket, /(n+1) 정규화
+- Encoder h=512 1~5L (ablation: n-gram 있으면 1L 충분), 각 layer 뒤 cross-attn pool (query=patch max-pool init, KV=byte, within-patch mask)
+- Decoder h=512 7~9L (decoder-heavy), cross-attn (query=byte, KV=patch), residual 로 encoder byte emb 직결
+- Latent: block-causal, SwiGLU/RMSNorm/RoPE θ=500K
+
+### Mamba encoder/decoder 치환 검토
+
+예산 128M 에서 BLT byte-level self-attn 비용 제거 가설:
+"Transformer SWA(512) O(L×W) 는 사실상 선형, Mamba-2 SSD O(L) 와 비교 싸움" →
+DenseEditor BiMamba-2 ds=64 인프라 (CPU Rust+C 커널까지) 재활용 가능하면 명분 충분.
+
+### Phase 0 — Self-attention 단독 micro-benchmark
+
+[exp-jamo-codec/bench_blt/phase0_selfattn.py](bench_blt/phase0_selfattn.py) 작성.
+B=8, h=384, BF16, torch.compile, flash_attn 2.8.3, mamba_ssm 2.3.0, fla-core 0.4.1 (RTX 5060 Ti).
+
+**합격선**: seq=2048 forward speedup ≥ 3x vs TF-SWA.
+
+결과 (forward ms, lower better):
+
+| seq | TF-SWA | Mamba-2 | LinAttn | GLA |
+|---|---|---|---|---|
+| 256 | **0.12** | 0.64 (0.18x) | 0.46 (0.26x) | 0.47 (0.25x) |
+| 512 | **0.20** | 0.51 (0.40x) | 0.40 (0.50x) | 0.54 (0.37x) |
+| 1024 | **0.36** | 0.69 (0.52x) | 0.71 (0.51x) | 0.55 (0.66x) |
+| 2048 | **0.71** | 1.62 (0.44x) | 0.87 (0.81x) | 0.96 (0.73x) |
+| 4096 | **1.45** | 3.41 (0.42x) | 2.13 (0.68x) | 2.05 (0.71x) |
+| 8192 | **2.87** | 7.40 (0.39x) | 4.46 (0.64x) | 4.18 (0.69x) |
+
+메모리도 TF-SWA 최저 (8192 에서 TF 646MB vs Mamba 1481MB).
+
+**결론 — Phase 0 전부 FAIL**:
+- `flash_attn + window_size=(512, 0)` 이 이미 O(L×512) 선형 + fused Triton
+- Mamba/FLA 는 같은 복잡도에서 constant factor 싸움인데 consumer GPU (SM 제한) 에서 TF-SWA 에 못 미침
+- autotune 경고 "Not enough SMs to use max_autotune_gemm mode" — 상위 GPU 에서도 역전 불확실
+- **Mamba encoder/decoder 치환 가설 폐기**. BLT 원 설계 (Transformer SWA) 가 이미 정답
+
+### BBPE Base vs BLT 128M 비교
+
+[exp-jamo-codec/bench_blt/bbpe_vs_blt.py](bench_blt/bbpe_vs_blt.py) 작성. 둘 다 Transformer (BLT encoder/decoder 는 SWA), BF16, torch.compile.
+
+**구성**:
+- BBPE Base: 12L full-attn h=768 heads=12 d_ff=3072, Embedding(35K, 768) tied head → **140M**
+- BLT 128M: byte_emb(256, 384) + hash(50K, 64) + proj, enc 2L SWA h=384, latent 12L full-attn h=768 d_ff=3072 (block-causal), dec 6L SWA h=384, cross-attn pool/unpool → **132M**
+
+**입력**: BBPE seq=512 token (≈1792 byte), BLT byte_seq=2048, B=8.
+
+**결과**:
+
+| 모델 | params | fwd | bwd | fwd+bwd | peak |
+|---|---|---|---|---|---|
+| BBPE Base | 140.2M | 27.2ms | 55.5ms | 82.7ms | 2840MB |
+| BLT 128M | 132.6M | 30.3ms | 61.7ms | 92.0ms | 2937MB |
+
+byte/sec 환산:
+- 학습: BLT / BBPE = **1.03x** (동등)
+- 추론(fwd): **1.02x** (동등)
+- 메모리: 1.03x
+
+patch_size 4/6/8 모두 동일 (~1.05x). **byte-level encoder(2L)+decoder(6L) self-attn 이 주 비용**, patch size 로 해결 안 됨.
+
+### 시사점
+
+1. **같은 예산에서 BLT 는 BBPE Base 와 효율 동등** — 토크나이저 제거 비용 사실상 0
+2. **효율 승리 없음** — 논문 patch size 효과 (7B+ crossover) 는 이 스케일에서 무효
+3. **BLT 의 가치 = 품질/로버스트** — 오타 강건성, OOV 해소, byte 구조 직접 학습. 속도는 본전
+4. 결론: BLT 128M 학습은 "속도 승부" 가 아닌 "품질/토크나이저-less 이득" 검증 목적으로만 의미
+
+### 미결정
+
+- BLT 128M 풀 구현 진행 (품질 검증) 할지
+- 다른 방향 (BBPE variant D 등) 으로 돌아갈지
+- 여기서 정리하고 다음 세션으로 넘길지
